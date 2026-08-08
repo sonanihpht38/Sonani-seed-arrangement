@@ -1,0 +1,15 @@
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# modules/production/engine is the vendored packing engine, carried over
+# unmodified from the original desktop app so it stays re-syncable. Don't lint it.
+exclude = ["migrations", ".venv", "staticfiles", "modules/production/engine"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "DJ"]  # errors, pyflakes, isort, pyupgrade, bugbear, django
+ignore = ["E501"]                          # line length handled by formatter
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "config.settings"
+python_files = ["tests.py", "test_*.py", "*_tests.py"]
+addopts = "-q"

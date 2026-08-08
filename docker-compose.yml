@@ -1,0 +1,159 @@
+# =============================================================================
+# Sonani ERP — full production-shaped stack.
+#
+#   db      SQL Server 2022
+#   redis   cache + session store + Celery broker/result backend
+#   api     Django/DRF under gunicorn (the ONLY container that migrates)
+#   worker  Celery worker (background jobs: email/OTP, reports, exports)
+#   beat    Celery beat (scheduled tasks)
+#   web     nginx serving the built React SPA + proxying /api -> api
+#
+# Optional observability stack lives behind the "observability" profile:
+#   docker compose --profile observability up
+#
+# Usage:  cp .env.example .env  &&  docker compose up --build
+#
+# Note: this single-host compose is for local/staging parity. For real 100k-scale
+# you run api/worker as many replicas on Kubernetes/ECS behind a load balancer,
+# and use MANAGED SQL Server + managed Redis instead of these containers.
+# =============================================================================
+
+services:
+  db:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: ${DB_PASSWORD}
+      MSSQL_PID: Developer
+    ports:
+      - "1433:1433"
+    volumes:
+      - mssql_data:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -C -Q 'SELECT 1' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build:
+      context: ./django-backend
+    env_file: .env
+    environment:
+      DJANGO_ENV: production
+      DB_ENGINE: mssql
+      DB_HOST: db
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      # This is the one container that runs migrations + collectstatic.
+      RUN_MIGRATIONS: "true"
+      COLLECT_STATIC: "true"
+    # MEDIA_ROOT (/app/media): the production module's job artifacts. Shared with
+    # worker (writes plate images) and web (serves them) — generated in one
+    # container, read from another.
+    volumes:
+      - media_data:/app/media
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ./django-backend
+    command: ["celery", "-A", "config", "worker", "-l", "info", "--concurrency=4"]
+    env_file: .env
+    environment:
+      DJANGO_ENV: production
+      DB_ENGINE: mssql
+      DB_HOST: db
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      RUN_MIGRATIONS: "false"   # never migrate from a worker
+      COLLECT_STATIC: "false"
+    # The arrangement job writes plate PNGs / Excel here; web serves them.
+    volumes:
+      - media_data:/app/media
+    depends_on:
+      api:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  beat:
+    build:
+      context: ./django-backend
+    command: ["celery", "-A", "config", "beat", "-l", "info"]
+    env_file: .env
+    environment:
+      DJANGO_ENV: production
+      DB_ENGINE: mssql
+      DB_HOST: db
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      RUN_MIGRATIONS: "false"
+      COLLECT_STATIC: "false"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./react-frontend
+      args:
+        VITE_API_URL: /api
+    # Read-only: nginx serves /media straight off the volume the api/worker write.
+    volumes:
+      - media_data:/srv/media:ro
+    depends_on:
+      - api
+    ports:
+      - "8080:80"
+    restart: unless-stopped
+
+  # ---- Optional: metrics stack (docker compose --profile observability up) ----
+  prometheus:
+    image: prom/prometheus:latest
+    profiles: ["observability"]
+    volumes:
+      - ./ops/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    profiles: ["observability"]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  mssql_data:
+  redis_data:
+  media_data:   # MEDIA_ROOT: api + worker write, web (nginx) serves

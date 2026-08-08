@@ -1,0 +1,55 @@
+/* ===== Sidebar: clean collapsed state (icons only), Skydash-style =====
+   antd adds the `ant-menu-inline-collapsed` class when the Sider collapses, but
+   its generated "hide the label" styles don't always apply in this setup, which
+   leaves the label text rendering and getting clipped by the 80px rail. These
+   scoped rules guarantee the clean look: only a centered icon per row, no label,
+   no chevron. The hover fly-out submenu is rendered in a portal OUTSIDE the
+   collapsed sider, so it still shows the full text (like Skydash). */
+
+/* Guarantee a compact 80px rail when collapsed (antd's inline collapsed width
+   can be overridden by flaky generated styles in this setup). */
+.ant-layout-sider-collapsed {
+  flex: 0 0 80px !important;
+  width: 80px !important;
+  min-width: 80px !important;
+  max-width: 80px !important;
+}
+
+.ant-layout-sider-collapsed .ant-menu-title-content {
+  display: none !important;
+}
+
+.ant-layout-sider-collapsed .ant-menu-submenu-arrow {
+  display: none !important;
+}
+
+.ant-layout-sider-collapsed .ant-menu-item,
+.ant-layout-sider-collapsed .ant-menu-submenu-title {
+  padding-inline: 0 !important;
+  display: flex !important;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Consistent icon slot so every row's icon is the same size and aligned. */
+.ant-layout-sider .ant-menu-item-icon,
+.ant-layout-sider .ant-menu-item .ant-menu-item-icon svg,
+.ant-layout-sider .ant-menu-submenu-title .ant-menu-item-icon svg {
+  display: inline-flex;
+  align-items: center;
+  font-size: 18px;
+  min-width: 18px;
+}
+
+/* Breathing room between the icon and the label. Our icons render as a raw
+   <svg> (no .ant-menu-item-icon wrapper), so antd's icon-gap token doesn't apply
+   — add the gap on the label instead. Expanded only (collapsed hides labels). */
+.ant-layout-sider:not(.ant-layout-sider-collapsed) .ant-menu-title-content {
+  margin-inline-start: 12px;
+}
+
+/* When collapsed, the hover fly-out submenu renders in a portal OUTSIDE the
+   sider, so give its items the same icon→label gap. */
+.ant-menu-submenu-popup .ant-menu-title-content {
+  margin-inline-start: 12px;
+}

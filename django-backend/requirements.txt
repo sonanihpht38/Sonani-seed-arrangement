@@ -1,0 +1,44 @@
+# ============================================================================
+# Production runtime dependencies. Pinned to compatible ranges.
+# ============================================================================
+
+# --- Core ---
+Django>=5.0,<5.2
+djangorestframework>=3.15,<3.16
+django-filter>=24.0,<26.0
+
+# --- Auth (Bearer/JWT to match the React client) ---
+djangorestframework-simplejwt>=5.3,<6.0
+drf-spectacular>=0.28,<1.0
+
+# --- Config & CORS ---
+django-environ>=0.11,<0.13
+django-cors-headers>=4.4,<5.0
+
+# --- Database: SQL Server (Microsoft's official Django backend; pulls pyodbc) ---
+mssql-django>=1.5,<2.0
+# sqlite works out of the box for local dev with no extra driver.
+
+# --- Cache / sessions / Celery broker ---
+redis>=5.0,<6.0
+django-redis>=5.4,<6.0
+
+# --- Async task queue ---
+celery>=5.4,<6.0
+
+# --- Production module: seed datasheets + the plate-packing engine ---
+# matplotlib renders the plate images (Agg, headless); shapely does the geometry.
+openpyxl>=3.1,<4.0
+matplotlib>=3.8,<4.0
+shapely>=2.0,<3.0
+
+# --- Static file serving from the app (admin/DRF assets) ---
+whitenoise>=6.7,<7.0
+
+# --- Observability ---
+django-prometheus>=2.3,<3.0
+python-json-logger>=2.0,<3.0
+sentry-sdk>=2.0,<3.0
+
+# --- Production WSGI server ---
+gunicorn>=22.0,<24.0

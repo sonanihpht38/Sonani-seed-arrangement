@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "composite": true,
+    // `composite` forces an emit. With no outDir it wrote vite.config.js next to
+    // vite.config.ts — and Vite loads the .js in preference to the .ts, so edits
+    // to the config silently did nothing until someone ran `tsc -b`. Keep the
+    // build output out of the project root.
+    "outDir": "./node_modules/.tmp/tsconfig.node",
+    "skipLibCheck": true,
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "allowSyntheticDefaultImports": true,
+    "strict": true
+  },
+  "include": ["vite.config.ts"]
+}

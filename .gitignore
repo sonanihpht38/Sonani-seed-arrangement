@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+db.sqlite3
+.env
+media/
+staticfiles/
+
+# Node
+node_modules/
+dist/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local backups and scratch edits
+*.bak
+*.orig
+*.rej
+
+# Claude Code per-machine state (305 approved-command rules and local paths).
+# The .local suffix means machine-specific by convention; shared settings.json
+# is still tracked.
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+
+# Windows reserved-name artefact. Something once rendered a plate to a path
+# named "nul.png"; Windows maps nul.* to the NUL device, so the file is on disk
+# but no normal API can open it and `git add` fails outright on it. Delete it
+# with an extended-length path if you want it gone:
+#   cmd /c del "\\?\C:\...\engine\nul.png"
+nul.png
+
+# Secrets — belt and braces. `.env` above already covers these, but the real
+# file holds SECRET_KEY, DB_PASSWORD and the LAN address of the live SQL
+# Server, so it is worth being explicit.
+.env.*
+!.env.example
