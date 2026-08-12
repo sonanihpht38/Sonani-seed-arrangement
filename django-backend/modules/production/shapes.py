@@ -217,11 +217,55 @@ def validate_corners(raw, length, width):
 CUT_EPS = 0.05            # mm — below this an edge pair counts as "not cut"
 
 
-def corners_from_sides(l1, w2, l3, w4):
+# Which corner the cross is on, as the datasheet writes it. The measuring
+# machine NORMALISES its four sides — it always reports the longer length as L1
+# and the shorter width as W2 — so the sides say how BIG the cut is but not
+# WHERE. Checked across a real batch: every stone reads L1 > L3 and W2 < W4
+# whether its cross is top-left or bottom-right, so the corner is recoverable
+# from this column and from nowhere else.
+CUT_CORNERS = {
+    "l1": "left-top", "lt": "left-top", "lefttop": "left-top", "topleft": "left-top",
+    "l2": "left-bottom", "lb": "left-bottom", "leftbottom": "left-bottom",
+    "bottomleft": "left-bottom",
+    "r1": "right-top", "rt": "right-top", "righttop": "right-top",
+    "topright": "right-top",
+    "r2": "right-bottom", "rb": "right-bottom", "rightbottom": "right-bottom",
+    "bottomright": "right-bottom",
+}
+
+
+# Used when the datasheet leaves the cross corner blank. Right about two thirds
+# of the time on the batch measured so far — see _poly_from_seed for why.
+CUT_CORNER_DEFAULT = "left-top"
+
+
+def parse_cut_corner(v):
+    """Datasheet text -> one of left-top/left-bottom/right-top/right-bottom.
+
+    Returns None for blank, and raises nothing for junk — an unreadable value is
+    reported as None so the caller can warn and fall back to a rectangle rather
+    than build a stone facing the wrong way.
+    """
+    if v is None:
+        return None
+    key = str(v).strip().lower().replace(" ", "").replace("_", "").replace("-", "")
+    return CUT_CORNERS.get(key)
+
+
+def corners_from_sides(l1, w2, l3, w4, corner=None):
     """Four edge lengths -> ``[(x, y), ...]``, or None if they cannot be read.
 
-    ``l1`` bottom, ``w2`` right, ``l3`` top, ``w4`` left, in mm. The outline is
-    returned with its bottom-left at (0, 0), ready for validate_corners().
+    ``l1`` bottom, ``w2`` LEFT, ``l3`` top, ``w4`` RIGHT, in mm — the measuring
+    machine numbers the edges CLOCKWISE from the bottom. The outline is returned
+    with its bottom-left at (0, 0), ready for validate_corners().
+
+    That direction is the whole ballgame and cannot be recovered from the numbers.
+    Reading the edges anticlockwise instead (w2 as the right edge) produces the
+    MIRROR of the real stone, and no rotation can turn a mirror back — a seat cut
+    on the wrong diagonal simply will not take the stone. It was anticlockwise
+    here until a real plate showed it: every CROSS PES stone came out top-right
+    when the physical stones are top-left, so each one was placed as its own
+    mirror image.
 
     A pair that matches within CUT_EPS means that axis is uncut; if both match
     the seed is a plain rectangle and this returns its four corners, which
@@ -242,8 +286,24 @@ def corners_from_sides(l1, w2, l3, w4):
     if p >= L or q >= W:
         return None                        # a cut cannot consume a whole edge
 
-    # The cut corner is where the two SHORTENED edges meet.
-    top_short, right_short = l3 < l1, w2 < w4
+    # WHERE the cut is. When the datasheet declares it, use that and nothing
+    # else — the sides cannot tell us (see CUT_CORNERS). Only fall back to
+    # reading it off the sides for older sheets that carry no such column, and
+    # that fallback is a guess: it returns the same corner for every stone.
+    if corner is not None:
+        if corner == "left-top":
+            pts = [(0, 0), (L, 0), (L, W), (p, W), (0, W - q)]
+        elif corner == "right-top":
+            pts = [(0, 0), (L, 0), (L, W - q), (L - p, W), (0, W)]
+        elif corner == "left-bottom":
+            pts = [(0, q), (p, 0), (L, 0), (L, W), (0, W)]
+        elif corner == "right-bottom":
+            pts = [(0, 0), (L - p, 0), (L, q), (L, W), (0, W)]
+        else:
+            return None
+        return [(round(float(x), COORD_DP), round(float(y), COORD_DP)) for x, y in pts]
+
+    top_short, right_short = l3 < l1, w4 < w2
     if top_short and right_short:                      # top-right
         pts = [(0, 0), (L, 0), (L, W - q), (L - p, W), (0, W)]
     elif top_short and not right_short:                # top-left
@@ -255,13 +315,15 @@ def corners_from_sides(l1, w2, l3, w4):
     return [(round(float(x), COORD_DP), round(float(y), COORD_DP)) for x, y in pts]
 
 
-def sides_to_corners(l1, w2, l3, w4):
+def sides_to_corners(l1, w2, l3, w4, corner=None):
     """corners_from_sides() + validation, in one call.
 
     Returns ``(coords, reason)`` exactly like validate_corners(), so the import
     path treats an edge-measured seed and a corner-listed one identically.
+    `corner` is the declared cross corner, already normalised by
+    parse_cut_corner(); None falls back to reading it off the sides.
     """
-    pts = corners_from_sides(l1, w2, l3, w4)
+    pts = corners_from_sides(l1, w2, l3, w4, corner)
     if pts is None:
         return None, "side measurements could not be read"
     xs = [p[0] for p in pts]

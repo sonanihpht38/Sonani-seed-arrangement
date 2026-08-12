@@ -18,7 +18,10 @@ from openpyxl import load_workbook
 
 from .models import Batch, DomainError, SeedData
 from .repository import BatchRepository, SeedRepository
-from .shapes import sides_to_corners, validate_corners
+from .shapes import (
+    CUT_CORNER_DEFAULT, CUT_EPS, parse_cut_corner, sides_to_corners,
+    validate_corners,
+)
 
 
 def _uuid_or_error(value, field="arrangeId"):
@@ -363,28 +366,113 @@ def _norm_hdr(v):
     return "" if v is None else str(v).strip().lower().replace(" ", "").replace("_", "")
 
 
+def _header_row(ws):
+    """The first row, normalised. Empty list if the sheet has no rows."""
+    try:
+        return [_norm_hdr(c) for c in
+                next(ws.iter_rows(min_row=1, max_row=1, values_only=True))]
+    except StopIteration:
+        return []
+
+
+def _find_col(hdr, *prefixes):
+    """Index of the first header starting with any of these, or None.
+
+    By NAME, never by position. A datasheet that carries extra columns in front
+    — a serial number, a department, anything — shifts every field along, and a
+    positional reader then takes the wrong cell for every seed. That is not
+    hypothetical: a sheet with four leading columns imported 35 stones with L3
+    stored as the thickness, which put them all outside the packing gate.
+    """
+    for i, h in enumerate(hdr):
+        if h and any(h.startswith(p) for p in prefixes):
+            return i
+    return None
+
+
+def _column_map(ws):
+    """Locate every field this importer understands, by header name.
+
+    Returns a dict of role -> column index. Roles absent from the sheet are
+    simply missing from the dict.
+    """
+    hdr = _header_row(ws)
+    return {
+        "batch": _find_col(hdr, "batchno", "batch"),
+        "stock": _find_col(hdr, "stockno", "stokeno", "stokno", "stock", "stoke"),
+        "pcs": _find_col(hdr, "pcs", "pes"),
+        "cts": _find_col(hdr, "cts", "ct"),
+        "l1": _find_col(hdr, "l1"),
+        "w2": _find_col(hdr, "w2"),
+        "l3": _find_col(hdr, "l3"),
+        "w4": _find_col(hdr, "w4"),
+        "length": _find_col(hdr, "length"),
+        "width": _find_col(hdr, "width"),
+        "height": _find_col(hdr, "height", "heigth", "thick"),
+        "corner": _find_col(hdr, "crossangle", "crosscorner", "cutfacing", "crossfacing"),
+        "cross": _find_col(hdr, "cross"),
+    }
+
+
 def _detect_layout(ws):
     """Which datasheet layout is this?
 
       "legacy" — BatchNo StockNo Pcs Cts Length Width Height  (+ optional Corners)
-      "sides"  — BatchNo StockNo Pcs Cts  L1 W2 L3 W4  Height
+      "sides"  — BatchNo StockNo Pcs Cts  L1 W2 L3 W4  Height  (+ optional corner)
 
     The "sides" sheet measures a seed as FOUR AXIS-PARALLEL EDGES instead of one
-    Length and one Width, which pushes Height from column 7 to column 9. Reading
-    it positionally as the legacy layout silently stores L3 as the thickness —
-    every seed then lands with an ~8 mm thickness and is dropped by the packing
-    gate, so the seeds import "successfully" and never reach a plate. Detecting
-    the header is what stops that happening quietly.
+    Length and one Width. Read as the legacy layout it silently stores L3 as the
+    thickness — every seed then lands with a ~5-11 mm thickness and is dropped by
+    the packing gate, so the import reports success and the seeds never reach a
+    plate.
+
+    Detection is by HEADER NAME and does not care where the columns sit.
     """
-    try:
-        hdr = [_norm_hdr(c) for c in next(ws.iter_rows(min_row=1, max_row=1, values_only=True))]
-    except StopIteration:
-        return "legacy"
-    if (len(hdr) >= 9
-            and hdr[4].startswith("l1") and hdr[5].startswith("w2")
-            and hdr[6].startswith("l3") and hdr[7].startswith("w4")):
+    cols = _column_map(ws)
+    if all(cols.get(k) is not None for k in ("l1", "w2", "l3", "w4")):
         return "sides"
+
+    # No four sides, but a thickness column that is NOT where the legacy layout
+    # keeps it means this is a shape we do not understand. Reading it positionally
+    # would put some other measurement into a field, so refuse and say what was
+    # found rather than import something quietly wrong.
+    hdr = _header_row(ws)
+    h = cols.get("height")
+    if h is not None and h != 6 and cols.get("length") is None:
+        raise DomainError(
+            "This datasheet's columns were not recognised. The thickness column "
+            "%r is at position %d, and no Length/Width or L1/W2/L3/W4 columns "
+            "were found. Importing it would store the wrong measurement in the "
+            "wrong field, so it has been stopped. Headers found: %s."
+            % (hdr[h], h + 1, ", ".join('"%s"' % (x or "(blank)") for x in hdr)))
     return "legacy"
+
+
+def _sides_are_cut(sides):
+    """Do these four edges describe a stone with a corner ground off?
+
+    A matched pair means that axis is uncut; both matched means a plain
+    rectangle, which needs no corner declared.
+    """
+    if not sides or len(sides) != 4 or any(s is None for s in sides):
+        return False
+    l1, w2, l3, w4 = (float(s) for s in sides)
+    return abs(l1 - l3) > CUT_EPS and abs(w2 - w4) > CUT_EPS
+
+
+def _header_cell(ws, idx):
+    """The idx-th (0-based) header cell, or None if the sheet is that short."""
+    try:
+        hdr = next(ws.iter_rows(min_row=1, max_row=1, values_only=True))
+    except StopIteration:
+        return None
+    return hdr[idx] if idx < len(hdr) else None
+
+
+def _is_thickness(h):
+    """Does this normalised header name a thickness column? Tolerates the
+    'HEIGTH' misspelling that the measuring machine emits."""
+    return h.startswith("height") or h.startswith("heigth") or h.startswith("thick")
 
 
 class SeedImportService:
@@ -399,6 +487,13 @@ class SeedImportService:
         ws = wb.active
         if _detect_layout(ws) == "sides":
             return SeedImportService._read_sides(ws)
+        # Column 8 has two possible jobs, told apart by its HEADER, never by
+        # position. Historically it is the optional Corners outline; a datasheet
+        # that instead marks cut stones with CROSS/NOCROSS puts the marker there.
+        # Read positionally, a marker is parsed as coordinates and every row
+        # reports "corner list could not be read" — 80 warnings on an 80-row
+        # sheet, burying anything real.
+        col8_is_cross = _norm_hdr(_header_cell(ws, 7)).startswith("cross")
         rows = []
         for raw in ws.iter_rows(min_row=2, values_only=True):
             # Column 8 (Corners) is OPTIONAL and additive: a sheet with only the
@@ -424,40 +519,87 @@ class SeedImportService:
                 "width": _dec(width),
                 "height": _dec(height),
                 # Raw text, validated later in import_seeds (which knows L/W).
-                "corners_raw": None if _blank(corners) else str(corners).strip(),
+                "corners_raw": (None if col8_is_cross or _blank(corners)
+                                else str(corners).strip()),
+                # True when the sheet marks this stone as cut/trimmed. The marker
+                # says THAT a seed is cut, never HOW MUCH, so it cannot rebuild an
+                # outline — a marked seed is still packed at its full Length x
+                # Width. Carried so the import can report the count.
+                "is_cross": (bool(col8_is_cross) and not _blank(corners)
+                             and str(corners).strip().upper() == "CROSS"),
             })
         wb.close()
         return rows
 
     @staticmethod
     def _read_sides(ws):
-        """Read the four-edge layout: BatchNo StockNo Pcs Cts L1 W2 L3 W4 Height.
+        """Read the four-edge layout:
+        BatchNo StockNo Pcs Cts L1 W2 L3 W4 Height [CrossAngle].
 
         Length and Width are the LONGER edge of each pair (the seed's bounding
         box); the shorter edge of each pair is what the corner cut took away, and
         `sides` carries all four through so import_seeds can rebuild the outline.
+
+        Column 10, when present, DECLARES which corner the cross is on — L1/L2/
+        R1/R2 for left-top, left-bottom, right-top, right-bottom. It is the only
+        source of that: the machine normalises its four sides, so they give the
+        cut's size but never its corner. Sheets without the column still import
+        exactly as before.
         """
+        cols = _column_map(ws)
+
+        def pick(cells, role):
+            i = cols.get(role)
+            return cells[i] if i is not None and i < len(cells) else None
+
         rows = []
         for raw in ws.iter_rows(min_row=2, values_only=True):
-            cells = list(raw) + [None] * 9
-            batch, stock, pcs, cts, l1, w2, l3, w4, height = cells[:9]
+            cells = list(raw) + [None] * 4
+            # BY NAME, not position — the sheet may carry leading columns.
+            batch, stock = pick(cells, "batch"), pick(cells, "stock")
+            pcs, cts = pick(cells, "pcs"), pick(cells, "cts")
+            l1, w2 = pick(cells, "l1"), pick(cells, "w2")
+            l3, w4 = pick(cells, "l3"), pick(cells, "w4")
+            height = pick(cells, "height")
+            xangle = pick(cells, "corner")
+            if xangle is None:
+                xangle = pick(cells, "cross")
             if all(_blank(c) for c in (batch, stock, pcs, cts, l1, w2, l3, w4, height)):
                 continue
             if _blank(batch) and _blank(stock):
                 continue                      # totals / summary row, same rule as legacy
             sides = tuple(_dec(v) for v in (l1, w2, l3, w4))
             have = [s for s in sides if s is not None]
+            # A PLAIN stone has one length and one width, so the sheet may give
+            # LENGTH/WIDTH and leave the four sides blank — writing the same
+            # number into L1 and L3 just to fill the columns would be pointless
+            # and invites the mistake of putting the WIDTH into L3, which reads
+            # as a 2 mm cut on a stone that has none.
+            #
+            # So each row chooses: four sides when they are all there (a cut
+            # stone), otherwise LENGTH and WIDTH (a plain one).
+            plain_l, plain_w = _dec(pick(cells, "length")), _dec(pick(cells, "width"))
+            if len(have) == 4:
+                box_l = max(sides[0], sides[2])
+                box_w = max(sides[1], sides[3])
+            else:
+                box_l, box_w = plain_l, plain_w
             rows.append({
                 "batch_no": _text(batch),
                 "stock_no": _text(stock),
                 "pcs": _int(pcs),
                 "cts": _dec(cts),
-                # Bounding box = the longer edge of each pair.
-                "length": max(sides[0], sides[2]) if None not in (sides[0], sides[2]) else (have[0] if have else None),
-                "width": max(sides[1], sides[3]) if None not in (sides[1], sides[3]) else None,
+                # Bounding box: the longer edge of each pair for a cut stone,
+                # the plain LENGTH/WIDTH otherwise.
+                "length": box_l,
+                "width": box_w,
                 "height": _dec(height),
                 "corners_raw": None,
                 "sides": sides if len(have) == 4 else None,
+                # Declared cross corner, normalised. None means the cell was
+                # blank or unreadable — import_seeds warns rather than guessing.
+                "cut_corner": parse_cut_corner(xangle),
+                "cut_corner_raw": None if _blank(xangle) else str(xangle).strip(),
             })
         return rows
 
@@ -505,6 +647,7 @@ class SeedImportService:
         to_create = []
         skipped = []
         warnings = []
+        cross_count = 0
         seen_in_sheet = set()
         imported_by_batch = {}  # batch_no (stripped) -> how many seeds imported
 
@@ -518,21 +661,65 @@ class SeedImportService:
                     skipped.append({"stock_no": stock, "batch_no": r["batch_no"], "reason": "Duplicate row in sheet"})
                     continue
                 seen_in_sheet.add(stock)
+            # A row that cannot yield all three dimensions must be REPORTED, not
+            # sent to the database. Passing a NULL into a numeric column fails
+            # the whole INSERT with "arithmetic overflow converting nvarchar to
+            # numeric" — every other row is lost with it and the screen shows a
+            # bare 500. One unusable row should cost that row and nothing else.
+            missing = [n for n, v in (("length", r["length"]), ("width", r["width"]),
+                                      ("height", r["height"])) if v is None]
+            if missing:
+                skipped.append({
+                    "stock_no": stock or None, "batch_no": r["batch_no"],
+                    "reason": "no %s — check the sheet has LENGTH and WIDTH for a "
+                              "plain seed, or all four of L1 W2 L3 W4 for a cut one"
+                              % " or ".join(missing),
+                })
+                continue
             bno = (r["batch_no"] or "").strip()
             imported_by_batch[bno] = imported_by_batch.get(bno, 0) + 1
             # Optional outline for an irregular seed. A corner list that fails
             # validation NEVER costs the seed: it is imported as a plain
             # Length x Width rectangle (the pre-existing behaviour) and the reason
             # is reported as a warning. Blank is the normal case and is silent.
+            assumed = False
             if r.get("sides"):
-                # Four-edge layout: rebuild the cut-corner outline from L1/W2/L3/W4.
-                corners_json, warn = sides_to_corners(*r["sides"])
+                # Four-edge layout: rebuild the cut-corner outline from
+                # L1/W2/L3/W4 for the size, and the declared column for the
+                # corner. A cut stone with no corner declared CANNOT be built
+                # correctly — the sides do not say which way it faces — so it is
+                # imported as a plain rectangle and reported. That is safe (the
+                # real stone is smaller than its rectangle and still drops into
+                # the seat) but it forfeits nesting and reads coverage high.
+                corner = r.get("cut_corner")
+                raw_corner = r.get("cut_corner_raw")
+                if corner is None and raw_corner:
+                    corners_json, warn = None, (
+                        "cross corner %r not recognised — expected LT, LB, RT or RB"
+                        % raw_corner)
+                elif corner is None and _sides_are_cut(r["sides"]):
+                    # No corner declared. Assume LEFT-TOP and MARK it, so Max
+                    # Coverage spends the declared stones first and falls back to
+                    # these only to fill what is left. The assumption is right
+                    # about two thirds of the time: rotation turns LEFT-TOP into
+                    # RIGHT-BOTTOM, but LEFT-BOTTOM and RIGHT-TOP are mirror
+                    # images no rotation can reach.
+                    corners_json, warn = sides_to_corners(
+                        *r["sides"], corner=CUT_CORNER_DEFAULT)
+                    assumed = corners_json is not None
+                    if warn is None:
+                        warn = ("no cross corner given — assumed %s"
+                                % CUT_CORNER_DEFAULT)
+                else:
+                    corners_json, warn = sides_to_corners(*r["sides"], corner=corner)
             else:
                 corners_json, warn = validate_corners(
                     r.get("corners_raw"), r["length"], r["width"],
                 )
             if warn:
                 warnings.append({"stock_no": stock or None, "batch_no": r["batch_no"], "reason": warn})
+            if r.get("is_cross"):
+                cross_count += 1
             to_create.append(SeedData(
                 seed_id=uuid.uuid4(),
                 batch_id=batch_id_by_no.get((r["batch_no"] or "").strip()),
@@ -542,7 +729,12 @@ class SeedImportService:
                 length=r["length"],
                 width=r["width"],
                 height=r["height"],
-                corners_json=json.dumps(corners_json) if corners_json else None,
+                # A declared corner stores the bare outline, as before. An
+                # ASSUMED one stores {"pts": ..., "assumed": true} so the packer
+                # can tell them apart; _poly_from_seed reads both.
+                corners_json=(json.dumps({"pts": corners_json, "assumed": True})
+                              if corners_json and assumed
+                              else json.dumps(corners_json) if corners_json else None),
                 entry_date=now,
                 entry_by=entry_by,
             ))
@@ -567,4 +759,10 @@ class SeedImportService:
             # Rows imported as rectangles because their outline failed validation.
             # Additive key: existing clients that don't read it are unaffected.
             "warnings": warnings,
+            # How many imported stones the sheet marked CROSS. Reported so the
+            # count is visible at import: with no cut measurements on the sheet
+            # these are packed at their full Length x Width, which makes the
+            # coverage figure read high by however much was ground off them.
+            # 0 for a sheet with no CROSS column.
+            "cross_count": cross_count,
         }

@@ -269,7 +269,20 @@ def _write_compare_xlsx(path, plate_no, panels):
 
 
 def _poly_from_seed(s):
-    """TRN_SeedData.CornersJSON -> [(x, y), ...] in mm, or None.
+    """TRN_SeedData.CornersJSON -> ([(x, y), ...], assumed) or (None, False).
+
+    Two stored shapes are accepted:
+
+      [[x, y], ...]                      an outline built from a DECLARED corner
+      {"pts": [[x, y], ...], "assumed": true}
+                                         the datasheet left the cross corner
+                                         blank, so LEFT-TOP was assumed
+
+    The flag matters because an assumed corner is right only about two thirds of
+    the time — rotation turns LEFT-TOP into RIGHT-BOTTOM, but LEFT-BOTTOM and
+    RIGHT-TOP are mirror images it can never reach. Marking them lets the packer
+    spend the known-good stones first and fall back to the assumed ones only to
+    fill what is left.
 
     Stored data is trusted only as far as it parses: the outline was validated by
     shapes.validate_corners() at import time, but a hand-edited row must degrade
@@ -277,12 +290,17 @@ def _poly_from_seed(s):
     """
     raw = getattr(s, "corners_json", None)
     if not raw:
-        return None
+        return None, False
     try:
-        pts = [(float(x), float(y)) for x, y in json.loads(raw)]
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return None
-    return pts if len(pts) >= 3 else None
+        blob = json.loads(raw)
+        assumed = False
+        if isinstance(blob, dict):
+            assumed = bool(blob.get("assumed"))
+            blob = blob.get("pts") or []
+        pts = [(float(x), float(y)) for x, y in blob]
+    except (TypeError, ValueError, AttributeError, json.JSONDecodeError):
+        return None, False
+    return (pts, assumed) if len(pts) >= 3 else (None, False)
 
 
 def _blocks_from_seeds(seeds, shapes, square_tol):
@@ -305,9 +323,14 @@ def _blocks_from_seeds(seeds, shapes, square_tol):
         # Optional true outline for an irregular seed, as [(x, y), ...] in mm.
         # Additive and nullable: only Max Coverage reads it. The Arrange packer
         # (engine/pack_v2.py) reads L/W/H/stock/cts/shape only, so it is unaffected.
-        poly = _poly_from_seed(s)
+        poly, assumed = _poly_from_seed(s)
         if poly:
             blk["poly"] = poly
+            if assumed:
+                # Cross corner was blank on the datasheet and LEFT-TOP was
+                # assumed. Max Coverage places these AFTER the stones whose
+                # corner was declared.
+                blk["corner_assumed"] = True
         out.append(blk)
     return out
 

@@ -227,6 +227,7 @@ class PolyFromSeedTests(SimpleTestCase):
     value it cannot trust, rather than break a packing run."""
 
     def _poly(self, stored):
+        """Returns (points, assumed) — see engine_runner._poly_from_seed."""
         from .engine_runner import _poly_from_seed
 
         class Row:
@@ -235,19 +236,31 @@ class PolyFromSeedTests(SimpleTestCase):
 
     def test_null_and_blank_give_none(self):
         for v in (None, ""):
-            self.assertIsNone(self._poly(v))
+            self.assertEqual(self._poly(v), (None, False))
 
     def test_unparseable_gives_none(self):
         for v in ("not json", "{}", "[1,2,3]", '[["a","b"],["c","d"]]'):
-            self.assertIsNone(self._poly(v), v)
+            self.assertEqual(self._poly(v), (None, False), v)
 
     def test_too_few_points_gives_none(self):
-        self.assertIsNone(self._poly("[[0,0],[1,0]]"))
+        self.assertEqual(self._poly("[[0,0],[1,0]]"), (None, False))
 
     def test_valid_outline_round_trips(self):
         self.assertEqual(
             self._poly("[[0,0],[12.4,0],[12.4,6.5],[9.2,9.8],[0,9.8]]"),
-            [(0.0, 0.0), (12.4, 0.0), (12.4, 6.5), (9.2, 9.8), (0.0, 9.8)])
+            ([(0.0, 0.0), (12.4, 0.0), (12.4, 6.5), (9.2, 9.8), (0.0, 9.8)], False))
+
+    def test_assumed_corner_round_trips_and_is_flagged(self):
+        """A blank cross corner is stored as {"pts": ..., "assumed": true} so the
+        packer can hold those stones back — a bare list must stay unflagged."""
+        pts, assumed = self._poly(
+            '{"pts": [[0,0],[12.4,0],[12.4,6.5],[9.2,9.8],[0,9.8]], "assumed": true}')
+        self.assertEqual(pts, [(0.0, 0.0), (12.4, 0.0), (12.4, 6.5),
+                               (9.2, 9.8), (0.0, 9.8)])
+        self.assertTrue(assumed)
+
+    def test_assumed_dict_without_points_gives_none(self):
+        self.assertEqual(self._poly('{"assumed": true}'), (None, False))
 
 
 def _rect_seed(stock, L, W, H=0.50):

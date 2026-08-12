@@ -1575,8 +1575,35 @@ def _seed_footprint(s):
     return ShPoly([(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)])
 
 
+# Rotation is allowed for every seed — squares, rectangles and cut/trimmed alike.
+# Turning a stone on the plate is a real operation; MIRRORING one is not, and
+# affinity.rotate() cannot produce a mirror, so every orientation reached here is
+# physically buildable.
+#
+# The rule from the shop floor is "clockwise only". That does NOT narrow this
+# tuple: a 90 degree clockwise turn is a 270 degree anticlockwise one, so turning
+# only clockwise still reaches all four orientations. Direction of travel does not
+# constrain where a stone ends up — only which final orientations are permitted
+# does, and all four are.
+#
 # 180 is tried straight after 0 on purpose: a cut corner and its neighbour's cut
 # corner only nest when one of them is turned to face the other.
+#
+# HISTORY, so this is not flip-flopped again without cause. This was briefly
+# (0,) after a real plate showed 7 of 11 cut seeds facing left when every real
+# stone faced right. Locking to 0 hid that, and happened to pack better too:
+#
+#   rotation allowed   3 plates   84.0 / 67.7 / 11.4 %   run avg 54.4%
+#   no rotation        2 plates   83.9 / 79.1 %          run avg 81.5%
+#
+# But 0-only treated the symptom. The cause is that the sheet cannot say which
+# side the cut is on, so the outline is rebuilt from the L1/W2/L3/W4 ORDER alone
+# and a mirrored reading is indistinguishable from a correct one. The datasheet
+# is gaining an explicit cut-side column; once orientation is stated rather than
+# inferred, rotation is safe and the packer keeps the freedom it needs.
+#
+# UNTIL that column is imported, cut seeds can still be turned to face the wrong
+# way — the run-average figures above are what that costs.
 ENHANCED_ANGLES = (0, 180, 90, 270)
 NEST_STEP = 0.25          # mm — how finely a seed is slid left to close a gap
 ROW_PROBE = 1.0           # mm — how far to step up when a row height fits nothing
@@ -1586,14 +1613,44 @@ RIM_EPS = 0.05            # mm — start this far inside the chord, so a corner
 ROW_TOL = 0.15            # mm — how much taller than its row a seed may stand
 SWEEP_ANCHORS = 48        # max pocket corners the sweep-up pass probes
 
-# Give the row-end seat (against the rim) to a cut seed ahead of a rectangle.
-#   True  — 52 seeds/plate, 11 cut seeds consumed, 84.5% coverage
-#   False — 50 seeds/plate,  3 cut seeds consumed, 85.2% coverage
-# Both leave ZERO notches inside the plate. True is the default because cut seeds
-# have to be used up somewhere: hold them back and a later plate ends up holding
-# nothing but cut seeds, with no rim slots left for any of them. The 0.7 points
-# of coverage buys a steady drain on the cut-seed pile.
-CUT_SEEDS_TAKE_ROW_ENDS = True
+# Who wins a seat when a cut stone and a plain one both fit. BOTH are tried on
+# every plate and the better result is kept — see enhanced_plate_job.
+#
+#   "cut-first"   — a cut stone takes the rim seat that opens a row, so the cut
+#                   pile drains a few per plate. Packs more stones in, but spends
+#                   crosses in the middle of the plate where they leave a notch.
+#   "plain-first" — a plain stone wins any tie. Fewer stones, far less waste.
+#
+# Measured on the reference plate, and the reason neither is hard-coded:
+#
+#   cut-first     42 seats  84.90%  11 cut used  10 unbuildable seats  24.6 mm2
+#   plain-first   39 seats  84.37%   4 cut used   2 unbuildable seats   2.3 mm2
+#
+# Coverage alone would pick cut-first; buildable area picks plain-first. Which
+# one wins depends on the mix on the day, so the packer runs both.
+CUT_POLICIES = ("cut-first", "plain-first")
+
+# How each row is laid. CENTRE-OUT only: rows start at the middle of the plate
+# and grow both ways, so what is left over is shared between the two rims.
+#
+# The old "left" mode opened every row at the left chord and filled across,
+# which pushed all the slack to one side — measured on the Ø80 reference plate,
+# 27.99 mm of clear rim on the left against 30.06 mm on the right. Centre-out
+# balances that to 29.13 against 29.09, and a symmetric plate is what the shop
+# floor wants to work from.
+#
+# It is also better on the numbers, once the whole run is counted:
+#
+#   centre   plate 1: 40 seats 84.63%  7 cut  3 unbuildable | run: 35 cut, 27 bad
+#   left     plate 1: 38 seats 83.84%  1 cut  0 unbuildable | run: 35 cut, 28 bad
+#
+# Left-to-right keeps plate 1 spotless only by pushing the cut stones onto plate
+# 2, where they cost more. Over three plates the two place the same 35 cut stones
+# and centre-out ends one unbuildable seat ahead.
+#
+# "left" is still implemented and can be put back here as a candidate; the packer
+# tries every entry in this tuple and keeps the best-scoring plate.
+FILL_DIRECTIONS = ("centre",)
 
 # Where the first row's baseline sits, as an offset above the bottom of the
 # plate. Rows stack from there, so this is the PHASE of the row grid against the
@@ -1609,11 +1666,53 @@ CUT_SEEDS_TAKE_ROW_ENDS = True
 #
 # Coarse sweep first, then a refine step either side of the winner. Rows run
 # about 9 mm tall, so phases beyond that repeat what a lower one already tried.
-ROW_PHASES = (0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0)
-ROW_PHASE_REFINE = 0.5
+#
+# The step is COARSE on purpose. Every phase is packed once per cut policy and
+# once per fill direction, so the phase count multiplies by four. With real cut
+# outlines a single pack costs about 30 s — polygon-against-polygon tests are far
+# dearer than box-against-box — and a seven-phase sweep took 946 s a plate. Four
+# phases plus the refine step below covers the same 0-6 mm range and brings that
+# back to roughly a third.
+ROW_PHASES = (0.0, 2.0, 4.0, 6.0)
+ROW_PHASE_REFINE = 1.0
 
 
-def _pack_once(args, y0=None):
+def _interior_waste(placed, disc):
+    """What a layout wastes because a cross has nothing to face.
+
+    Returns ``(notch_area, stone_count, stone_area)`` — the open notch beside
+    such stones, how many there are, and how much stone is sitting in those
+    unbuildable seats.
+
+    A cut stone's missing corner has to go somewhere. Against the rim it costs
+    nothing — that crescent was unusable anyway. Against another cross it costs
+    nothing either, because the two sit flush. Against a FLAT neighbour it leaves
+    a notch no stone can enter, and the shop floor cannot build that seat.
+    """
+    from shapely.geometry import Polygon as ShPoly, box as shbox
+    from shapely.ops import unary_union
+
+    if not placed:
+        return 0.0, 0, 0.0
+    occ = unary_union([ShPoly(p["poly"]).buffer(0) for p in placed])
+    waste, n, stone = 0.0, 0, 0.0
+    for p in placed:
+        g = ShPoly(p["poly"]).buffer(0)
+        void = shbox(*g.bounds).difference(g)
+        if void.is_empty or void.area < 0.05:
+            continue                                  # a plain rectangle
+        inside = void.intersection(disc)
+        if void.area - inside.area > void.area * 0.5:
+            continue                                  # mostly past the rim
+        open_part = inside.difference(occ)             # not taken by a neighbour
+        if open_part.area >= void.area * 0.25:
+            waste += open_part.area
+            stone += g.area
+            n += 1
+    return waste, n, stone
+
+
+def _pack_once(args, y0=None, policy="cut-first", fill="left"):
     """ONE complete packing run for MAX COVERAGE. Returns (placed, fill_pct).
 
     Draws nothing and mutates no caller state, so it is safe to call repeatedly
@@ -1631,7 +1730,19 @@ def _pack_once(args, y0=None):
     instead of each leaving a triangle of scrap.
 
     `args` = (real, pi, plate_d, R, min_size, path); `y0` is the absolute y of
-    the first row's baseline, None meaning the bottom of the plate.
+    the first row's baseline, None meaning the bottom of the plate; `policy`
+    decides who wins a seat when a cut stone and a plain one both fit:
+
+      "cut-first"   — a cut stone takes the rim seat that opens a row, so the
+                      cut pile drains a few per plate
+      "plain-first" — a plain stone wins any tie, so crosses are not spent in
+                      the middle of the plate where they leave a notch
+
+    `fill` is the direction each row is laid:
+
+      "left"   — open at the left chord and fill across, as it always has
+      "centre" — start at the middle of the plate and grow both ways, so a row
+                 ends ragged at both rims instead of flush left and ragged right
     """
     real, pi, plate_d, R, min_size, path = args
     P.PLATE_D = plate_d
@@ -1640,6 +1751,10 @@ def _pack_once(args, y0=None):
     from shapely.ops import unary_union
 
     disc = Point(0.0, 0.0).buffer(R, resolution=180)
+    # The disc is a 180-gon inscribed in the true circle, so a box that clears
+    # this radius is inside the polygon too. RIM_EPS keeps the analytic test on
+    # the safe side of that difference.
+    RSQ = (R - RIM_EPS) ** 2
     if not real:
         return [], 0.0
 
@@ -1677,7 +1792,15 @@ def _pack_once(args, y0=None):
     # one plate holds that choice is a real lever — spending a row's width on
     # fewer, wider seeds leaves less end-of-row remainder. Worth 1.6 points on a
     # Ø80 plate (77.08% to 78.71%) for a change of sort key alone.
-    queue.sort(key=lambda s: (-(shapes[id(s)].bounds[3] - shapes[id(s)].bounds[1]),
+    #
+    # ASSUMED corners go last. A stone whose datasheet left the cross corner
+    # blank is carrying a guess — LEFT-TOP — and a guess is right only about two
+    # thirds of the time, because rotation turns LEFT-TOP into RIGHT-BOTTOM but
+    # can never reach LEFT-BOTTOM or RIGHT-TOP, which are mirror images. Placing
+    # the declared stones first means a plate that fills on known-good data never
+    # spends a guessed one at all.
+    queue.sort(key=lambda s: (1 if s.get("corner_assumed") else 0,
+                              -(shapes[id(s)].bounds[3] - shapes[id(s)].bounds[1]),
                               -(shapes[id(s)].bounds[2] - shapes[id(s)].bounds[0])))
 
     placed, occ, used = [], [], set()
@@ -1693,8 +1816,17 @@ def _pack_once(args, y0=None):
 
     def free(g):
         """Wholly inside the plate, and at least `clear` mm from every neighbour."""
-        if not disc.contains(g):
-            return False
+        # Cheap analytic rim test first. disc.contains() walks a 180-gon and is
+        # called tens of thousands of times a pack; the four corners of the
+        # bounding box against R settles almost every case without it, and a box
+        # inside the circle guarantees the stone inside it is too.
+        bx0, by0, bx1, by1 = g.bounds
+        far = max(bx0 * bx0, bx1 * bx1) + max(by0 * by0, by1 * by1)
+        if far > RSQ:
+            # A corner of the BOX is outside — the stone itself may still be in
+            # (a ground-off corner), so fall back to the exact test.
+            if not disc.contains(g):
+                return False
         t = tree[0]
         if t is None:
             return True
@@ -1704,15 +1836,46 @@ def _pack_once(args, y0=None):
             if clear > 0.0:
                 if g.distance(o) < clear - EPS:
                     return False
-            elif g.intersects(o) and g.intersection(o).area > EPS:
+                continue
+            # Seeds are laid touching, so `intersects` is true for every
+            # neighbour and the old test paid for a full polygon intersection on
+            # each one. Overlapping BOXES are a prerequisite for overlapping
+            # areas, so reject on the boxes first — that settles a touching
+            # neighbour with four comparisons instead.
+            ob0, ob1, ob2, ob3 = o.bounds
+            if (min(bx1, ob2) - max(bx0, ob0) <= EPS
+                    or min(by1, ob3) - max(by0, ob1) <= EPS):
+                continue
+            if g.intersects(o) and g.intersection(o).area > EPS:
                 return False
         return True
 
-    def slide_left(g):
-        """Nudge a seed left while it stays legal — this is the nesting step."""
+    def slide_left(g, limit=None):
+        """Nudge a seed left while it stays legal — this is the nesting step.
+
+        `limit` stops the seed's left edge going past a line. Centre-out needs
+        it: the first stone of a row has nothing to its left, so without a stop
+        it slides the full width of the plate to the rim — which defeats the
+        point of starting at the centre AND costs hundreds of collision tests,
+        since every 0.25 mm step is a full free() check.
+        """
         cur = g
         while True:
+            if limit is not None and cur.bounds[0] - NEST_STEP < limit:
+                return cur
             nxt = affinity.translate(cur, -NEST_STEP, 0.0)
+            if not free(nxt):
+                return cur
+            cur = nxt
+
+    def slide_right(g, limit=None):
+        """The mirror of slide_left, for a row growing leftwards from the middle.
+        `limit` caps the seed's RIGHT edge."""
+        cur = g
+        while True:
+            if limit is not None and cur.bounds[2] + NEST_STEP > limit:
+                return cur
+            nxt = affinity.translate(cur, NEST_STEP, 0.0)
             if not free(nxt):
                 return cur
             cur = nxt
@@ -1741,8 +1904,12 @@ def _pack_once(args, y0=None):
             "lx": rp.x, "ly": rp.y,
         })
 
-    def scan(y, x, row_h, allow_taller):
-        """Best seed for the seat at (x, y), or None. Returns (key, seed, deg, poly)."""
+    def scan(y, x, row_h, allow_taller, going_left=False):
+        """Best seed for the seat at (x, y), or None. Returns (key, seed, deg, poly).
+
+        `x` is the seat's NEAR edge: its left edge when the row grows rightwards,
+        its right edge when the row grows leftwards from the middle of the plate.
+        """
         best = None
         for s in queue:
             if id(s) in used:
@@ -1756,18 +1923,30 @@ def _pack_once(args, y0=None):
                 y_out = max(abs(y), abs(y + hh))
                 if y_out >= R:
                     continue
-                x_min = -math.sqrt(R * R - y_out * y_out) + RIM_EPS
+                chord = math.sqrt(R * R - y_out * y_out) - RIM_EPS
                 # No cheap width pre-test here on purpose. Rejecting a seat
                 # because the seed's BOUNDING BOX overruns the far chord throws
                 # away legal placements of cut seeds: the ground-off corner means
                 # the box crosses the chord while the stone itself is still
                 # inside. free() tests the true outline, so let it decide.
-                x_at = max(x, x_min)
                 rb = rg.bounds
-                g = affinity.translate(rg, x_at - rb[0], y - rb[1])
-                if not free(g):
-                    continue
-                g = slide_left(g)
+                # Centre-out keeps each half on its own side of the middle: a
+                # stone growing rightwards may nest back toward x=0 but not past
+                # it, and vice versa. Left-to-right has no such stop — its stones
+                # nest all the way back to whatever is already placed.
+                if going_left:
+                    # Right edge on the cursor, then nudged back toward the middle.
+                    x_at = min(x, chord)
+                    g = affinity.translate(rg, x_at - rb[2], y - rb[1])
+                    if not free(g):
+                        continue
+                    g = slide_right(g, 0.0 if fill == "centre" else None)
+                else:
+                    x_at = max(x, -chord)
+                    g = affinity.translate(rg, x_at - rb[0], y - rb[1])
+                    if not free(g):
+                        continue
+                    g = slide_left(g, 0.0 if fill == "centre" else None)
 
                 # Plate actually LOST by taking this seat: the strip consumed
                 # along the row, clipped to the plate, minus the seed itself.
@@ -1781,9 +1960,20 @@ def _pack_once(args, y0=None):
                 # a 90-degree rotation win the opening slot and set the row 2 mm
                 # taller than it needed to be. Every shorter seed in that row then
                 # left a band above it.
-                strip_x0 = g.bounds[0] if row_h <= 0.0 else x
-                strip = shbox(strip_x0, y, g.bounds[2], y + hh)
-                lost = max(0.0, strip.intersection(disc).area - g.area)
+                if going_left:
+                    lo, hi = g.bounds[0], (g.bounds[2] if row_h <= 0.0 else x)
+                else:
+                    lo, hi = (g.bounds[0] if row_h <= 0.0 else x), g.bounds[2]
+                sx0, sx1 = min(lo, hi), max(lo, hi)
+                # Clipping the strip to the plate only matters when it actually
+                # reaches the rim. Inside the circle its area is just width x
+                # height, and skipping the clip removes one polygon intersection
+                # per candidate seat — the single hottest call in the packer.
+                if max(sx0 * sx0, sx1 * sx1) + max(y * y, (y + hh) ** 2) <= RSQ:
+                    strip_area = (sx1 - sx0) * hh
+                else:
+                    strip_area = shbox(sx0, y, sx1, y + hh).intersection(disc).area
+                lost = max(0.0, strip_area - g.area)
                 out = _outward_score(g, cut0, deg)
                 gap = max(0.0, row_h - hh) if row_h > 0.0 else 0.0
                 # A seed lying flat — its shorter side as the height. Only that
@@ -1792,7 +1982,15 @@ def _pack_once(args, y0=None):
                 # seed then leaves a band above it.
                 lying_flat = hh <= min(g0.bounds[2] - g0.bounds[0],
                                        g0.bounds[3] - g0.bounds[1]) + 0.05
-                if (CUT_SEEDS_TAKE_ROW_ENDS and row_h <= 0.0
+                # A stone whose cross corner was ASSUMED is a last resort at
+                # every seat, not merely later in the queue. Sorting the queue
+                # only breaks ties — scan() picks the best-scoring stone for each
+                # seat, so an assumed one still won seats while declared stones
+                # were going spare. Leading the key with this makes the rule
+                # absolute: an assumed stone is chosen only when no declared one
+                # fits the seat at all.
+                risky = 1 if s.get("corner_assumed") else 0
+                if (policy == "cut-first" and row_h <= 0.0
                         and cut0 is not None and out > 0.0 and lying_flat):
                     # ROW-END SEAT. The first seat of a row sits against the rim,
                     # and that is where a ground corner earns its keep. Cut seeds
@@ -1806,7 +2004,7 @@ def _pack_once(args, y0=None):
                     # every neighbour. Ranking only on the outward cut chose
                     # exactly that: an 8.88 mm seed turned 90 degrees opened a row
                     # at 11.12 mm and cost 55 mm2 in one stripe.
-                    key = (-1.0, -out, round(lost, 2))
+                    key = (risky, -1.0, -out, round(lost, 2))
                 else:
                     # Mid-row, FILLING THE ROW'S HEIGHT matters more than which
                     # way a cut points. A seed shorter than its row leaves a
@@ -1816,7 +2014,15 @@ def _pack_once(args, y0=None):
                     # its sides is the height. Ranking the cut direction first
                     # left those bands open for the sake of a cut that, away from
                     # the rim, has no curve to follow anyway.
-                    key = (round(lost, 2), round(gap, 2), -out)
+                    #
+                    # Under "plain-first" a plain stone also wins any tie against
+                    # a cut one. A cut stone put here has its cross facing a flat
+                    # neighbour, which leaves a notch nothing can fill and a seat
+                    # the shop floor cannot build.
+                    key = ((risky, round(lost, 2), round(gap, 2),
+                            1 if cut0 is not None else 0, -out)
+                           if policy == "plain-first"
+                           else (risky, round(lost, 2), round(gap, 2), -out))
                 if best is None or key < best[0]:
                     best = (key, s, deg, g)
         return best
@@ -1827,25 +2033,51 @@ def _pack_once(args, y0=None):
         guard += 1
         if all(id(s) in used for s in queue):
             break
-        x = -R                  # cursor; each seed works out its own legal start
+        # CENTRE-OUT lays each row from the middle of the plate outwards, filling
+        # rightwards and leftwards in turn, so a row ends ragged at BOTH rims
+        # instead of flush left and ragged right. LEFT-TO-RIGHT opens each row at
+        # the left chord and fills across.
+        #
+        # Both are packed on every plate and the better one is kept — the row
+        # direction changes which chord each row is anchored to, and which wins
+        # depends on the seed mix.
+        xr = 0.0 if fill == "centre" else -R
+        xl = 0.0                # only used by centre-out, growing leftwards
         row_h = 0.0
+        dead = {False: False, True: False}   # has each side run dry?
         while True:
             # Level rows only. A taller seed is never admitted, even when the row
             # would otherwise end early: letting one in raises the row's height,
             # and every shorter seed already in it then sits under a band that no
             # later row can reach. Measured on a Ø80 plate that traded 80.5% for
             # 78.0% — the stretch of row left empty costs less than the band.
-            best = scan(y, x, row_h, False)
-            if not best:
+            took = False
+            for going_left in ((False, True) if fill == "centre" else (False,)):
+                # Once a side of the row has nothing left that fits, STOP
+                # scanning it. Re-scanning an exhausted side costs a full pass
+                # over the queue for every remaining seat on the other side, and
+                # that alone made a centre-out pack take 62 s against 5 s.
+                if dead[going_left]:
+                    continue
+                best = scan(y, xl if going_left else xr, row_h, False, going_left)
+                if not best:
+                    dead[going_left] = True
+                    continue
+                _key, s, deg, g = best
+                record(s, deg, g)
+                # Leave the requested gap before the next seat, and before the
+                # next row. free() already enforces it against every neighbour;
+                # advancing the cursors too stops the search starting inside a gap
+                # it can never use, which would otherwise cost a slide attempt for
+                # every seed.
+                if going_left:
+                    xl = min(xl, g.bounds[0] - clear)
+                else:
+                    xr = max(xr, g.bounds[2] + clear)
+                row_h = max(row_h, g.bounds[3] - y)
+                took = True
+            if not took:
                 break
-            _key, s, deg, g = best
-            record(s, deg, g)
-            # Leave the requested gap before the next seat, and before the next
-            # row. free() already enforces it against every neighbour; advancing
-            # the cursors too stops the search starting inside a gap it can never
-            # use, which would otherwise cost a slide attempt for every seed.
-            x = g.bounds[2] + clear
-            row_h = max(row_h, g.bounds[3] - y)
         y += (row_h + clear) if row_h > 0 else ROW_PROBE
 
     # ---- SWEEP-UP: whole seeds into the pockets the row sweep walked past -----
@@ -1928,6 +2160,9 @@ def enhanced_plate_job(args):
     84.0%. Rather than betting on one phase, this packs the plate once per phase
     in ROW_PHASES, refines either side of the winner, and renders the best plate.
 
+    Both cut-seed policies are tried and the better BUILDABLE result is kept —
+    coverage on its own would pick a layout whose seats the shop floor rejects.
+
     Every run is independent and non-destructive — nothing is carried between
     them — so the result can only be at least as good as the single run this
     replaces, at the cost of packing the plate a handful of times.
@@ -1939,27 +2174,51 @@ def enhanced_plate_job(args):
         render_enhanced_circle([], [], pi, R, 0.0, path)
         return (pi, [], 0.0, round(2 * R, 4), 0.0)
 
-    best_placed, best_fill, best_phase = None, -1.0, 0.0
+    from shapely.geometry import Point
+    disc = Point(0.0, 0.0).buffer(R, resolution=180)
+
+    best = {"placed": None, "fill": -1.0, "score": -1.0, "phase": 0.0,
+            "policy": CUT_POLICIES[0], "dir": FILL_DIRECTIONS[0],
+            "waste": 0.0, "nwaste": 0}
     tried = set()
 
-    def attempt(ph):
-        nonlocal best_placed, best_fill, best_phase
-        key = round(ph, 3)
+    def attempt(ph, policy, direction=None):
+        direction = direction or best["dir"]
+        key = (round(ph, 3), policy, direction)
         if key in tried or ph < 0.0:
             return
         tried.add(key)
-        pl, f = _pack_once(args, -R + ph)
-        if f > best_fill:
-            best_placed, best_fill, best_phase = pl, f, ph
+        pl, f = _pack_once(args, -R + ph, policy, direction)
+        waste, nw, stuck = _interior_waste(pl, disc)
+        # SCORE = area that can actually be BUILT. Coverage on its own prefers
+        # the layout that squeezes in more stones by putting crosses against flat
+        # neighbours — seats the shop floor has to reject. A rejected seat costs
+        # both the notch beside it and the stone sitting in it, so both come off.
+        score = (f / 100.0) * math.pi * R * R - waste - stuck
+        if score > best["score"]:
+            best.update(placed=pl, fill=f, score=score, phase=ph,
+                        policy=policy, waste=waste, nwaste=nw)
+            best["dir"] = direction
 
-    for ph in ROW_PHASES:
-        attempt(ph)
+    # EVERY policy gets EVERY phase. It is tempting to sweep the phases once and
+    # test the other policies only near the winner — on one pool both policies
+    # peaked at the same phase, so it looked free. It is not. On a 90-seed pool
+    # they peak in different places, and probing the second policy at the first
+    # one's phase found 82.85% with an unbuildable seat when that policy's own
+    # best was 83.50% with none. The pruned search returned a plate that was
+    # neither policy's best. Coverage is worth more than the seconds saved.
+    for direction in FILL_DIRECTIONS:
+        for policy in CUT_POLICIES:
+            for ph in ROW_PHASES:
+                attempt(ph, policy, direction)
     # Refine around the winner — the coarse step is wider than the difference
-    # between a good phase and the best one.
-    for d in (-ROW_PHASE_REFINE, ROW_PHASE_REFINE):
-        attempt(best_phase + d)
+    # between a good phase and the best one. Only the winning combination is
+    # refined; re-sweeping the losers costs a pack each for nothing.
+    for d in (-ROW_PHASE_REFINE, ROW_PHASE_REFINE, -ROW_PHASE_REFINE / 2,
+              ROW_PHASE_REFINE / 2):
+        attempt(best["phase"] + d, best["policy"], best["dir"])
 
-    placed, fill = best_placed or [], max(0.0, best_fill)
+    placed, fill = best["placed"] or [], max(0.0, best["fill"])
     render_enhanced_circle(placed, placed, pi, R, fill, path)
     return (pi, placed, round(fill, 4), round(2 * R, 4), 0.0)
 
