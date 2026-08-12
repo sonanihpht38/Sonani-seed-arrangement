@@ -1764,6 +1764,19 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left"):
     # only — the clear ring around the plate is the MARGIN, already taken out of
     # R before this runs. 0 packs edge to edge, as before.
     clear = max(0.0, float(getattr(P, "CLEARANCE", 0.0) or 0.0))
+    # Where each half of a centre-out row stops. The two halves grow towards each
+    # other and must not touch, so the middle needs the gap as well: the
+    # rightward half owns x >= +half, the leftward half x <= -half, leaving
+    # exactly `clear` across the centre line and the same margin at both rims.
+    #
+    # Getting this wrong is not a cosmetic error. With both halves stopped at 0
+    # the first leftward seed of every row landed flush against the first
+    # rightward one, free() refused it for being 0 mm away when `clear` mm were
+    # required, and — since no orientation of any seed could ever satisfy that
+    # seat — the whole left side of the row was marked dead. Rows collapsed into
+    # short fragments: at 0.5 mm a Ø90 plate fell to 19 stunted rows, 31 seats,
+    # 68.10%, against 84.63% at 0 mm where the bug cannot bite.
+    half = clear / 2.0
 
     shapes, cutdirs, poses = {}, {}, {}
     for s in real:
@@ -1940,13 +1953,13 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left"):
                     g = affinity.translate(rg, x_at - rb[2], y - rb[1])
                     if not free(g):
                         continue
-                    g = slide_right(g, 0.0 if fill == "centre" else None)
+                    g = slide_right(g, -half if fill == "centre" else None)
                 else:
                     x_at = max(x, -chord)
                     g = affinity.translate(rg, x_at - rb[0], y - rb[1])
                     if not free(g):
                         continue
-                    g = slide_left(g, 0.0 if fill == "centre" else None)
+                    g = slide_left(g, half if fill == "centre" else None)
 
                 # Plate actually LOST by taking this seat: the strip consumed
                 # along the row, clipped to the plate, minus the seed itself.
@@ -2041,8 +2054,8 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left"):
         # Both are packed on every plate and the better one is kept — the row
         # direction changes which chord each row is anchored to, and which wins
         # depends on the seed mix.
-        xr = 0.0 if fill == "centre" else -R
-        xl = 0.0                # only used by centre-out, growing leftwards
+        xr = half if fill == "centre" else -R
+        xl = -half              # only used by centre-out, growing leftwards
         row_h = 0.0
         dead = {False: False, True: False}   # has each side run dry?
         while True:
