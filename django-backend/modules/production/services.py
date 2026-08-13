@@ -14,7 +14,10 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
 from django.db import transaction
+from django.db.models import Count, Q
 from openpyxl import load_workbook
+
+from modules.core.exceptions import ConflictError
 
 from .models import Batch, DomainError, SeedData
 from .repository import BatchRepository, SeedRepository
@@ -126,6 +129,16 @@ class ArrangementService:
             return datetime.min.replace(tzinfo=timezone.utc)
 
         rows.sort(key=run_at, reverse=True)
+        # How much inventory each run is holding (TRN_SeedData.Used_ID). Shown in
+        # the history so a run's seeds can be released from a screen that always
+        # works — Finalization needs a live in-memory job, which is gone after a
+        # backend restart, and the release action went with it.
+        from .models import SeedData
+        held = {
+            r["used_id"]: r["n"]
+            for r in SeedData.objects.filter(used_id__in=ids)
+            .values("used_id").annotate(n=Count("seed_id"))
+        }
         return [
             {
                 "arrangeId": str(r.arrange_id),
@@ -143,6 +156,7 @@ class ArrangementService:
                 # Real timestamp (from the plate rows) — what the list is actually sorted by.
                 "runAt": run_at(r).isoformat(),
                 "isFinalized": bool(r.is_finalized),
+                "seedsHeld": held.get(r.arrange_id, 0),
             }
             for r in rows
         ]
@@ -273,13 +287,216 @@ class ArrangementService:
         }
 
 
+class InventoryService:
+    """Consuming seeds when an arrangement is finalized, and giving them back.
+
+    A finalized arrangement's stones are physically committed to plates, so they
+    must not be offered to the next run — that is what TRN_SeedData.ISUsed and
+    Used_ID are for. Both columns have existed since the schema was written and
+    were never populated: an earlier attempt wrote ISUsed at GENERATION time,
+    which consumed inventory merely for previewing a layout, and was rolled back
+    (see the note in engine_runner.write_arrangement). Tying it to the user's
+    explicit finalize instead is what makes it safe.
+
+    Used_ID records WHICH arrangement took each seed. That is what lets
+    unfinalize give back exactly the seeds this run consumed and no others —
+    without it, releasing one arrangement could free stones another one is
+    still using.
+    """
+
+    # Which layout's seed list a plate consumes. A Compare run records BOTH an
+    # `arrange` and an `enhanced` placement for the same stones, and the two put
+    # 36-67% of seeds on DIFFERENT plate numbers (measured across the live
+    # history) — so "the seeds on plate 2" only has an answer once a layout is
+    # named. Max Coverage is the layout that gets physically built, so it wins.
+    BUILT_METHOD = "enhanced"
+
+    @staticmethod
+    def seed_ids_for(arrange_id, plate_no=None):
+        """Real seeds this arrangement placed — all of them, or one plate's.
+
+        Dummy/filler seeds carry SeedType=True and are excluded: they are not
+        inventory. Rows are restricted to the built layout (see BUILT_METHOD),
+        falling back to whatever methods exist for runs that never produced a
+        Max Coverage layout — otherwise an Arrange-only run would consume
+        nothing at all.
+        """
+        from .models import SeedArrangeDetail
+
+        qs = (SeedArrangeDetail.objects
+              .filter(arrange_id=arrange_id, seed_type=False)
+              .exclude(seed_id__isnull=True))
+        if plate_no is not None:
+            qs = qs.filter(plate_id=plate_no)
+        built = qs.filter(method=InventoryService.BUILT_METHOD)
+        return set((built if built.exists() else qs).values_list("seed_id", flat=True))
+
+    @staticmethod
+    @transaction.atomic
+    def consume_plate(arrange_id, plate_no, user_id=None):
+        """Take one plate's seeds out of the pool — called when the plate is
+        assigned a name, which is what "this plate is finalized" means here.
+
+        Only this plate's stones are touched, so the rest of the arrangement
+        stays available and can still be re-generated against what is left.
+        """
+        from .models import SeedData
+
+        seed_ids = InventoryService.seed_ids_for(arrange_id, plate_no)
+        if not seed_ids:
+            return {"placed": 0, "consumed": 0}
+        # A stone already committed to a DIFFERENT arrangement must not be
+        # silently re-taken — that would be two physical plates claiming one
+        # seed. Happens when this run was generated before that one was
+        # assigned, so its seed list is stale.
+        clash = list(
+            SeedData.objects
+            .filter(seed_id__in=seed_ids, is_used=True)
+            .exclude(used_id=arrange_id)
+            .values_list("stock_no", flat=True)[:10]
+        )
+        if clash:
+            raise ConflictError(
+                "These seeds are already used by another finalized plate: "
+                + ", ".join(str(s) for s in clash)
+                + ". Re-generate this arrangement so it excludes them."
+            )
+        now = datetime.now(timezone.utc)
+        consumed = SeedData.objects.filter(seed_id__in=seed_ids).update(
+            is_used=True, used_id=arrange_id, update_date=now, update_by=user_id,
+        )
+        # `placed` counts what the plate recorded; `consumed` counts the rows
+        # actually flipped. They differ when a re-import replaced the seed rows,
+        # leaving old details pointing at Seed_IDs no longer in inventory.
+        return {"placed": len(seed_ids), "consumed": consumed}
+
+    @staticmethod
+    @transaction.atomic
+    def return_plate(arrange_id, plate_no, user_id=None):
+        """Give one plate's seeds back — called when its name is released.
+
+        Matched on Used_ID as well as the seed list, so a stone another
+        arrangement is holding is never freed by releasing this plate.
+        """
+        from .models import SeedData
+
+        seed_ids = InventoryService.seed_ids_for(arrange_id, plate_no)
+        if not seed_ids:
+            return {"returned": 0}
+        now = datetime.now(timezone.utc)
+        returned = SeedData.objects.filter(
+            seed_id__in=seed_ids, used_id=arrange_id,
+        ).update(is_used=False, used_id=None, update_date=now, update_by=user_id)
+        return {"returned": returned}
+
+    @staticmethod
+    @transaction.atomic
+    def unfinalize(arrange_id, user_id=None):
+        """Return EVERY seed this arrangement is holding, whichever plate took it.
+
+        A recovery action, not part of the normal flow — releasing a plate is
+        the per-plate route. Kept because it is the only way back from a bulk
+        consume, including one done by an earlier version of this feature.
+
+        Filters on Used_ID, never on the detail list, so a seed another run took
+        stays taken even if both runs happened to place it.
+        """
+        from .models import SeedArrange, SeedData
+
+        arrange_id = _uuid_or_error(arrange_id)
+        header = SeedArrange.objects.filter(arrange_id=arrange_id).first()
+        if header is None:
+            raise DomainError("Arrangement not found.")
+        now = datetime.now(timezone.utc)
+        returned = SeedData.objects.filter(used_id=arrange_id).update(
+            is_used=False, used_id=None, update_date=now, update_by=user_id,
+        )
+        header.finalized_by_user = False
+        header.finalized_by = None
+        header.finalized_date = None
+        header.save(update_fields=["finalized_by_user", "finalized_by", "finalized_date"])
+        return {"finalized": False, "returned": returned}
+
+    @staticmethod
+    def sync_header(arrange_id, user_id=None):
+        """TRN_SeedArrange.FinalizedByUser = "every plate of this run is named".
+
+        IsFinalized is set to 1 automatically on every generated run, so it
+        cannot carry this meaning; FinalizedByUser is the column that can.
+        """
+        from .models import SeedArrange, SeedArrangePlate
+
+        header = SeedArrange.objects.filter(arrange_id=arrange_id).first()
+        if header is None:
+            return False
+        rows = list(SeedArrangePlate.objects.filter(arrange_id=arrange_id)
+                    .values_list("plate_name", flat=True))
+        done = bool(rows) and all((n or "").strip() for n in rows)
+        if bool(header.finalized_by_user) == done:
+            return done
+        now = datetime.now(timezone.utc)
+        header.finalized_by_user = done
+        header.finalized_by = user_id if done else None
+        header.finalized_date = now if done else None
+        header.save(update_fields=["finalized_by_user", "finalized_by", "finalized_date"])
+        return done
+
+    @staticmethod
+    def status(arrange_id):
+        """What the Finalization screen shows: which plates are committed, and
+        how much inventory is left for the next run."""
+        from .models import SeedArrange, SeedArrangePlate, SeedData
+
+        arrange_id = _uuid_or_error(arrange_id)
+        header = SeedArrange.objects.filter(arrange_id=arrange_id).first()
+        if header is None:
+            raise DomainError("Arrangement not found.")
+        named = {
+            pn: (nm or "").strip()
+            for pn, nm in SeedArrangePlate.objects.filter(arrange_id=arrange_id)
+            .values_list("plate_no", "plate_name")
+        }
+        # Seeds this run placed that some OTHER run has since committed. Once a
+        # plate has any, it can no longer be built as drawn — assigning it would
+        # be refused, so the screen must say so BEFORE the user tries rather
+        # than failing at the click. Happens when a second arrangement is
+        # generated from the leftovers and assigned first.
+        all_ids = InventoryService.seed_ids_for(arrange_id)
+        taken_elsewhere = set(
+            SeedData.objects.filter(seed_id__in=all_ids, is_used=True)
+            .exclude(used_id=arrange_id).values_list("seed_id", flat=True)
+        ) if all_ids else set()
+        plates = []
+        for pn in sorted(p for p in named if p is not None):
+            ids = InventoryService.seed_ids_for(arrange_id, pn)
+            lost = len(ids & taken_elsewhere)
+            plates.append({
+                "plateNo": pn,
+                "plateName": named.get(pn) or None,
+                "seeds": len(ids),
+                "consumed": bool(named.get(pn)),
+                # Non-zero = this plate is stale; re-generate before assigning.
+                "takenElsewhere": lost,
+                "canAssign": lost == 0,
+            })
+        return {
+            "arrangeId": str(arrange_id),
+            "isFinalized": bool(header.finalized_by_user),
+            "plates": plates,
+            "seedsInArrangement": len(InventoryService.seed_ids_for(arrange_id)),
+            "seedsConsumedByThisRun": SeedData.objects.filter(used_id=arrange_id).count(),
+            "seedsAvailable": SeedData.objects.exclude(is_used=True).count(),
+            "seedsUsedTotal": SeedData.objects.filter(is_used=True).count(),
+        }
+
+
 class PlateService:
     """Per-plate name assignment against the MST_SeedPlate master (finalize step).
     Free-text names are supported — a master row is created on demand."""
 
     @staticmethod
     @transaction.atomic
-    def assign(arrange_id, plate_no, plate_name):
+    def assign(arrange_id, plate_no, plate_name, user_id=None):
         from .models import SeedArrangePlate, SeedPlate
 
         name = (plate_name or "").strip()
@@ -302,17 +519,24 @@ class PlateService:
         row.plate_id = master.plate_id
         row.update_date = now
         row.save(update_fields=["plate_name", "plate_id", "update_date"])
-        return {"assigned": True, "plateName": master.plate_name}
+        # Naming a plate IS finalizing it: its stones are committed, so they
+        # leave the pool now — and only this plate's, so the rest of the run
+        # stays available for a re-generate. Raises ConflictError if any of them
+        # already belongs to another plate, which aborts the whole assign.
+        taken = InventoryService.consume_plate(arrange_id, plate_no, user_id)
+        InventoryService.sync_header(arrange_id, user_id)
+        return {"assigned": True, "plateName": master.plate_name,
+                "seedsConsumed": taken["consumed"]}
 
     @staticmethod
     @transaction.atomic
-    def release(arrange_id, plate_no):
+    def release(arrange_id, plate_no, user_id=None):
         from .models import SeedArrangePlate, SeedPlate
 
         arrange_id = _uuid_or_error(arrange_id)
         row = SeedArrangePlate.objects.filter(arrange_id=arrange_id, plate_no=plate_no).first()
         if not row or not row.plate_name:
-            return {"released": False, "plateName": None}
+            return {"released": False, "plateName": None, "seedsReturned": 0}
         name = row.plate_name
         now = datetime.now(timezone.utc)
         SeedPlate.objects.filter(plate_name=name).update(is_used=False, is_released=True, update_date=now)
@@ -320,7 +544,112 @@ class PlateService:
         row.plate_id = None
         row.update_date = now
         row.save(update_fields=["plate_name", "plate_id", "update_date"])
-        return {"released": True, "plateName": name}
+        # The plate is no longer committed, so its stones go back in the pool —
+        # only the ones THIS arrangement took (matched on Used_ID).
+        back = InventoryService.return_plate(arrange_id, plate_no, user_id)
+        InventoryService.sync_header(arrange_id, user_id)
+        return {"released": True, "plateName": name, "seedsReturned": back["returned"]}
+
+    @staticmethod
+    @transaction.atomic
+    def release_plate(plate_id):
+        """Free a plate from the PLATE MASTER side, given only its Plate_ID.
+
+        `release` above is keyed on (arrange_id, plate_no) because Finalization
+        works one arrangement at a time. Plate Master has no arrangement in hand
+        — it lists the master rows — so it could not call it, and ISUsed is
+        read-only on the serializer. A plate left reading "in use" was therefore
+        unreachable: the only way to free it was to walk back into the exact
+        arrangement that took it.
+
+        This clears BOTH sides, which `release` also does but keyed the other
+        way round: the master row goes back to the pool, and any arrangement
+        still naming this plate forgets it. Clearing the arrangement matters —
+        leaving it pointing at a freed plate is how two arrangements end up
+        claiming the same physical plate.
+        """
+        from .models import SeedArrangePlate, SeedPlate
+
+        try:
+            pid = int(plate_id)
+        except (TypeError, ValueError):
+            raise DomainError("A valid plateId is required.")
+        master = SeedPlate.objects.filter(plate_id=pid).first()
+        if master is None:
+            raise DomainError("Plate not found.")
+        now = datetime.now(timezone.utc)
+        # Match on the id AND on the name: rows written before Plate_ID was
+        # stored carry only the name, and they must be cleared too or the plate
+        # reads free here while an old arrangement still lists it.
+        used_by = SeedArrangePlate.objects.filter(
+            Q(plate_id=pid) | Q(plate_name=master.plate_name)
+        ) if master.plate_name else SeedArrangePlate.objects.filter(plate_id=pid)
+        cleared = used_by.update(plate_name=None, plate_id=None, update_date=now)
+        master.is_used = False
+        master.is_released = True
+        master.update_date = now
+        master.save(update_fields=["is_used", "is_released", "update_date"])
+        return {"released": True, "plateName": master.plate_name, "clearedFrom": cleared}
+
+    @staticmethod
+    def finalized_list():
+        """Every plate that carries an assigned name — i.e. every finalized plate.
+
+        Reads TRN_SeedPlate, not the job cache, so it survives a backend restart
+        and does not need the run that produced it to still be open. Newest
+        first. Seed counts come from the built (Max Coverage) layout, matching
+        what was actually consumed.
+        """
+        from .models import SeedArrange, SeedArrangeDetail, SeedArrangePlate
+
+        rows = list(
+            SeedArrangePlate.objects
+            .exclude(plate_name__isnull=True).exclude(plate_name="")
+        )
+        if not rows:
+            return []
+        aids = {r.arrange_id for r in rows}
+        # Seeds per (run, plate) in one grouped query rather than one per row.
+        counts = {}
+        for d in (SeedArrangeDetail.objects
+                  .filter(arrange_id__in=aids, seed_type=False)
+                  .values("arrange_id", "plate_id", "method")
+                  .annotate(n=Count("seed_id", distinct=True))):
+            counts.setdefault((d["arrange_id"], d["plate_id"]), {})[d["method"] or ""] = d["n"]
+        runs = {
+            a.arrange_id: a for a in SeedArrange.objects.filter(arrange_id__in=aids)
+        }
+
+        def seeds_of(r):
+            by_method = counts.get((r.arrange_id, r.plate_no), {})
+            if not by_method:
+                return r.real_seed_count or 0
+            return by_method.get(InventoryService.BUILT_METHOD) or max(by_method.values())
+
+        def when(r):
+            run = runs.get(r.arrange_id)
+            return r.update_date or r.entry_date or getattr(run, "finalized_date", None)
+
+        out = [
+            {
+                "plateName": r.plate_name,
+                "plateId": r.plate_id,
+                "plateNo": r.plate_no,
+                "arrangeId": str(r.arrange_id) if r.arrange_id else None,
+                "seeds": seeds_of(r),
+                # The fill of the layout that was built, falling back for older rows.
+                "fillPct": ArrangementService._num(
+                    r.finalized_fill_pct or r.enhanced_fill_pct or r.arrange_fill_pct),
+                "plateDiameter": ArrangementService._num(
+                    getattr(runs.get(r.arrange_id), "plate_diameter", None)),
+                "imageUrl": (r.finalized_image_path or r.enhanced_image_path
+                             or r.arrange_image_path),
+                "finalizedAt": when(r).isoformat() if when(r) else None,
+            }
+            for r in rows
+        ]
+        out.sort(key=lambda x: (x["finalizedAt"] or "", x["plateName"] or ""), reverse=True)
+        return out
 
     @staticmethod
     def names(arrange_id):

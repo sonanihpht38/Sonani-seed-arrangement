@@ -5,8 +5,8 @@ from rest_framework.routers import DefaultRouter
 
 from .views import (
     ArrangementDetailView, ArrangementListView, AssignPlateView, AvailablePlatesView, BatchListView,
-    DownloadPlatesView, GenerateFinalView, JobDetailView, JobsView, PlateMasterViewSet, PlateNamesView,
-    ReleasePlateView, SeedImportView,
+    DownloadPlatesView, FinalizeArrangementView, FinalizedPlatesView, GenerateFinalView,
+    JobDetailView, JobsView, PlateMasterViewSet, PlateNamesView, ReleasePlateView, SeedImportView,
 )
 
 router = DefaultRouter()
@@ -19,10 +19,14 @@ urlpatterns = [
     path("production/jobs/<str:job_id>", JobDetailView.as_view(), name="job-detail"),
     path("production/jobs/<str:job_id>/generate-final", GenerateFinalView.as_view(), name="generate-final"),
     path("production/plates", AvailablePlatesView.as_view(), name="available-plates"),
+    path("production/plates/finalized", FinalizedPlatesView.as_view(), name="finalized-plates"),
     path("production/plates/assign", AssignPlateView.as_view(), name="assign-plate"),
     path("production/plates/release", ReleasePlateView.as_view(), name="release-plate"),
     path("production/arrangements/", ArrangementListView.as_view(), name="arrangements"),
     path("production/arrangements/<str:arrange_id>/plate-names", PlateNamesView.as_view(), name="plate-names"),
+    # Must be declared BEFORE <arrange_id> alone, or the detail route swallows it.
+    path("production/arrangements/<str:arrange_id>/finalize", FinalizeArrangementView.as_view(),
+         name="finalize-arrangement"),
     path("production/arrangements/<str:arrange_id>", ArrangementDetailView.as_view(), name="arrangement-detail"),
     path("production/jobs/<str:job_id>/download", DownloadPlatesView.as_view(), name="download-plates"),
 ] + router.urls

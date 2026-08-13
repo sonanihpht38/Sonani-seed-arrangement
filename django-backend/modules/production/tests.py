@@ -5,7 +5,7 @@
 
 import io
 
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, TransactionTestCase
 from openpyxl import Workbook
 
 from .shapes import (
@@ -305,6 +305,20 @@ class PlateInvariantTests(SimpleTestCase):
                  for i in range(6)]
         return pool
 
+    @staticmethod
+    def _saturating_mix():
+        """More seeds than the plate can hold.
+
+        _mix() is deliberately small — every stone finds a seat, which is what
+        the congruence and overlap tests want. It cannot show a layout FAULT
+        though: with room to spare, a broken row sweep still places everything,
+        just untidily. Judging how well the plate is packed needs it full.
+        """
+        pool = [_rect_seed("R%02d" % i, 11.0 + (i % 4) * 0.5, 8.6) for i in range(48)]
+        pool += [_cut_seed("C%02d" % i, 9.5, 8.6, 2.0 + (i % 3) * 0.4, 1.8)
+                 for i in range(18)]
+        return pool
+
     def test_no_two_seeds_overlap(self):
         from shapely.geometry import Polygon as ShPoly
         _, placed, _f, _s, _ = self._plate(self._mix(), tag="ovl")
@@ -421,6 +435,52 @@ class PlateInvariantTests(SimpleTestCase):
         finally:
             P.CLEARANCE = before
 
+    def test_rows_stay_whole_at_every_clearance(self):
+        """A non-zero gap must not wreck the layout — only shrink it.
+
+        Centre-out builds each row in two halves that grow towards each other.
+        Both halves once stopped at x=0, so with a gap asked for, the first
+        LEFTWARD stone of every row landed flush against the first rightward one;
+        free() refused it for being 0 mm away when `clear` mm were required, and
+        because no orientation of any seed could ever satisfy that seat the whole
+        left half of the row was marked dead. Rows degenerated into stubs and the
+        leftovers were scattered by the sweep-up pass.
+
+        test_distance_between_seeds_is_honoured did NOT catch this: the surviving
+        stones were correctly spaced. The plate was simply much worse. So the
+        invariant here is structural — rows must stay populated.
+
+        Measured on this pool, stones per row: 5.0 fixed against 2.0 before, at
+        every non-zero clearance. Zero is unaffected either way, which is the
+        other half of the guarantee.
+        """
+        from .engine_runner import D, P
+        pool = self._saturating_mix()
+        before, seen = P.CLEARANCE, {}
+        try:
+            for want in (0.0, 0.25, 0.5, 1.0):
+                P.CLEARANCE = want
+                placed, fill = D._pack_once(
+                    (list(pool), 1, 90.0, 45.0, 2.0,
+                     __import__("os").path.join(self.tmp, "rw%s.png" % want)),
+                    -45.0, "cut-first", "centre")
+                rows = {}
+                for p in placed:
+                    rows.setdefault(round(p["y"], 0), []).append(p)
+                per_row = len(placed) / max(1, len(rows))
+                seen[want] = fill
+                self.assertGreaterEqual(
+                    per_row, 3.5,
+                    "at %.2f mm the rows collapsed: %d seeds spread over %d rows "
+                    "(%.2f per row)" % (want, len(placed), len(rows), per_row))
+            # ...and a small gap must cost a little coverage, not a cliff.
+            self.assertGreaterEqual(
+                seen[0.25], seen[0.0] - 6.0,
+                "0.25 mm between seeds dropped coverage from %.2f%% to %.2f%%"
+                % (seen[0.0], seen[0.25]))
+        finally:
+            P.CLEARANCE = before
+
     def test_clearance_is_between_seeds_not_from_the_rim(self):
         # The clear ring around the plate is the MARGIN, taken out of R already.
         # Clearance must not shrink the usable circle on top of that.
@@ -457,6 +517,472 @@ class PlateInvariantTests(SimpleTestCase):
                 self.assertLessEqual(
                     D._wasted_area(ShPoly(p["poly"]), disc), 3.0,
                     "%s sits inland and leaves a hole" % p["stock"])
+
+
+class PlateMasterUnassignTests(TransactionTestCase):
+    """Freeing a plate from the Plate Master screen, and deleting one safely.
+
+    MST_SeedPlate / TRN_SeedPlate are managed=False (SQL Server DDL), so the
+    test database has no such tables — every other test in this file avoids the
+    database for that reason. These rules cannot be checked without one, so the
+    tables are built here from the model definitions and torn down after.
+    """
+
+    reset_sequences = True
+
+    @classmethod
+    def _unmanaged(cls):
+        from django.apps import apps
+        return [m for m in apps.get_app_config("production").get_models()
+                if not m._meta.managed]
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        from django.db import connection
+        with connection.schema_editor() as se:
+            for m in cls._unmanaged():
+                se.create_model(m)
+
+    @classmethod
+    def tearDownClass(cls):
+        from django.db import connection
+        with connection.schema_editor() as se:
+            for m in cls._unmanaged():
+                se.delete_model(m)
+        super().tearDownClass()
+
+    def setUp(self):
+        import uuid as _uuid
+
+        from django.contrib.auth import get_user_model
+        from rest_framework.test import APIClient
+
+        from .models import SeedArrangePlate, SeedPlate
+        SeedPlate.objects.all().delete()
+        SeedArrangePlate.objects.all().delete()
+        self.SeedPlate, self.SeedArrangePlate = SeedPlate, SeedArrangePlate
+        self.arrange_id = _uuid.uuid4()
+        self.user = get_user_model().objects.create_superuser("pm", "pm@x.y", "pw12345!")
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+    def _assigned_plate(self, name="P-USED"):
+        p = self.SeedPlate.objects.create(plate_name=name, diameter=90, is_active=True,
+                                          is_used=True, is_released=False)
+        self.SeedArrangePlate.objects.create(arrange_id=self.arrange_id, plate_no=1,
+                                             plate_id=p.plate_id, plate_name=name)
+        return p
+
+    def test_unassign_frees_the_plate_and_clears_the_arrangement(self):
+        """Both sides must be cleared. Freeing only the master row would leave
+        the arrangement still naming the plate, so the same physical plate could
+        be handed to a second arrangement."""
+        p = self._assigned_plate()
+        r = self.client.post("/api/production/plate-master/%d/release/" % p.plate_id,
+                             {}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        p.refresh_from_db()
+        self.assertFalse(p.is_used)
+        self.assertTrue(p.is_released)
+        row = self.SeedArrangePlate.objects.get(arrange_id=self.arrange_id, plate_no=1)
+        self.assertIsNone(row.plate_name)
+        self.assertIsNone(row.plate_id)
+
+    def test_unassigned_plate_returns_to_the_available_pool(self):
+        p = self._assigned_plate()
+        avail = self.client.get("/api/production/plates").json()
+        self.assertNotIn(p.plate_name, [a["plateName"] for a in avail])
+        self.client.post("/api/production/plate-master/%d/release/" % p.plate_id,
+                         {}, format="json")
+        avail = self.client.get("/api/production/plates").json()
+        self.assertIn(p.plate_name, [a["plateName"] for a in avail])
+
+    def test_deleting_an_assigned_plate_is_refused(self):
+        """It used to succeed and take the master row with it, leaving the
+        arrangement pointing at a Plate_ID that no longer existed."""
+        p = self._assigned_plate()
+        r = self.client.delete("/api/production/plate-master/%d/" % p.plate_id)
+        self.assertEqual(r.status_code, 409, r.content)
+        self.assertIn("Unassign it first", r.json()["detail"])
+        self.assertTrue(self.SeedPlate.objects.filter(pk=p.plate_id).exists())
+        row = self.SeedArrangePlate.objects.get(arrange_id=self.arrange_id, plate_no=1)
+        self.assertEqual(row.plate_name, p.plate_name)
+
+    def test_unassign_then_delete_succeeds(self):
+        # The route out of the refusal above — and the reason blocking is safe.
+        p = self._assigned_plate()
+        self.client.post("/api/production/plate-master/%d/release/" % p.plate_id,
+                         {}, format="json")
+        r = self.client.delete("/api/production/plate-master/%d/" % p.plate_id)
+        self.assertEqual(r.status_code, 204, r.content)
+        self.assertFalse(self.SeedPlate.objects.filter(pk=p.plate_id).exists())
+
+    def test_deleting_a_free_plate_still_works(self):
+        # Unchanged behaviour: only ASSIGNED plates are protected.
+        p = self.SeedPlate.objects.create(plate_name="P-FREE", diameter=90, is_active=True)
+        r = self.client.delete("/api/production/plate-master/%d/" % p.plate_id)
+        self.assertEqual(r.status_code, 204, r.content)
+        self.assertFalse(self.SeedPlate.objects.filter(pk=p.plate_id).exists())
+
+    def test_a_released_plate_can_be_deleted(self):
+        p = self.SeedPlate.objects.create(plate_name="P-REL", diameter=90, is_active=True,
+                                          is_used=True, is_released=True)
+        self.assertEqual(
+            self.client.delete("/api/production/plate-master/%d/" % p.plate_id).status_code, 204)
+
+    def test_unassign_rejects_an_unknown_plate(self):
+        r = self.client.post("/api/production/plate-master/999999/release/", {}, format="json")
+        self.assertIn(r.status_code, (400, 404), r.content)
+
+    def test_finalization_release_is_unchanged(self):
+        """The arrangement-keyed release that Finalization uses must behave
+        exactly as before — this change only ADDED a second way in."""
+        p = self._assigned_plate("P-FIN")
+        r = self.client.post("/api/production/plates/release",
+                             {"arrangeId": str(self.arrange_id), "plateNo": 1}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        # `seedsReturned` was added when releasing started giving a plate's
+        # seeds back; the release behaviour itself is unchanged.
+        self.assertEqual(r.json()["released"], True)
+        self.assertEqual(r.json()["plateName"], "P-FIN")
+        p.refresh_from_db()
+        self.assertFalse(p.is_used)
+        self.assertTrue(p.is_released)
+
+    def test_assign_is_unchanged(self):
+        p = self.SeedPlate.objects.create(plate_name="P-NEW", diameter=90, is_active=True)
+        self.SeedArrangePlate.objects.create(arrange_id=self.arrange_id, plate_no=2)
+        r = self.client.post("/api/production/plates/assign",
+                             {"arrangeId": str(self.arrange_id), "plateNo": 2,
+                              "plateName": "P-NEW"}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        p.refresh_from_db()
+        self.assertTrue(p.is_used)
+        self.assertFalse(p.is_released)
+
+
+class FinalizeConsumesSeedsTests(TransactionTestCase):
+    """Finalizing an arrangement takes its seeds out of circulation.
+
+    The point of the feature: a stone glued to a finalized plate must never be
+    offered to the next run. TRN_SeedData.ISUsed / Used_ID have existed since
+    the schema was written and were never populated — an earlier attempt wrote
+    ISUsed at GENERATION time, consuming inventory just for previewing, and was
+    rolled back. These tests pin the safe version: consumption happens only on
+    an explicit finalize, and is reversible.
+    """
+
+    reset_sequences = True
+
+    @classmethod
+    def _unmanaged(cls):
+        from django.apps import apps
+        return [m for m in apps.get_app_config("production").get_models()
+                if not m._meta.managed]
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        from django.db import connection
+        with connection.schema_editor() as se:
+            for m in cls._unmanaged():
+                se.create_model(m)
+
+    @classmethod
+    def tearDownClass(cls):
+        from django.db import connection
+        with connection.schema_editor() as se:
+            for m in cls._unmanaged():
+                se.delete_model(m)
+        super().tearDownClass()
+
+    def setUp(self):
+        import uuid as _uuid
+
+        from .models import (
+            SeedArrange, SeedArrangeDetail, SeedArrangePlate, SeedData, SeedPlate,
+        )
+        for m in (SeedData, SeedArrange, SeedArrangeDetail, SeedArrangePlate, SeedPlate):
+            m.objects.all().delete()
+        self.SeedData, self.SeedArrange = SeedData, SeedArrange
+        self.SeedArrangeDetail, self.SeedArrangePlate = SeedArrangeDetail, SeedArrangePlate
+        self.uuid = _uuid
+        # 10 seeds; an arrangement that placed the first 6 across two plates —
+        # 3 on each — leaving 4 that were never placed at all.
+        self.seeds = [SeedData.objects.create(seed_id=_uuid.uuid4(), stock_no="S%02d" % i,
+                                              length=11, width=9, height=0.5)
+                      for i in range(10)]
+        self.arrange_id = _uuid.uuid4()
+        SeedArrange.objects.create(arrange_id=self.arrange_id, is_active=True, plate_no=2)
+        for pno in (1, 2):
+            SeedArrangePlate.objects.create(arrange_id=self.arrange_id, plate_no=pno)
+        for i, s in enumerate(self.seeds[:6]):
+            SeedArrangeDetail.objects.create(
+                detail_id=_uuid.uuid4(), arrange_id=self.arrange_id, seed_type=False,
+                seed_id=s.seed_id, plate_id=1 + (i // 3), method="enhanced")
+
+    def _svc(self):
+        from .services import InventoryService
+        return InventoryService
+
+    @staticmethod
+    def _load():
+        """What the packer would actually receive. _blocks_from_seeds gates on
+        the P.T_LO/P.T_HI thickness globals, so they must be set first or every
+        seed is filtered out regardless of ISUsed."""
+        from .engine_runner import _apply_globals, load_blocks_from_db
+        _apply_globals({"plateD": 90, "margin": 5.0, "tLo": 0.45, "tHi": 0.65,
+                        "grid": 0.5, "clearance": 0.0, "minSeed": 2.0})
+        return load_blocks_from_db({"square", "rectangle"}, 0.05)
+
+    def _assign(self, plate_no, name):
+        from .services import PlateService
+        return PlateService.assign(self.arrange_id, plate_no, name, user_id=7)
+
+    def _release(self, plate_no):
+        from .services import PlateService
+        return PlateService.release(self.arrange_id, plate_no, user_id=7)
+
+    def test_assigning_one_plate_consumes_only_that_plate(self):
+        """The whole point of per-plate: plate 2's stones stay available so the
+        rest of the run can still be re-generated."""
+        res = self._assign(1, "P-1")
+        self.assertEqual(res["seedsConsumed"], 3)
+        self.assertEqual(self.SeedData.objects.filter(is_used=True).count(), 3)
+        for s in self.seeds[:3]:                      # plate 1
+            s.refresh_from_db()
+            self.assertTrue(s.is_used)
+            self.assertEqual(s.used_id, self.arrange_id)
+        for s in self.seeds[3:]:                      # plate 2 + never placed
+            s.refresh_from_db()
+            self.assertNotEqual(s.is_used, True,
+                                "%s was consumed but its plate is unassigned" % s.stock_no)
+
+    def test_unassigned_plates_stay_available_to_the_packer(self):
+        self.assertEqual(len(self._load()), 10)
+        self._assign(1, "P-1")
+        after = self._load()
+        self.assertEqual(len(after), 7)
+        self.assertEqual({b["stock"] for b in after},
+                         {s.stock_no for s in self.seeds[3:]})
+        # ...and the second plate takes only its own three.
+        self._assign(2, "P-2")
+        self.assertEqual(len(self._load()), 4)
+
+    def test_releasing_a_plate_returns_only_its_seeds(self):
+        self._assign(1, "P-1")
+        self._assign(2, "P-2")
+        self.assertEqual(self.SeedData.objects.filter(is_used=True).count(), 6)
+        res = self._release(1)
+        self.assertEqual(res["seedsReturned"], 3)
+        self.assertEqual(self.SeedData.objects.filter(is_used=True).count(), 3)
+        for s in self.seeds[3:6]:
+            s.refresh_from_db()
+            self.assertTrue(s.is_used, "%s is on plate 2, still assigned" % s.stock_no)
+        self.assertEqual(len(self._load()), 7)
+
+    def test_newly_imported_seeds_join_the_available_pool(self):
+        """New inventory arrives with ISUsed NULL, so it is picked up with no
+        extra step — alongside whatever is left of the old stock."""
+        self._assign(1, "P-1")
+        self.assertEqual(len(self._load()), 7)
+        for i in range(5):
+            self.SeedData.objects.create(seed_id=self.uuid.uuid4(), stock_no="NEW%02d" % i,
+                                         length=11, width=9, height=0.5)
+        stocks = {b["stock"] for b in self._load()}
+        self.assertEqual(len(stocks), 12)
+        self.assertTrue({"NEW00", "NEW04"} <= stocks)
+        self.assertNotIn("S00", stocks, "a consumed seed came back")
+
+    def test_max_coverage_is_the_layout_that_counts(self):
+        """Arrange and Max Coverage put 36-67% of stones on different plates, so
+        the plate's seed list must come from the layout actually built."""
+        # Same seeds, but the arrange layout puts them all on plate 1.
+        for s in self.seeds[3:6]:
+            self.SeedArrangeDetail.objects.create(
+                detail_id=self.uuid.uuid4(), arrange_id=self.arrange_id, seed_type=False,
+                seed_id=s.seed_id, plate_id=1, method="arrange")
+        self.assertEqual(len(self._svc().seed_ids_for(self.arrange_id, 1)), 3)
+        self.assertEqual(self._assign(1, "P-1")["seedsConsumed"], 3)
+
+    def test_an_arrange_only_run_still_consumes(self):
+        """No Max Coverage layout exists for older runs — falling back keeps
+        them working instead of silently consuming nothing."""
+        other = self.uuid.uuid4()
+        self.SeedArrange.objects.create(arrange_id=other, is_active=True, plate_no=1)
+        self.SeedArrangePlate.objects.create(arrange_id=other, plate_no=1)
+        for s in self.seeds[6:9]:
+            self.SeedArrangeDetail.objects.create(
+                detail_id=self.uuid.uuid4(), arrange_id=other, seed_type=False,
+                seed_id=s.seed_id, plate_id=1, method="arrange")
+        self.assertEqual(len(self._svc().seed_ids_for(other, 1)), 3)
+
+    def test_a_seed_cannot_be_claimed_by_two_plates(self):
+        """A stale run generated before the first assign still lists the same
+        seeds. Assigning it must fail loudly, not steal them."""
+        from modules.core.exceptions import ConflictError
+        from .services import PlateService
+        stale = self.uuid.uuid4()
+        self.SeedArrange.objects.create(arrange_id=stale, is_active=True, plate_no=1)
+        self.SeedArrangePlate.objects.create(arrange_id=stale, plate_no=1)
+        for s in self.seeds[:3]:
+            self.SeedArrangeDetail.objects.create(
+                detail_id=self.uuid.uuid4(), arrange_id=stale, seed_type=False,
+                seed_id=s.seed_id, plate_id=1, method="enhanced")
+        self._assign(1, "P-1")
+        with self.assertRaises(ConflictError):
+            PlateService.assign(stale, 1, "P-2", user_id=7)
+        # ...and nothing was taken from the first plate, nor was the name set.
+        for s in self.seeds[:3]:
+            s.refresh_from_db()
+            self.assertEqual(s.used_id, self.arrange_id)
+        self.assertIsNone(
+            self.SeedArrangePlate.objects.get(arrange_id=stale, plate_no=1).plate_name)
+
+    def test_a_stale_plate_is_flagged_before_the_user_clicks(self):
+        """Generate two runs from overlapping stock, assign the second's plate,
+        and the first's plate must report itself unbuildable — the UI disables
+        Assign on it instead of letting the click fail with a conflict."""
+        from .services import PlateService
+        other = self.uuid.uuid4()
+        self.SeedArrange.objects.create(arrange_id=other, is_active=True, plate_no=1)
+        self.SeedArrangePlate.objects.create(arrange_id=other, plate_no=1)
+        for s in self.seeds[:2]:            # 2 of plate 1's 3 seeds
+            self.SeedArrangeDetail.objects.create(
+                detail_id=self.uuid.uuid4(), arrange_id=other, seed_type=False,
+                seed_id=s.seed_id, plate_id=1, method="enhanced")
+        PlateService.assign(other, 1, "P-OTHER", user_id=7)
+
+        st = self._svc().status(self.arrange_id)
+        p1 = next(p for p in st["plates"] if p["plateNo"] == 1)
+        p2 = next(p for p in st["plates"] if p["plateNo"] == 2)
+        self.assertFalse(p1["canAssign"], "plate 1 lost seeds and must be flagged")
+        self.assertEqual(p1["takenElsewhere"], 2)
+        self.assertTrue(p2["canAssign"], "plate 2 is untouched and still buildable")
+        self.assertEqual(p2["takenElsewhere"], 0)
+
+    def test_a_regenerated_run_never_sees_consumed_seeds(self):
+        """The other half of the guarantee: once a plate is assigned, a fresh
+        generation is built only from what is left, so it can never collide."""
+        self._assign(1, "P-1")
+        fresh = {b["stock"] for b in self._load()}
+        self.assertEqual(len(fresh), 7)
+        self.assertTrue(fresh.isdisjoint({s.stock_no for s in self.seeds[:3]}))
+
+    def test_the_finalized_plate_list_tracks_assignment(self):
+        """The register in the Finalization screen. Reads TRN_SeedPlate, so it
+        must appear on assign and disappear on release — and it must not depend
+        on the in-memory job, which is gone after a backend restart."""
+        from .services import PlateService
+        self.assertEqual(PlateService.finalized_list(), [])
+
+        self._assign(1, "P-1")
+        rows = PlateService.finalized_list()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["plateName"], "P-1")
+        self.assertEqual(rows[0]["plateNo"], 1)
+        self.assertEqual(rows[0]["seeds"], 3, "counts the built layout's seeds")
+        self.assertEqual(rows[0]["arrangeId"], str(self.arrange_id))
+
+        self._assign(2, "P-2")
+        self.assertEqual({r["plateName"] for r in PlateService.finalized_list()},
+                         {"P-1", "P-2"})
+
+        self._release(1)
+        self.assertEqual([r["plateName"] for r in PlateService.finalized_list()], ["P-2"])
+
+    def test_the_finalized_list_endpoint_is_reachable(self):
+        from django.contrib.auth import get_user_model
+        from rest_framework.test import APIClient
+        c = APIClient()
+        c.force_authenticate(user=get_user_model().objects.create_superuser(
+            "fl", "fl@x.y", "pw12345!"))
+        self._assign(1, "P-1")
+        r = c.get("/api/production/plates/finalized")
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual([x["plateName"] for x in r.json()], ["P-1"])
+
+    def test_dummy_seeds_are_not_inventory(self):
+        # Filler seeds carry SeedType=True and live in TRN_DummySeedData.
+        self.SeedArrangeDetail.objects.create(
+            detail_id=self.uuid.uuid4(), arrange_id=self.arrange_id, seed_type=True,
+            seed_id=self.uuid.uuid4(), plate_id=1, method="enhanced")
+        self.assertEqual(len(self._svc().seed_ids_for(self.arrange_id)), 6)
+
+    def test_status_reports_each_plate(self):
+        st = self._svc().status(self.arrange_id)
+        self.assertFalse(st["isFinalized"])
+        self.assertEqual(st["seedsAvailable"], 10)
+        self.assertEqual([(p["plateNo"], p["seeds"], p["consumed"]) for p in st["plates"]],
+                         [(1, 3, False), (2, 3, False)])
+        self._assign(1, "P-1")
+        st = self._svc().status(self.arrange_id)
+        self.assertFalse(st["isFinalized"], "only one of two plates is named")
+        self.assertEqual(st["seedsAvailable"], 7)
+        self.assertEqual([(p["plateNo"], p["consumed"]) for p in st["plates"]],
+                         [(1, True), (2, False)])
+        self._assign(2, "P-2")
+        self.assertTrue(self._svc().status(self.arrange_id)["isFinalized"])
+
+    def test_details_pointing_at_deleted_seeds_do_not_break_assign(self):
+        """Re-imports mint new Seed_IDs, so old details reference rows that are
+        gone — live already has 815 distinct detail Seed_IDs against 95 seeds."""
+        self.SeedArrangeDetail.objects.create(
+            detail_id=self.uuid.uuid4(), arrange_id=self.arrange_id, seed_type=False,
+            seed_id=self.uuid.uuid4(), plate_id=1, method="enhanced")
+        self.assertEqual(self._assign(1, "P-1")["seedsConsumed"], 3)
+
+    def test_the_http_endpoints_work_end_to_end(self):
+        """The service tests bypass routing, permissions and JSON. These drive
+        the real URLs the browser calls."""
+        from django.contrib.auth import get_user_model
+        from rest_framework.test import APIClient
+        c = APIClient()
+        c.force_authenticate(user=get_user_model().objects.create_superuser(
+            "fin", "fin@x.y", "pw12345!"))
+        url = "/api/production/arrangements/%s/finalize" % self.arrange_id
+        self.assertEqual(c.get(url).json()["seedsAvailable"], 10)
+
+        r = c.post("/api/production/plates/assign",
+                   {"arrangeId": str(self.arrange_id), "plateNo": 1, "plateName": "P-1"},
+                   format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual(r.json()["seedsConsumed"], 3)
+        self.assertEqual(c.get(url).json()["seedsAvailable"], 7)
+
+        r = c.post("/api/production/plates/release",
+                   {"arrangeId": str(self.arrange_id), "plateNo": 1}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual(r.json()["seedsReturned"], 3)
+        self.assertEqual(c.get(url).json()["seedsAvailable"], 10)
+
+    def test_return_all_recovers_a_bulk_consume(self):
+        """The way back from seeds consumed by the earlier arrangement-level
+        version, which took every plate at once."""
+        self._assign(1, "P-1")
+        self._assign(2, "P-2")
+        self.assertEqual(self.SeedData.objects.filter(is_used=True).count(), 6)
+        self.assertEqual(self._svc().unfinalize(self.arrange_id)["returned"], 6)
+        self.assertEqual(len(self._load()), 10)
+
+    def test_the_finalize_route_does_not_shadow_arrangement_detail(self):
+        """`/arrangements/<id>` and `/arrangements/<id>/finalize` share a prefix;
+        the order they are declared in decides whether both resolve."""
+        from django.urls import resolve
+        self.assertEqual(
+            resolve("/api/production/arrangements/%s/finalize" % self.arrange_id).url_name,
+            "finalize-arrangement")
+        self.assertEqual(
+            resolve("/api/production/arrangements/%s" % self.arrange_id).url_name,
+            "arrangement-detail")
+
+    def test_nothing_is_consumed_by_generating(self):
+        """Generating must stay free of side effects — the reason the earlier
+        attempt was rolled back."""
+        self._load()
+        self.assertEqual(self.SeedData.objects.filter(is_used=True).count(), 0)
+        self.assertEqual(self.SeedData.objects.filter(used_id__isnull=False).count(), 0)
 
 
 class DomainErrorWiringTests(SimpleTestCase):

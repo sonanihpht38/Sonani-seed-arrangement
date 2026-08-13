@@ -55,6 +55,8 @@ export interface ArrangementRow {
   /** Real run timestamp (from the plate rows) — the header's EntryDate is date-only. */
   runAt?: string | null;
   isFinalized: boolean;
+  /** Seeds this run is holding (TRN_SeedData.Used_ID) — 0 once they are returned. */
+  seedsHeld: number;
 }
 
 // One placed seed on a past run's plate (real seed, or a Machine-Cut dummy filler).
@@ -191,6 +193,38 @@ export interface AvailablePlate {
   diameter: number | null;
   isUsed: boolean;
   isReleased: boolean;
+}
+
+// Finalization state of one arrangement, plus what it means for inventory.
+// A finalized run's seeds are consumed: they no longer reach the packer.
+export interface FinalizeStatus {
+  arrangeId: string;
+  isFinalized: boolean;          // every plate of this run is named
+  plates: {
+    plateNo: number;
+    plateName: string | null;
+    seeds: number;
+    consumed: boolean;
+    takenElsewhere: number;   // seeds another run has committed — >0 means stale
+    canAssign: boolean;
+  }[];
+  seedsInArrangement: number;
+  seedsConsumedByThisRun: number;
+  seedsAvailable: number;
+  seedsUsedTotal: number;
+}
+
+// A plate that has been finalized — one row of TRN_SeedPlate carrying a name.
+export interface FinalizedPlate {
+  plateName: string;
+  plateId: number | null;
+  plateNo: number | null;
+  arrangeId: string | null;
+  seeds: number;
+  fillPct: number | null;
+  plateDiameter: number | null;
+  imageUrl: string | null;
+  finalizedAt: string | null;
 }
 
 // The packing criteria collected in Form 3 and used by the arrangement job.

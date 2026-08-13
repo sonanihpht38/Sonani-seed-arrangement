@@ -3,29 +3,29 @@
   "configurations": [
     {
       "name": "sonani-web",
-      "runtimeExecutable": "npm",
-      "runtimeArgs": [
-        "--prefix",
-        "react-frontend",
-        "run",
-        "dev",
-        "--",
-        "--port",
-        "5175",
-        "--strictPort"
-      ],
-      "port": 5175,
+      "runtimeExecutable": "cmd",
+      "runtimeArgs": ["/c", ".claude\\run-web.cmd"],
+      "port": 5174,
       "autoPort": false
     },
     {
       "name": "backend",
-      "runtimeExecutable": "django-backend/.venv/Scripts/python.exe",
-      "runtimeArgs": [
-        "django-backend/manage.py",
-        "runserver",
-        "8001"
-      ],
+      "runtimeExecutable": "cmd",
+      "runtimeArgs": ["/c", ".claude\\run-backend.cmd"],
       "port": 8001
+    },
+    {
+      "name": "sonani-web-sandbox",
+      "runtimeExecutable": "cmd",
+      "runtimeArgs": ["/c", ".claude\\run-web-sandbox.cmd"],
+      "port": 5175,
+      "autoPort": false
+    },
+    {
+      "name": "backend-sandbox",
+      "runtimeExecutable": "cmd",
+      "runtimeArgs": ["/c", ".claude\\run-backend-sandbox.cmd"],
+      "port": 8002
     }
   ]
 }

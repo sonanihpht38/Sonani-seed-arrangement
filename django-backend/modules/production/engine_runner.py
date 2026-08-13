@@ -342,6 +342,12 @@ def load_blocks_from_db(shapes, square_tol, batches=None):
     from .models import SeedData
 
     qs = SeedData.objects.all()
+    # Seeds consumed by a FINALIZED arrangement are physically on a plate — they
+    # cannot be placed again, so they never reach the packer. ISUsed is NULL for
+    # every seed until someone finalizes a run (InventoryService.finalize), so
+    # this filter is a no-op until the feature is actually used, and excluding
+    # NULL explicitly would drop the whole inventory.
+    qs = qs.exclude(is_used=True)
     if batches:
         qs = qs.filter(batch_id__in=list(batches))
     return _blocks_from_seeds(qs.iterator(), shapes, square_tol)

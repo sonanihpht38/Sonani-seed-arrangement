@@ -7,10 +7,12 @@
 // Nothing here mutates: the records are written by the Result step when a job runs.
 
 import { useMemo, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Card, Space, Typography, Alert, Drawer, Tag, Button, Spin, Empty, Descriptions, Row, Col, Image } from "antd";
 import type { ColDef } from "ag-grid-community";
+import { useAuth } from "../auth/useAuth";
 import { productionApi } from "./productionApi";
+import { notify } from "../../lib/notify";
 import type { ArrangementRow, ArrangementSeed } from "./types";
 import { DataGrid } from "../../components/DataGrid";
 import { FiInfo, FiEye, FiDownload, FiRefreshCw } from "../../components/icons";
@@ -70,8 +72,22 @@ const SEED_COLS_CUT: ColDef<ArrangementSeed>[] = [
 
 export function ArrangementHistory() {
   const [openId, setOpenId] = useState<string | null>(null);
+  const { can } = useAuth();
+  const canRelease = can("finalization", "save");
+  const qc = useQueryClient();
 
   const listQ = useQuery({ queryKey: ["arrangements"], queryFn: productionApi.listArrangements });
+  // Hand a run's seeds back to the available pool. The per-plate route is
+  // Finalization's Release; this frees everything the run holds at once, which
+  // is the only way back when its job no longer exists.
+  const releaseMut = useMutation({
+    mutationFn: (arrangeId: string) => productionApi.unfinalizeArrangement(arrangeId),
+    onSuccess: (r) => {
+      notify.success(`${r.returned} seeds returned to the available list.`);
+      qc.invalidateQueries({ queryKey: ["arrangements"] });
+    },
+    onError: (e) => notify.error(e instanceof Error ? e.message : "Return failed"),
+  });
   const detailQ = useQuery({
     queryKey: ["arrangement", openId],
     queryFn: () => productionApi.getArrangement(openId!),
@@ -107,6 +123,33 @@ export function ArrangementHistory() {
         cellRenderer: (p: { value: string }) => methodTag(p.value),
       },
       { headerName: "Plates", field: "plateCount", minWidth: 90 },
+      {
+        // Inventory this run is holding. Releasing lives here because this
+        // screen always works — Finalization needs a live job, which is gone
+        // once the backend restarts, taking its release button with it.
+        headerName: "Seeds held",
+        field: "seedsHeld",
+        minWidth: 150,
+        cellRenderer: (p: { data?: ArrangementRow }) => {
+          const n = p.data?.seedsHeld ?? 0;
+          if (!p.data) return null;
+          if (!n) return <Text type="secondary">—</Text>;
+          return (
+            <Space size={6}>
+              <Tag color="green" style={{ margin: 0 }}>{n}</Tag>
+              {canRelease && (
+                <Button
+                  size="small"
+                  loading={releaseMut.isPending && releaseMut.variables === p.data.arrangeId}
+                  onClick={() => releaseMut.mutate(p.data!.arrangeId)}
+                >
+                  Return
+                </Button>
+              )}
+            </Space>
+          );
+        },
+      },
       {
         headerName: "Avg fill",
         field: "average",
@@ -147,7 +190,8 @@ export function ArrangementHistory() {
           ) : null,
       },
     ],
-    [],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [canRelease, releaseMut.isPending, releaseMut.variables],
   );
 
   return (

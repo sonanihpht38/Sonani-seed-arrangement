@@ -12,7 +12,7 @@ import { Card, Space, Typography, Alert, Button, Row, Col, Pagination, Image, Ta
 import type { ColDef } from "ag-grid-community";
 import { useAuth } from "../auth/useAuth";
 import { productionApi } from "./productionApi";
-import type { DimRow, FinalizeContext, Job } from "./types";
+import type { DimRow, FinalizeContext, FinalizedPlate, Job } from "./types";
 import { DataGrid } from "../../components/DataGrid";
 import { FiCheck, FiDownload, FiX } from "../../components/icons";
 import { notify } from "../../lib/notify";
@@ -85,8 +85,23 @@ export function Finalization() {
     enabled: !!ctx?.arrangeId,
   });
 
+  // ---- Inventory ----------------------------------------------------------
+  // A plate's seeds leave the pool when the plate is ASSIGNED a name, and come
+  // back when the name is released. Declared here, above `current`, because the
+  // Assign button reads it.
+  const finalQ = useQuery({
+    queryKey: ["finalize-status", ctx?.arrangeId],
+    queryFn: () => productionApi.finalizeStatus(ctx!.arrangeId),
+    enabled: !!ctx?.arrangeId,
+  });
+
   const plates = useMemo(() => (jobQ.data && jobQ.data.status === "done" ? normalize(jobQ.data) : []), [jobQ.data]);
   const current = plates[page - 1];
+  // Inventory state of the plate on screen. A plate whose seeds another run has
+  // already committed cannot be built as drawn — block Assign and say why,
+  // rather than letting the click fail with a conflict.
+  const currentInv = finalQ.data?.plates.find((p) => p.plateNo === current?.plateNo);
+  const stale = Boolean(currentInv && !currentInv.consumed && !currentInv.canAssign);
   const names = namesQ.data?.names ?? {};
   const currentName = current ? names[String(current.plateNo)] ?? undefined : undefined;
 
@@ -110,31 +125,151 @@ export function Finalization() {
   const assignMut = useMutation({
     mutationFn: () => productionApi.assignPlate(ctx!.arrangeId, current!.plateNo, pick!),
     onSuccess: (r) => {
-      notify.success(`Plate ${current!.plateNo} named "${r.plateName}".`);
+      notify.success(
+        `Plate ${current!.plateNo} named "${r.plateName}" — ${r.seedsConsumed} seeds removed from the available list.`);
       namesQ.refetch();
       availQ.refetch();
+      finalQ.refetch();
+      finalizedQ.refetch();
     },
     onError: (e) => notify.error(e instanceof Error ? e.message : "Assign failed"),
   });
-  const releaseMut = useMutation({
-    mutationFn: () => productionApi.releasePlate(ctx!.arrangeId, current!.plateNo),
-    onSuccess: () => {
-      notify.success(`Plate ${current!.plateNo} name released.`);
-      setPick(undefined);
+  const unfinalizeMut = useMutation({
+    mutationFn: () => productionApi.unfinalizeArrangement(ctx!.arrangeId),
+    onSuccess: (r) => {
+      notify.success(`Arrangement reopened — ${r.returned} seeds back in the available list.`);
+      finalQ.refetch();
+    },
+    onError: (e) => notify.error(e instanceof Error ? e.message : "Reopen failed"),
+  });
+
+  // ---- The finalized-plate register --------------------------------------
+  // Read straight from TRN_SeedPlate, so it is here whether or not a run is
+  // open — unlike the per-plate view above, which needs a live job.
+  const finalizedQ = useQuery({
+    queryKey: ["finalized-plates"],
+    queryFn: productionApi.finalizedPlates,
+  });
+  const releaseRowMut = useMutation({
+    mutationFn: (v: { arrangeId: string; plateNo: number }) =>
+      productionApi.releasePlate(v.arrangeId, v.plateNo),
+    onSuccess: (r) => {
+      notify.success(
+        `Plate "${r.plateName}" released — ${r.seedsReturned} seeds back in the available list.`);
+      finalizedQ.refetch();
       namesQ.refetch();
       availQ.refetch();
+      finalQ.refetch();
     },
     onError: (e) => notify.error(e instanceof Error ? e.message : "Release failed"),
   });
 
+  const finalizedCols: ColDef<FinalizedPlate>[] = useMemo(() => [
+    { headerName: "Plate name", field: "plateName", minWidth: 140 },
+    {
+      headerName: "Finalized at",
+      field: "finalizedAt",
+      minWidth: 170,
+      valueFormatter: (p) => {
+        if (!p.value) return "—";
+        const d = new Date(p.value);
+        return Number.isNaN(d.getTime())
+          ? String(p.value).slice(0, 16)
+          : `${d.toLocaleDateString()} ${d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+      },
+    },
+    { headerName: "Plate #", field: "plateNo", minWidth: 90 },
+    { headerName: "Seeds", field: "seeds", minWidth: 90 },
+    {
+      headerName: "Fill",
+      field: "fillPct",
+      minWidth: 90,
+      valueFormatter: (p) => (p.value == null ? "—" : `${p.value}%`),
+    },
+    {
+      headerName: "Ø",
+      field: "plateDiameter",
+      minWidth: 80,
+      valueFormatter: (p) => (p.value == null ? "—" : `${p.value}mm`),
+    },
+    {
+      headerName: "",
+      minWidth: 120,
+      maxWidth: 130,
+      sortable: false,
+      filter: false,
+      cellRenderer: (p: { data?: FinalizedPlate }) =>
+        p.data && p.data.arrangeId && p.data.plateNo != null && canFinalize ? (
+          <Button
+            size="small"
+            icon={<FiX />}
+            loading={releaseRowMut.isPending
+              && releaseRowMut.variables?.arrangeId === p.data.arrangeId
+              && releaseRowMut.variables?.plateNo === p.data.plateNo}
+            onClick={() => releaseRowMut.mutate({
+              arrangeId: p.data!.arrangeId!, plateNo: p.data!.plateNo!,
+            })}
+          >
+            Release
+          </Button>
+        ) : null,
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  ], [canFinalize, releaseRowMut.isPending, releaseRowMut.variables]);
+
+  const finalizedCard = (
+    <Card
+      title={`Finalized plates${finalizedQ.data ? ` (${finalizedQ.data.length})` : ""}`}
+      loading={finalizedQ.isLoading}
+      extra={
+        <Button size="small" loading={finalizedQ.isFetching} onClick={() => finalizedQ.refetch()}>
+          Refresh
+        </Button>
+      }
+    >
+      {finalizedQ.data && finalizedQ.data.length === 0 ? (
+        <Empty description="No plate has been finalized yet. Assign a plate name above to finalize one." />
+      ) : (
+        <>
+          <Text type="secondary">
+            Every plate that carries an assigned name. Releasing one frees its plate name
+            and returns its seeds to the available list.
+          </Text>
+          <div style={{ marginTop: 12 }}>
+            <DataGrid rowData={finalizedQ.data ?? []} columnDefs={finalizedCols} />
+          </div>
+        </>
+      )}
+    </Card>
+  );
+
+  const releaseMut = useMutation({
+    mutationFn: () => productionApi.releasePlate(ctx!.arrangeId, current!.plateNo),
+    onSuccess: (r) => {
+      notify.success(
+        `Plate ${current!.plateNo} released — ${r.seedsReturned} seeds back in the available list.`);
+      setPick(undefined);
+      namesQ.refetch();
+      availQ.refetch();
+      finalQ.refetch();
+      finalizedQ.refetch();
+    },
+    onError: (e) => notify.error(e instanceof Error ? e.message : "Release failed"),
+  });
+
+  // No run open — but the register of already-finalized plates still belongs
+  // here, and is the only way to review or release them once a job is gone.
   if (!ctx) {
     return (
-      <Card title="Finalization">
-        <Alert type="warning" showIcon message="Nothing to finalize" description="Open this from a plate's “Finalize this plate” button on the Result screen." />
-        <div style={{ marginTop: 16 }}>
-          <Button onClick={() => navigate("/production/result")}>← Back to Result</Button>
-        </div>
-      </Card>
+      <Space direction="vertical" size="large" style={{ display: "flex" }}>
+        <Card title="Finalization">
+          <Alert type="warning" showIcon message="Nothing to finalize" description="Open this from a plate's “Finalize this plate” button on the Result screen." />
+          <div style={{ marginTop: 16 }}>
+            <Button onClick={() => navigate("/production/result")}>← Back to Result</Button>
+          </div>
+        </Card>
+        {finalizedCard}
+      </Space>
     );
   }
 
@@ -151,6 +286,57 @@ export function Finalization() {
         />
         {loading && <div style={{ padding: "16px 0" }}><Spin /></div>}
         {!loading && plates.length === 0 && <Empty style={{ marginTop: 12 }} description="No plates to finalize." />}
+
+        {/* Inventory: finalizing takes this run's seeds out of circulation. */}
+        {finalQ.data && plates.length > 0 && (
+          <div style={{ marginTop: 16, paddingTop: 16, borderTop: `1px solid ${colors.border}` }}>
+            <Space wrap size="middle">
+              <Text strong>Inventory:</Text>
+              <Tag color={finalQ.data.isFinalized ? "green" : "orange"}>
+                {finalQ.data.isFinalized ? "finalized" : "draft"}
+              </Tag>
+              <Text type="secondary">
+                {finalQ.data.seedsInArrangement} seeds on these plates ·{" "}
+                {finalQ.data.seedsAvailable} still available ·{" "}
+                {finalQ.data.seedsUsedTotal} used
+              </Text>
+              {finalQ.data.seedsConsumedByThisRun > 0 && (
+                <Button
+                  icon={<FiX />}
+                  loading={unfinalizeMut.isPending}
+                  disabled={!canFinalize}
+                  onClick={() => unfinalizeMut.mutate()}
+                >
+                  Return all ({finalQ.data.seedsConsumedByThisRun} seeds)
+                </Button>
+              )}
+            </Space>
+            {/* Per plate, because each plate is committed on its own. */}
+            <div style={{ marginTop: 8 }}>
+              <Space wrap size={6}>
+                {finalQ.data.plates.map((p) => (
+                  <Tag
+                    key={p.plateNo}
+                    color={p.consumed ? "green" : !p.canAssign ? "red" : "default"}
+                  >
+                    Plate {p.plateNo}: {p.seeds} seeds
+                    {p.consumed
+                      ? ` · ${p.plateName}`
+                      : !p.canAssign
+                        ? ` · ${p.takenElsewhere} taken by another plate`
+                        : " · available"}
+                  </Tag>
+                ))}
+              </Space>
+            </div>
+            <div style={{ marginTop: 6 }}>
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                Assigning a plate name removes that plate's seeds from the available list;
+                releasing the name puts them back. Unassigned plates stay available.
+              </Text>
+            </div>
+          </div>
+        )}
       </Card>
 
       {current && (
@@ -176,7 +362,7 @@ export function Finalization() {
               type="primary"
               icon={<FiCheck />}
               loading={assignMut.isPending}
-              disabled={!pick || !canFinalize}
+              disabled={!pick || !canFinalize || stale}
               onClick={() => assignMut.mutate()}
             >
               Assign
@@ -195,6 +381,19 @@ export function Finalization() {
               </Tag>
             )}
           </Space>
+
+          {/* This plate's stones went to another plate after it was generated,
+              so it can no longer be built as drawn. Said here rather than let
+              the Assign click fail. */}
+          {stale && (
+            <Alert
+              type="warning"
+              showIcon
+              style={{ marginBottom: 16 }}
+              message="This plate is out of date"
+              description={`${currentInv?.takenElsewhere} of its ${currentInv?.seeds} seeds have since been used by another finalized plate. Generate the plates again to build this one from the seeds that are still available.`}
+            />
+          )}
 
           {/* Each stage: image + its report, paired side by side (same-size images) */}
           <Row gutter={[16, 16]}>
@@ -232,6 +431,8 @@ export function Finalization() {
           </div>
         </Card>
       )}
+
+      {finalizedCard}
     </Space>
   );
 }

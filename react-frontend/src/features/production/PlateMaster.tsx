@@ -11,7 +11,8 @@ import { useAuth } from "../auth/useAuth";
 import { productionApi } from "./productionApi";
 import type { SeedPlate } from "./types";
 import { DataGrid } from "../../components/DataGrid";
-import { AddButton, EditButton, DeleteButton } from "../../components/buttons";
+import { AddButton, ActionButton, EditButton, DeleteButton } from "../../components/buttons";
+import { FiX } from "../../components/icons";
 import { notify } from "../../lib/notify";
 
 const activeTag = (v: boolean) => <Tag color={v ? "green" : "red"}>{v ? "active" : "inactive"}</Tag>;
@@ -43,6 +44,14 @@ export function PlateMaster() {
     onSuccess: () => { notify.success("Plate deleted"); invalidate(); },
     onError: (e) => notify.error(e instanceof Error ? e.message : "Delete failed"),
   });
+  // Unassign: puts an "in use" plate back in the pool. Without this the only way
+  // to free a plate was to reopen the arrangement that took it — and if that
+  // arrangement was gone, the plate stayed locked for good.
+  const releaseMut = useMutation({
+    mutationFn: (id: number) => productionApi.releasePlateById(id),
+    onSuccess: (r) => { notify.success(`Plate "${r.plateName}" unassigned`); invalidate(); },
+    onError: (e) => notify.error(e instanceof Error ? e.message : "Unassign failed"),
+  });
 
   function open(p: SeedPlate | "new") {
     setModal(p);
@@ -63,6 +72,16 @@ export function PlateMaster() {
       cellRenderer: (p: { data: SeedPlate }) => (
         <Space size={4}>
           {canUpdate && <EditButton size="small" onClick={() => open(p.data)} />}
+          {/* Only an "in use" plate can be unassigned — the same test the Status
+              column renders, so the button appears exactly when the tag says
+              "in use" and never on a plate that is already free. */}
+          {canUpdate && p.data.is_used && !p.data.is_released && (
+            <ActionButton size="small" icon={<FiX />}
+              loading={releaseMut.isPending && releaseMut.variables === p.data.plate_id}
+              onClick={() => releaseMut.mutate(p.data.plate_id)}>
+              Unassign
+            </ActionButton>
+          )}
           {canDelete && (
             <DeleteButton size="small" confirm={`Delete plate "${p.data.plate_name}"?`}
               onConfirm={() => delMut.mutate(p.data.plate_id)} />
@@ -71,7 +90,7 @@ export function PlateMaster() {
       ),
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  ], [canUpdate, canDelete]);
+  ], [canUpdate, canDelete, releaseMut.isPending, releaseMut.variables]);
 
   return (
     <Space direction="vertical" size="large" style={{ display: "flex" }}>

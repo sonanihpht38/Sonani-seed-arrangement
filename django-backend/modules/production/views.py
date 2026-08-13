@@ -12,22 +12,29 @@ from django.conf import settings
 from django.db.models import Q
 from django.http import HttpResponse
 from rest_framework import status, viewsets
+from rest_framework.decorators import action
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from modules.access.permissions import HasFormPermission
+from modules.core.exceptions import ConflictError
 
 from . import engine_runner
 from .jobs import create_job, get_job, job_to_json
 from .models import DomainError, SeedPlate
 from .serializers import BatchSerializer, SeedImportRequestSerializer, SeedPlateSerializer
-from .services import ArrangementService, BatchService, PlateService, SeedImportService
+from .services import (
+    ArrangementService, BatchService, InventoryService, PlateService, SeedImportService,
+)
 
 # CRUD action -> required form action on the 'plate_master' form.
 _PLATE_PERM = {
     "list": "view", "retrieve": "view",
     "create": "create", "update": "edit", "partial_update": "edit", "destroy": "delete",
+    # Unassigning changes the plate's state, not the inventory — same right as
+    # an edit, so a user who may correct a plate may also free it.
+    "release": "edit",
 }
 
 _VALID_ACTIONS = {"arrange", "machinefill", "compare", "enhanced"}
@@ -138,8 +145,11 @@ class AssignPlateView(APIView):
     def post(self, request):
         try:
             res = PlateService.assign(
-                request.data.get("arrangeId"), request.data.get("plateNo"), request.data.get("plateName"),
+                request.data.get("arrangeId"), request.data.get("plateNo"),
+                request.data.get("plateName"), getattr(request.user, "id", None),
             )
+        except ConflictError:
+            raise          # 409 via the global handler — a seed clash is not a 400
         except DomainError as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(res)
@@ -151,7 +161,32 @@ class ReleasePlateView(APIView):
     permission_classes = [HasFormPermission.require("finalization", "save")]
 
     def post(self, request):
-        return Response(PlateService.release(request.data.get("arrangeId"), request.data.get("plateNo")))
+        return Response(PlateService.release(
+            request.data.get("arrangeId"), request.data.get("plateNo"),
+            getattr(request.user, "id", None)))
+
+
+class FinalizeArrangementView(APIView):
+    """Inventory state of one arrangement.
+
+    Seeds are consumed per PLATE, when that plate is assigned a name — see
+    PlateService.assign — so there is no "finalize the run" action here.
+
+    GET    → status: which plates are committed, how much inventory is left.
+    DELETE → recovery: return EVERY seed this run is holding, whichever plate
+             took it. The way back from a bulk consume.
+    """
+
+    def get_permissions(self):
+        act = "view" if self.request.method == "GET" else "save"
+        return [HasFormPermission.require("finalization", act)()]
+
+    def get(self, request, arrange_id):
+        return Response(InventoryService.status(arrange_id))
+
+    def delete(self, request, arrange_id):
+        return Response(InventoryService.unfinalize(
+            arrange_id, getattr(request.user, "id", None)))
 
 
 class PlateMasterViewSet(viewsets.ModelViewSet):
@@ -163,6 +198,32 @@ class PlateMasterViewSet(viewsets.ModelViewSet):
 
     def get_permissions(self):
         return [HasFormPermission.require("plate_master", _PLATE_PERM.get(self.action, "view"))()]
+
+    @action(detail=True, methods=["post"])
+    def release(self, request, pk=None):
+        """Free this plate back to the pool — the Plate Master "Unassign" action.
+
+        Finalization's /production/plates/release needs (arrangeId, plateNo);
+        this screen has neither, so it gets its own door onto the same rule.
+        """
+        return Response(PlateService.release_plate(pk))
+
+    def perform_destroy(self, instance):
+        """Refuse to delete a plate an arrangement is still using.
+
+        The delete used to go through and take the master row with it, leaving
+        TRN_SeedPlate naming a Plate_ID that no longer existed — the arrangement
+        still claimed the plate, but nothing recorded that it was taken, so the
+        same physical plate could be handed to a second arrangement. Blocking is
+        the safe half of that trade: the plate can still be removed, it just has
+        to be unassigned first, which is now possible from this very screen.
+        """
+        if instance.is_used and not instance.is_released:
+            raise ConflictError(
+                f"Plate \"{instance.plate_name}\" is assigned to an arrangement. "
+                f"Unassign it first, then delete."
+            )
+        instance.delete()
 
 
 class AvailablePlatesView(APIView):
@@ -185,6 +246,20 @@ class AvailablePlatesView(APIView):
             for p in qs.order_by("plate_name", "plate_id")
         ]
         return Response(rows)
+
+
+class FinalizedPlatesView(APIView):
+    """Every plate that has been finalized (i.e. carries an assigned name).
+
+    Read from TRN_SeedPlate, so the list is there whether or not the run that
+    produced a plate is still open — the Finalization screen's per-plate view
+    needs a live job, this does not.
+    """
+
+    permission_classes = [HasFormPermission.require("finalization", "view")]
+
+    def get(self, request):
+        return Response(PlateService.finalized_list())
 
 
 class DownloadPlatesView(APIView):
