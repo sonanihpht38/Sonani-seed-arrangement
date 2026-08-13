@@ -69,3 +69,20 @@ if settings.SERVE_MEDIA:
             {"document_root": settings.MEDIA_ROOT},
         ),
     ]
+
+# The SAME files, also reachable under /api/. Deployments that put a separate
+# web server in front of the SPA proxy only /api to Django; a request for
+# /media/... then never leaves that server, hits its SPA fallback and comes back
+# as index.html with HTTP 200 and Content-Type text/html — so every plate image
+# renders broken while the page itself works. Riding the /api prefix means the
+# images follow the proxy rule that already exists, with no server config to add.
+#
+# Registered unconditionally, unlike the block above: it is the only route that
+# works when nothing fronts MEDIA_ROOT.
+urlpatterns += [
+    re_path(
+        rf"^api/{settings.MEDIA_URL.strip('/')}/(?P<path>.*)$",
+        serve,
+        {"document_root": settings.MEDIA_ROOT},
+    ),
+]
