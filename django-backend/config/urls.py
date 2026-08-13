@@ -61,7 +61,12 @@ urlpatterns = [
 # SERVE_MEDIA is on (dev default). `django.conf.urls.static.static()` is a no-op
 # once DEBUG is off, so wire the serve view directly — a DEBUG=false dev stack on
 # a LAN IP still needs its images. Production fronts MEDIA_ROOT with nginx.
-if settings.SERVE_MEDIA:
+# getattr, not settings.SERVE_MEDIA: an older deployment's settings module may
+# not define it at all, and a bare attribute access raises AttributeError while
+# the URLconf is being imported — before any routing exists. Django then fails
+# EVERY request with a 500, including login, and the traceback points here
+# rather than at the settings file that is actually out of date.
+if getattr(settings, "SERVE_MEDIA", False):
     urlpatterns += [
         re_path(
             rf"^{settings.MEDIA_URL.lstrip('/')}(?P<path>.*)$",
