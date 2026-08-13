@@ -66,10 +66,33 @@ export default defineConfig({
         // Split large, rarely-changing vendors into their own long-cached chunks.
         // ag-grid is only pulled in by the lazy feature screens, so its chunk
         // loads on demand — not on first paint.
-        manualChunks: {
-          "react-vendor": ["react", "react-dom", "react-router-dom", "@tanstack/react-query"],
-          "antd-vendor": ["antd", "@ant-design/icons"],
-          "aggrid-vendor": ["ag-grid-community", "ag-grid-react"],
+        // MATCH BY PATH, not by package name. The object form
+        // ({"react-vendor": ["react", "react-dom", ...]}) matches only the exact
+        // ids listed, so `react-dom/client`, `scheduler` and antd's `rc-*`
+        // internals were never claimed and scattered into whichever chunk first
+        // pulled them — react-dom ended up inside antd-vendor.
+        //
+        // That made the two vendor chunks CIRCULAR: react-vendor holds
+        // react-router-dom, which imports react-dom (then in antd-vendor), while
+        // antd-vendor imports React from react-vendor. Whichever chunk evaluated
+        // first saw the other's exports as undefined, and the app died on
+        // `React.__SECRET_INTERNALS_...` of undefined — a blank white page with
+        // one console error and no other clue.
+        //
+        // Matching on the node_modules path keeps react + react-dom + scheduler
+        // together, so the dependency runs one way: antd/ag-grid -> react-vendor.
+        manualChunks(id) {
+          if (!id.includes("node_modules")) return;
+          const p = id.replace(/\\/g, "/");
+          if (/\/node_modules\/(react|react-dom|scheduler|react-router|react-router-dom|@remix-run|@tanstack)\//.test(p)) {
+            return "react-vendor";
+          }
+          if (/\/node_modules\/(antd|@ant-design|rc-[^/]+|@rc-component)\//.test(p)) {
+            return "antd-vendor";
+          }
+          if (/\/node_modules\/(ag-grid-community|ag-grid-react)\//.test(p)) {
+            return "aggrid-vendor";
+          }
         },
       },
     },
