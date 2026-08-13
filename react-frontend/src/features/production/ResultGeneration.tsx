@@ -18,6 +18,7 @@ import { ACTION_KEY, COMPARE_METHODS_KEY } from "./ProcessingOption";
 import { DataGrid } from "../../components/DataGrid";
 import { FiCheck, FiDownload, FiRefreshCw } from "../../components/icons";
 import { notify } from "../../lib/notify";
+import { mediaUrl } from "../../lib/media";
 import { colors, alpha } from "../../theme";
 
 const { Text } = Typography;
@@ -50,21 +51,21 @@ function normalize(job: Job): PlateItem[] {
     return job.pairs.map((p) => ({
       plateNo: p.plateNo,
       // One image + one full seed table per selected method (2 or 3), side by side.
-      images: p.panels.map((pn) => ({ label: pn.label, url: pn.imageUrl, fill: pn.fillPct, method: pn.method })),
+      images: p.panels.map((pn) => ({ label: pn.label, url: mediaUrl(pn.imageUrl), fill: pn.fillPct, method: pn.method })),
       reports: p.panels.map((pn) => ({
         label: `${pn.label} · ${pn.seeds.length} seeds`,
         seeds: pn.seeds,
       })),
-      exportUrl: p.exportUrl,
+      exportUrl: mediaUrl(p.exportUrl),
     }));
   }
   const label = job.action === "arrange" ? "Arrange" : job.action === "enhanced" ? "Max Coverage" : "Machine-Cut";
   const reportLabel = job.action === "arrange" ? "Arrange · real seeds" : job.action === "enhanced" ? "Max Coverage · real seeds" : "Machine-Cut · real + dummy";
   return job.plates.map((p) => ({
     plateNo: p.plateNo,
-    images: [{ label, url: p.imageUrl, fill: p.fillPct }],
+    images: [{ label, url: mediaUrl(p.imageUrl), fill: p.fillPct }],
     reports: [{ label: reportLabel, seeds: p.seeds }],
-    exportUrl: p.exportUrl,
+    exportUrl: mediaUrl(p.exportUrl),
   }));
 }
 

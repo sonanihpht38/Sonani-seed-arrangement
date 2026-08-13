@@ -16,6 +16,7 @@ import type { DimRow, FinalizeContext, FinalizedPlate, Job } from "./types";
 import { DataGrid } from "../../components/DataGrid";
 import { FiCheck, FiDownload, FiX } from "../../components/icons";
 import { notify } from "../../lib/notify";
+import { mediaUrl } from "../../lib/media";
 import { colors, alpha } from "../../theme";
 
 const { Text } = Typography;
@@ -50,7 +51,7 @@ function normalize(job: Job): PlateItem[] {
   if (job.action === "compare") {
     return job.pairs.map((p) => ({
       plateNo: p.plateNo,
-      images: p.panels.map((pn) => ({ label: pn.label, url: pn.imageUrl, fill: pn.fillPct })),
+      images: p.panels.map((pn) => ({ label: pn.label, url: mediaUrl(pn.imageUrl), fill: pn.fillPct })),
       reports: p.panels.map((pn) => ({ label: `${pn.label} · ${pn.seeds.length} seeds`, seeds: pn.seeds })),
     }));
   }
@@ -58,7 +59,7 @@ function normalize(job: Job): PlateItem[] {
   const reportLabel = job.action === "arrange" ? "Arrange · real seeds" : "Machine-Cut · real + dummy";
   return job.plates.map((p) => ({
     plateNo: p.plateNo,
-    images: [{ label, url: p.imageUrl, fill: p.fillPct }],
+    images: [{ label, url: mediaUrl(p.imageUrl), fill: p.fillPct }],
     reports: [{ label: reportLabel, seeds: p.seeds }],
   }));
 }

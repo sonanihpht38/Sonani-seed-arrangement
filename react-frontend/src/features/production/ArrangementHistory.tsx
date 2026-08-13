@@ -13,6 +13,7 @@ import type { ColDef } from "ag-grid-community";
 import { useAuth } from "../auth/useAuth";
 import { productionApi } from "./productionApi";
 import { notify } from "../../lib/notify";
+import { mediaUrl } from "../../lib/media";
 import type { ArrangementRow, ArrangementSeed } from "./types";
 import { DataGrid } from "../../components/DataGrid";
 import { FiInfo, FiEye, FiDownload, FiRefreshCw } from "../../components/icons";
@@ -288,7 +289,7 @@ export function ArrangementHistory() {
                         {p.dummyCount ? ` · ${p.dummyCount} dummy` : ""}
                       </Text>
                       {p.excelUrl && (
-                        <Button size="small" icon={<FiDownload />} href={p.excelUrl} target="_blank">
+                        <Button size="small" icon={<FiDownload />} href={mediaUrl(p.excelUrl)} target="_blank">
                           Excel
                         </Button>
                       )}
@@ -320,13 +321,13 @@ export function ArrangementHistory() {
                                 {s.url && (
                                   <Col xs={24} lg={10}>
                                     <Image
-                                      src={s.url}
+                                      src={mediaUrl(s.url)}
                                       alt={`Plate ${p.plateNo} ${s.label}`}
                                       width="100%"
                                       style={{ objectFit: "contain", borderRadius: 4 }}
                                     />
                                     <div style={{ marginTop: 6 }}>
-                                      <Button size="small" icon={<FiEye />} href={s.url} target="_blank">
+                                      <Button size="small" icon={<FiEye />} href={mediaUrl(s.url)} target="_blank">
                                         Open full size
                                       </Button>
                                     </div>
