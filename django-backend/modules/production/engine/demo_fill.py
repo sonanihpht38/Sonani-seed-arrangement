@@ -1346,6 +1346,29 @@ SEAT_SCORES = ("compact", "area")
 # the curve, and a cut stone there wastes more plate than it saves.
 RIM_SEAT = 8.0
 
+# How close to the plate boundary a cut/trimmed stone must sit to count as being
+# ON THE RIM, in mm of clear space left outside it.
+#
+# CUT/TRIMMED STONES GO ON THE RIM AND NOWHERE ELSE. A ground corner only works
+# where the plate curves away from it; anywhere else the missing corner is an
+# open notch against a flat neighbour and the seat cannot be built.
+#
+# "Last stone in its row" is NOT the same thing, and that is what this used to
+# test (_rem < RIM_SEAT, i.e. up to 8 mm of bare plate could sit outside a
+# cross). It let a cut stone take the end of a row while still 6 mm short of the
+# boundary — inside the plate by any reading, with the gap outside it. Refusing
+# that seat leaves it to a plain square or rectangle, which is what belongs
+# there, and the cut stone is only used where it genuinely follows the curve.
+#
+# 2.0 mm is set from the stones themselves, not picked round. On the Ø90 plate
+# the five correctly-seated crosses sat 0.02, 0.10, 0.48, 0.48 and 1.23 mm from
+# the boundary; the one sitting inland sat 5.96 mm out. Anything from about 1.5
+# to 5.5 mm separates them, so 2.0 mm keeps every genuine rim seat and refuses
+# the inland one — the smallest rule that fixes the seat without disturbing the
+# rest of the plate. Tightening it to 0.5 mm also works but re-seats crosses
+# that were already right, and moves the whole layout with them.
+RIM_FLUSH = 2.0
+
 # Seat cut stones at both rims BEFORE filling the row. Measured far worse than
 # filling whole-first and capping afterwards; see seed_row_ends().
 CUTS_FIRST = False
@@ -1882,7 +1905,7 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
                 notch = 0.0
                 if cut0 is None:
                     cutrim = 0
-                elif _rem < RIM_SEAT and out > 0.0 and not _mid:
+                elif _rem <= RIM_FLUSH and out > 0.0 and not _mid:
                     # WHERE a cut stone may sit is unchanged: the outermost seat
                     # of a row, outside the protected centre band, ground corner
                     # pointing outward. A cross facing a flat neighbour leaves a
@@ -1963,6 +1986,12 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
                     # NOTCH is the cut stone's missing corner, counted only where
                     # it falls inside the plate, and CUT_BONUS is what draining
                     # the cut pile is worth against it.
+                    # Charging a cut stone for the WHOLE remainder beyond it —
+                    # true in principle, since a cross closes its side — was
+                    # tried and is worse: it prices crosses out of the rim seats
+                    # they exist for (cut usage 6 -> 3 on the Ø90 pool) and the
+                    # layout that replaces them left 9.5 mm and 24.7 mm holes,
+                    # against 83.32% and one 9.08 mm gap this way.
                     _dead = _rem * hh if 0.0 < _rem < narrowest else 0.0
                     _waste = (lost + gap * bw + _dead + notch
                               - (CUT_BONUS if cut0 is not None else 0.0))
@@ -2194,11 +2223,26 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
             nonlocal xl, xr
             # The fill now seats cut stones at the rims itself and closes that
             # side behind them, so capping normally finds nothing left to do.
-            # It still runs: a side the fill closed for want of a WHOLE stone can
-            # sometimes take a cut one, and a cross there costs nothing.
+            # It still runs, because a side the fill closed for want of a WHOLE
+            # stone can sometimes take a cut one, and a cross there costs
+            # nothing.
             if row_h <= 0.0 or abs(y + row_h / 2.0) < CENTRE_BAND:
                 return
+            row = placed[n0:]
             for going_left in (False, True):
+                # NEVER cap a side that already ENDS in a cut stone. Capping on
+                # top of one the fill seated puts a second cross outside the
+                # first, and the inner one is then stranded inland with its
+                # ground corner against a flat neighbour — the seat the floor
+                # rejects. It put seat 45 three stones deep in its row while
+                # seat 47 sat correctly at the rim beside it.
+                #
+                # One mechanism or the other per side, never both.
+                if row:
+                    outer = (min(row, key=lambda p: p["x"]) if going_left
+                             else max(row, key=lambda p: p["x"] + p["w"]))
+                    if outer.get("irregular"):
+                        continue
                 best = scan(y, xl if going_left else xr, row_h, False,
                             going_left, want_cut=True, level=level)
                 if not best:
