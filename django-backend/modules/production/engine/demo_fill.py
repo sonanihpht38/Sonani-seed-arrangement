@@ -1195,11 +1195,23 @@ def _seed_footprint(s):
 # way — the run-average figures above are what that costs.
 ENHANCED_ANGLES = (0, 180, 90, 270)
 NEST_STEP = 0.25          # mm — how finely a seed is slid left to close a gap
-ROW_PROBE = 1.0           # mm — how far to step up when a row height fits nothing
+# How far to step up when a row height fits nothing. This is a SEARCH step, not
+# a spacing: whatever it skips past becomes a horizontal band of bare plate
+# between two rows, because the next row simply opens higher up.
+#
+# It was 1.0 mm, and that is what put a visible gap under the bottom row and
+# above the top one — 0.94 mm and 1.04 mm on a Ø90 plate, while every row in the
+# middle sat flush. Only the first and last rows show it, because those are the
+# heights where the narrowing chord starts refusing rows. Measured on the
+# 95-stone pool: 1.00 mm leaves gaps of 0.94/1.04 at 83.09%, 0.50 mm leaves one
+# of 0.44 at 84.23%, 0.25 mm leaves NONE at 84.57%. The finer step both closes
+# the band and finds a height where a row actually fits. It costs about 10% of
+# the packing time and changes nothing on a pool whose rows never fail.
+ROW_PROBE = 0.25          # mm — how far to step up when a row height fits nothing
 RIM_EPS = 0.05            # mm — start this far inside the chord, so a corner
                           # lying exactly on the circle is not rejected (the disc
                           # is a 180-gon, marginally inside the true circle)
-ROW_TOL = 0.15            # mm — how much taller than its row a seed may stand
+ROW_TOL = 0.10            # mm — how much taller than its row a seed may stand
 SWEEP_ANCHORS = 48        # max pocket corners the sweep-up pass probes
 
 # UNIFORM ROWS — a row is built from ONE height class and nothing else.
@@ -1211,7 +1223,24 @@ SWEEP_ANCHORS = 48        # max pocket corners the sweep-up pass probes
 # makes the plate unacceptable however good its coverage looks.
 #
 # ROW_LEVEL_TOL is the mirror of ROW_TOL: how much SHORTER than its row a seed
-# may be. Together they hold a row inside a 0.25 mm band.
+# may be. Together they hold a row inside a 0.20 mm band.
+#
+# The band is NOT slack for measurement error — the stones are measured to
+# 0.01 mm and that is exactly the difficulty. 163 stones in stock carry 102
+# DISTINCT short-side heights and 66 of them are unique, so a row can only be
+# built at all by admitting stones whose true heights differ. Taken to zero the
+# plate collapses: 11 seats and 20.68% on the 163-stone pool, 2 seats and 3.37%
+# on the 95-stone one, because no two stones match exactly.
+#
+# 0.10/0.10 was measured against the 0.15/0.10 it replaces and is better on both
+# pools at once — tighter rows AND more plate covered:
+#
+#   band          163-stone pool             95-stone pool
+#   0.15 / 0.10   43 seats 86.44%, step 0.23  50 seats 82.40%, step 0.22
+#   0.10 / 0.10   45 seats 86.58%, step 0.16  49 seats 83.09%, step 0.19
+#
+# Tightening further does cost: 0.08/0.06 gives a 0.13-0.14 mm step for 83.71%
+# and 80.11%, and 0.02/0.02 drops to 76.66% / 51.43%.
 #
 # This only works because the height class is chosen from what is actually in
 # stock — see pick_level() — so the row is opened at a height the inventory can
