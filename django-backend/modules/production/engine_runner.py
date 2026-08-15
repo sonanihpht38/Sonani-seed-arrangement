@@ -58,6 +58,43 @@ def _num(params, key):
     return float(params[key])
 
 
+# Deal the Max Coverage stone pool out across the plates by height class, so no
+# plate can take the whole of a class and leave later ones unable to build a
+# level row from it.
+#
+# OFF. It does even the plates out, and it costs more than it returns. Measured
+# on the 163-stone Ø90 pool, coverage per plate:
+#
+#   plates  shared pool                    dealt by class
+#   3       86.4 / 84.9 / 55.9  126 stones  71.1 / 76.8 / 68.5  119 stones
+#   4       86.4 / 84.9 / 55.9 / 16.9  136  62.8 / 66.7 / 55.8 / 53.7  132
+#
+# Every plate ends up middling and FEWER stones are placed overall: the packer's
+# freedom to pick the best stone for a seat out of the whole pool is worth more
+# than an even spread. The tail is not the packer giving up either — a fixed
+# pool fills about two and a half plates, and the rump is the half.
+BALANCE_ACROSS_PLATES = False
+
+
+def _deal_by_height_class(pool, n):
+    """Split `pool` into `n` groups, each holding the same share of every height
+    class, widest stones dealt first so no group gets only the narrow ones."""
+    if n <= 1:
+        return [list(pool)]
+    band = 0.10
+    classes = {}
+    for s in pool:
+        L, W = float(s["L"]), float(s["W"])
+        h = min(L, W)
+        classes.setdefault(round(round(h / band) * band, 2), []).append(s)
+    groups = [[] for _ in range(n)]
+    for k in sorted(classes):
+        stones = sorted(classes[k], key=lambda s: -max(float(s["L"]), float(s["W"])))
+        for i, s in enumerate(stones):
+            groups[i % n].append(s)
+    return groups
+
+
 def _apply_globals(params):
     """Set the engine's module globals from the request params (every value is
     the one the user entered in the form). Returns the usable-circle radius R."""
@@ -429,6 +466,11 @@ def run(action, params, out_dir, media_base, progress=lambda p: None):
     # therefore method-vs-method over the whole run (how full, how many plates),
     # not a per-plate like-for-like of identical stones.
     enh_pool = [s for p in real_plates for s in p] if do_enhanced else []
+    # Optionally DEAL the pool out by height class instead — see
+    # _deal_by_height_class. enh_groups is None when the pool stays shared.
+    enh_groups = (_deal_by_height_class(enh_pool, total)
+                  if do_enhanced and BALANCE_ACROSS_PLATES else None)
+    enh_carry = []
 
     arrange_plates, machine_plates, enhanced_plates, pairs = [], [], [], []
     per_plate_real = []   # (plate_no, [real seed dicts])  → TRN_SeedArrangeDetails SeedType 0
@@ -481,11 +523,17 @@ def run(action, params, out_dir, media_base, progress=lambda p: None):
                 "seeds": mrows,
             })
 
-        if do_enhanced and enh_pool:
+        _enh_feed = enh_pool
+        if enh_groups is not None:
+            # This plate's dealt share, plus whatever earlier plates left over.
+            _enh_feed = (enh_groups[idx - 1] if idx - 1 < len(enh_groups) else []) + enh_carry
+        if do_enhanced and _enh_feed:
             # Feed the whole remaining pool; the job fills its grid and stops. Remove
             # what it placed so no later plate can reuse any of it.
-            _, eplaced, efill, _, _ = D.enhanced_plate_job((list(enh_pool), idx, plate_d, R, min_seed, epath))
+            _, eplaced, efill, _, _ = D.enhanced_plate_job((list(_enh_feed), idx, plate_d, R, min_seed, epath))
             _spent = {p["stock"] for p in eplaced}
+            if enh_groups is not None:
+                enh_carry = [s for s in _enh_feed if s["stock"] not in _spent]
             enh_pool = [s for s in enh_pool if s["stock"] not in _spent]
             e_made = True
             erows = dim_rows(eplaced)

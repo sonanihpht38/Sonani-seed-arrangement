@@ -1613,6 +1613,26 @@ RIM_EPS = 0.05            # mm — start this far inside the chord, so a corner
 ROW_TOL = 0.15            # mm — how much taller than its row a seed may stand
 SWEEP_ANCHORS = 48        # max pocket corners the sweep-up pass probes
 
+# UNIFORM ROWS — a row is built from ONE height class and nothing else.
+#
+# ROW_TOL alone only stopped a seed standing TALLER than its row. A shorter one
+# was always admitted, and it leaves a strip of bare plate above itself that no
+# later row can reach. Two things are wrong with that: the strip is waste, and a
+# row whose stones are not the same height cannot be built on the floor — which
+# makes the plate unacceptable however good its coverage looks.
+#
+# ROW_LEVEL_TOL is the mirror of ROW_TOL: how much SHORTER than its row a seed
+# may be. Together they hold a row inside a 0.25 mm band.
+#
+# This only works because the height class is chosen from what is actually in
+# stock — see pick_level() — so the row is opened at a height the inventory can
+# finish. Choosing it from the first stone that happened to fit would strand
+# every row the moment its class ran out.
+ROW_LEVEL_TOL = 0.10      # mm — how much shorter than its row a seed may be
+LEVEL_BAND = 0.10         # mm — width of a height class in the stock census
+LEVEL_MARGIN = 1.0        # how much more stock than chord a class needs to qualify
+LEVEL_TRIES = 3           # height classes actually laid out per row before choosing
+
 # Who wins a seat when a cut stone and a plain one both fit. BOTH are tried on
 # every plate and the better result is kept — see enhanced_plate_job.
 #
@@ -1723,8 +1743,50 @@ EDGE_FIRST = False
 CENTRE_BAND = 10.0
 
 # Most plate a cut stone's missing corner may waste INSIDE the circle, mm2.
-# Above this the cross is not following the rim and the seat is unbuildable.
-CUT_NOTCH_MAX = 1.0
+#
+# This was 1.0, which is not a strict gate — it is a closed one. Measured over
+# the 56 cut stones in stock, taking each stone's BEST orientation at its BEST
+# rim seat on any row of a Ø80 plate:
+#
+#   ground-corner triangle  median 2.22 mm2, up to 12.84
+#   best in-plate notch     min 0.08, median 2.22, p75 5.33
+#   admitted at 1.0 mm2      7 of 56          at 3.0 mm2   34 of 56
+#
+# The median stone cannot get its notch below the size of the corner itself,
+# because a chord is straight and the rim only curves away from a corner in the
+# few places the two happen to match. Holding the gate at 1.0 therefore did not
+# keep cut stones out of bad seats — it kept them out of every seat, and 0 of 56
+# were used on a plate. 3.0 mm2 is about one corner triangle: a notch that size
+# sits under the stone's own footprint, and the pile actually drains.
+CUT_NOTCH_MAX = 3.0
+
+# What using a cut stone is WORTH, as plate area in mm2, when it competes with a
+# plain one for the same seat.
+#
+# Ranking cut stones as an absolute winner (-1 ahead of a plain stone's 0) is
+# what made them unusable in the other direction: on a short row near the rim
+# every seat counts as a rim seat, so a narrow cross took the FIRST seat of the
+# row and closed it, leaving 17 mm of bare plate behind. Scoring it as a bonus
+# instead keeps the choice honest — a cut stone wins the seat unless a plain one
+# is better by more than this — and a cut stone is genuinely worth something:
+# left in the drawer it is 100% waste, and the rim is the only place it can go.
+CUT_BONUS = 12.0
+
+# RECONSIDERATION: after the plate is packed, revisit finished rows and keep any
+# exchange that seats one more stone. The packer is greedy — it commits a seat
+# the moment it fills one and never looks back — so a row can end 7 mm short
+# while carrying a 13 mm stone a narrower one would have served.
+#
+# ON. It was held off after its first attempt returned a plate with the rows
+# shoved against the left rim; that was the re-lay opening every rebuilt row at
+# the left chord, and it now centres the row instead. The exchange is also
+# atomic — a rebuild that does not actually gain a seat puts the old row back —
+# and it keeps the row's height line, so a reconsidered row is still level.
+RECONSIDER = True
+RECONSIDER_ROUNDS = 3
+
+# How far a sweep-up seat may sit off an established row baseline, mm.
+SWEEP_ROW_TOL = 0.6
 
 
 def _interior_waste(placed, disc):
@@ -1848,6 +1910,13 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
                 # handedness, matching how a seed can actually be laid down.
                 rg = affinity.rotate(g, deg, origin="centroid") if deg else g
                 b = rg.bounds
+                # NORMALISED to the origin, so every pose's bounds are exactly
+                # (0, 0, ww, hh). Seating one is then a translate to the seat's
+                # own corner, and neither the pose nor the placement has to be
+                # asked for its bounds — that question was being put to shapely
+                # 85,000 times per pack, once for every candidate orientation
+                # the scan looked at and discarded.
+                rg = affinity.translate(rg, -b[0], -b[1])
                 pl.append((deg, rg, b[2] - b[0], b[3] - b[1]))
             poses[id(s)] = pl
     queue = [s for s in real if id(s) in shapes]
@@ -1872,6 +1941,72 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
 
     placed, occ, used = [], [], set()
     srcs = []          # seed behind each placement, so one can be undone
+
+    def pick_level(y):
+        """Height classes for the row starting at `y`, best first.
+
+        Every stone still in the pool is filed under the height it lies flat at,
+        in LEVEL_BAND-wide classes. A class is judged on whether it can FINISH
+        the row about to be laid: the chord at this height is measured, and the
+        class's stones are counted against it — WHOLE stones only, since a cut
+        stone can only ever take the one seat at each end.
+
+        Choosing the class before the row opens is the whole point. The row is
+        then locked to a height the inventory can actually finish, instead of to
+        whichever stone happened to win the opening seat — which is how rows
+        ended up 2 mm taller than anything left to fill them.
+
+        Ranking on stock alone was not enough. A class holding three wide stones
+        outranked one holding eight narrower ones, opened a row it could fill
+        barely a third of, and left the rest of that chord bare — one plate came
+        back with 5 seats on it while the NEXT plate, from almost the same pool,
+        took 19. Whether the class covers the chord is what matters; how much it
+        has spare only breaks the tie.
+        """
+        census = {}
+        for s in queue:
+            if id(s) in used:
+                continue
+            g = shapes.get(id(s))
+            if g is None:
+                continue
+            bx0, by0, bx1, by1 = g.bounds
+            h = min(bx1 - bx0, by1 - by0)
+            w = max(bx1 - bx0, by1 - by0)
+            k = round(round(h / LEVEL_BAND) * LEVEL_BAND, 2)
+            c = census.setdefault(k, [0.0, 0.0])
+            c[1] = max(c[1], h)
+            if not s.get("poly"):
+                c[0] += w
+        if not census:
+            return None
+
+        def rank(k):
+            h = census[k][1]
+            yout = max(abs(y), abs(y + h))
+            if yout >= R:
+                return (0, 0.0, k)
+            chord2 = 2.0 * math.sqrt(R * R - yout * yout)
+            stock = census[k][0]
+            # Among classes that can finish the row, the best STOCKED wins, and
+            # height only breaks the tie. Ranking by height instead drains the
+            # tall classes a row at a time and leaves every class holding a
+            # little — none of them able to cover a chord — and the job then
+            # dribbles out over plates of 8, 7, 6 and 5 seats: 114 of 163 stones
+            # placed against 128 this way.
+            return (1 if stock >= LEVEL_MARGIN * chord2 else 0, stock, k)
+
+        return [census[k][1] for k in sorted(census, key=rank, reverse=True)]
+
+    def rollback(n, used_mark):
+        """Undo every placement made since a mark, so a row can be tried again."""
+        while len(placed) > n:
+            placed.pop()
+            occ.pop()
+            srcs.pop()
+        used.clear()
+        used.update(used_mark)
+        reindex()
 
     # Spatial index over what is already placed. free() is called thousands of
     # times — every probe, and every 0.25 mm step of every nesting slide — and
@@ -1974,7 +2109,7 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
         })
 
     def scan(y, x, row_h, allow_taller, going_left=False, want_cut=None,
-             rim_seed=False):
+             rim_seed=False, level=None):
         """Best seed for the seat at (x, y), or None. Returns (key, seed, deg, poly).
 
         `x` is the seat's NEAR edge: its left edge when the row grows rightwards,
@@ -1997,6 +2132,20 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
             for deg, rg, ww, hh in poses[id(s)]:
                 if row_h > 0.0 and hh > row_h + ROW_TOL and not allow_taller:
                     continue
+                # LEVEL ROWS, both ways, against a FIXED line. Too tall was
+                # always refused; too short is refused here, so a row cannot end
+                # up carrying stones of different heights.
+                #
+                # `level` is the class chosen from stock before the row opens,
+                # replaced by the opener's true height once one is seated — and
+                # never by the running row_h. Measuring against row_h ratchets:
+                # each stone may stand ROW_TOL taller than the row so far, that
+                # raises row_h, and the next stone may stand ROW_TOL taller
+                # again, so a row drifts well past its band and the earliest
+                # stones end up under a 0.45 mm strip.
+                if not allow_taller and level:
+                    if not (level - ROW_LEVEL_TOL <= hh <= level + ROW_TOL):
+                        continue
                 # The binding corner is on whichever of THIS seed's edges is
                 # nearer the rim, which depends on its own height, not the row's.
                 y_out = max(abs(y), abs(y + hh))
@@ -2008,7 +2157,6 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
                 # away legal placements of cut seeds: the ground-off corner means
                 # the box crosses the chord while the stone itself is still
                 # inside. free() tests the true outline, so let it decide.
-                rb = rg.bounds
                 # Centre-out keeps each half on its own side of the middle: a
                 # stone growing rightwards may nest back toward x=0 but not past
                 # it, and vice versa. Left-to-right has no such stop — its stones
@@ -2018,18 +2166,21 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
                 # the left edge going right — so seating at the rim has to be
                 # computed from the stone's own width, and it must NOT then be
                 # slid back toward the middle, which is the whole point.
-                bw = rb[2] - rb[0]
+                #
+                # The pose is normalised to the origin, so its bounds are
+                # (0, 0, ww, hh) and a translate by (left, bottom) seats it.
+                bw = ww
                 if going_left:
                     # Right edge on the cursor, then nudged back toward the middle.
                     x_at = (-chord + bw) if rim_seed else min(x, chord)
-                    g = affinity.translate(rg, x_at - rb[2], y - rb[1])
+                    g = affinity.translate(rg, x_at - bw, y)
                     if not free(g):
                         continue
                     if not rim_seed:
                         g = slide_right(g, -half if fill == "centre" else None)
                 else:
                     x_at = (chord - bw) if rim_seed else max(x, -chord)
-                    g = affinity.translate(rg, x_at - rb[0], y - rb[1])
+                    g = affinity.translate(rg, x_at, y)
                     if not free(g):
                         continue
                     if not rim_seed:
@@ -2096,26 +2247,24 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
                 # -1 outranks a plain stone (0) outright. Merely tying is not
                 # enough: a cut stone's notch counts as `lost`, so on any tie the
                 # plain rectangle wins and the cross never reaches the rim.
+                notch = 0.0
                 if cut0 is None:
                     cutrim = 0
                 elif _rem < RIM_SEAT and out > 0.0 and not _mid:
-                    # The cut must genuinely follow the curve. `out > 0` only
-                    # says the ground corner points outward-ish; it still allows
-                    # a placement whose missing corner sits INSIDE the plate,
-                    # leaving the triangular notch beside a neighbour that the
-                    # floor cannot build. Measure the notch instead of trusting
-                    # the direction: against the rim it is ~0, facing in it is
-                    # the whole triangle.
-                    if _wasted_area(g, disc) > CUT_NOTCH_MAX:
+                    # WHERE a cut stone may sit is unchanged: the outermost seat
+                    # of a row, outside the protected centre band, ground corner
+                    # pointing outward. A cross facing a flat neighbour leaves a
+                    # notch nothing can close and the floor rejects the seat.
+                    #
+                    # HOW it competes for that seat has changed. The notch is now
+                    # priced into the seat's waste below rather than being tested
+                    # against a threshold no real stone could meet, so the best
+                    # orientation of the best stone wins on merit.
+                    notch = _wasted_area(g, disc)
+                    if notch > CUT_NOTCH_MAX:
                         continue
-                    cutrim = -1
+                    cutrim = 0
                 else:
-                    # BANNED, not merely penalised. A ground corner away from the
-                    # rim faces a flat neighbour, leaving a notch nothing can
-                    # close — the floor rejects the seat. Penalising was not
-                    # enough: where no whole stone fitted, the penalised cut
-                    # stone was still the best candidate and went in anyway, six
-                    # times on one plate. Leaving the seat empty is cheaper.
                     continue
                 # EDGE UTILISATION: with cut stones allowed into the fill they
                 # win rim seats outright (-1 beats a plain stone's 0). Every rim
@@ -2159,10 +2308,36 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
                     # it only decides between stones that were already equal, and
                     # there the wider one is simply more plate covered.
                     bulk = -g.area if seat == "area" else 0.0
-                    key = ((risky, cutrim, round(lost, 2), round(gap, 2),
+                    # Charge the seat for BOTH kinds of waste it creates, as
+                    # areas so they are comparable: what the stone fails to nest
+                    # into along the row (`lost`), and the band it leaves above
+                    # itself for being shorter than the row (`gap` x its width).
+                    #
+                    # Ranked separately, `gap` was a bare length placed AFTER
+                    # `lost`, so any nesting difference above 0.01 mm2 outranked
+                    # a band of any size — a stone 2.2 mm short of its row won
+                    # the seat over one that filled it, and left a strip no later
+                    # row can reach. Measured on the Ø90 reference pool: 46
+                    # seats / 83.82% ranked separately, 49 / 84.95% combined,
+                    # with the surviving bands under 0.55 mm instead of 2.2 mm.
+                    #
+                    # DEAD REMAINDER. What is left between this stone and the
+                    # chord is charged to the seat when nothing in stock can fit
+                    # there. Without it the packer cannot tell a stone that
+                    # finishes a row from one that stops 6 mm short, because
+                    # neither wastes anything BEHIND it — and a row-end gap is
+                    # the most visible waste on the plate.
+                    #
+                    # NOTCH is the cut stone's missing corner, counted only where
+                    # it falls inside the plate, and CUT_BONUS is what draining
+                    # the cut pile is worth against it.
+                    _dead = _rem * hh if 0.0 < _rem < narrowest else 0.0
+                    _waste = (lost + gap * bw + _dead + notch
+                              - (CUT_BONUS if cut0 is not None else 0.0))
+                    key = ((risky, cutrim, round(_waste, 2),
                             1 if cut0 is not None else 0, bulk, -out)
                            if policy == "plain-first"
-                           else (risky, cutrim, round(lost, 2), round(gap, 2), bulk, -out))
+                           else (risky, cutrim, round(_waste, 2), bulk, -out))
                 if best is None or key < best[0]:
                     best = (key, s, deg, g)
         return best
@@ -2186,6 +2361,8 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
         row_h = 0.0
         dead = {False: False, True: False}   # has each side run dry?
         n0 = len(placed)        # first seat of THIS row, for the squeeze below
+        level = None            # height class this row is built from
+        anchored = False        # were the rims claimed by cut stones first?
 
         def seed_row_ends():
             """Seat a cut/trimmed stone at BOTH rims before the row is filled.
@@ -2219,7 +2396,7 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
                     continue
                 chord = math.sqrt(R * R - yout * yout) - RIM_EPS
                 best = scan(y, 0.0, row_h, False, going_left,
-                            want_cut=True, rim_seed=True)
+                            want_cut=True, rim_seed=True, level=level)
                 if not best:
                     continue
                 _key, s, deg, g = best
@@ -2258,15 +2435,31 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
             gap = max(0.0, chord - hi) + max(0.0, lo + chord)
             if gap < 0.05:
                 return False
-            spare = [t for t in queue if id(t) not in used]
+            # WHOLE stones only, on both sides of the trade. A cut stone brought
+            # in here is seated mid-row by the rebuild below, where its ground
+            # corner has no rim to follow — the notch check then refuses it and
+            # the stone is dropped, leaving the row SHORTER than it started. A
+            # cut stone already in the row is left alone for the same reason: it
+            # earned a rim seat, and the rebuild cannot promise it another.
+            # Cut stones reach the row ends through cap_row(), which runs after
+            # this and places them against the curve where they belong.
+            spare = [t for t in queue if id(t) not in used and not t.get("poly")]
 
             def sides(t):
-                """(width, height) for each orientation that fits this row."""
+                """(width, height) for each orientation that fits this row.
+
+                Level both ways, as in scan(): a trade that brings in a shorter
+                stone buys its extra seat with a strip of bare plate along the
+                whole row, and leaves a row the floor cannot build.
+                """
                 L, W = float(t["L"]), float(t["W"])
-                return [(a, b) for a, b in ((L, W), (W, L)) if b <= row_h + ROW_TOL]
+                return [(a, b) for a, b in ((L, W), (W, L))
+                        if row_h - ROW_LEVEL_TOL <= b <= row_h + ROW_TOL]
 
             best = None
             for i, b in enumerate(row):
+                if b.get("irregular"):
+                    continue
                 for a in spare:
                     for wa, _ha in sides(a):
                         freed = gap + (b["w"] - wa)
@@ -2299,6 +2492,11 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
             _whole = [t for t in order if not t[0].get("poly")]
             if _cuts:
                 order = _cuts[:1] + _whole + _cuts[1:]
+            # Everything needed to put the row back exactly as it was. The
+            # rebuild below can refuse any stone it is handed, so the old row has
+            # to survive until the new one has proved itself.
+            keep = [(placed[n0 + k], occ[n0 + k], srcs[n0 + k])
+                    for k in range(len(row))]
             for k in range(len(placed) - 1, n0 - 1, -1):
                 used.discard(id(srcs[k]))
                 placed.pop(k)
@@ -2317,8 +2515,7 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
                 if pick is None:
                     continue
                 deg, rg = pick
-                rb = rg.bounds
-                g = affinity.translate(rg, x - rb[0], y - rb[1])
+                g = affinity.translate(rg, x, y)   # pose is origin-normalised
                 if not free(g):
                     continue
                 # The rebuild seats stones directly, so scan()'s cut rules do not
@@ -2329,6 +2526,29 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
                     continue
                 record(t, deg, g)
                 x = g.bounds[2] + clear
+            # ATOMIC. The whole point of the trade is to gain a seat: a stone was
+            # given up for a narrower one to make room for one more. Every step
+            # of the rebuild is allowed to refuse a stone, and when the one being
+            # ADDED is refused the row keeps the narrower stone and gains
+            # nothing — it ends shorter than it started, by exactly the width
+            # that was traded away. That is how a whole-seed hole appeared at the
+            # right rim of two rows on a Ø90 plate (10.66 mm and 7.86 mm wide)
+            # while the seat count stayed the same, so nothing flagged it.
+            #
+            # Unless the row actually grew, put back what was lifted.
+            if len(placed) - n0 <= len(row):
+                for k in range(len(placed) - 1, n0 - 1, -1):
+                    used.discard(id(srcs[k]))
+                    placed.pop(k)
+                    occ.pop(k)
+                    srcs.pop(k)
+                for p_, g_, s_ in keep:
+                    used.add(id(s_))
+                    placed.append(p_)
+                    occ.append(g_)
+                    srcs.append(s_)
+                reindex()
+                return False
             return True
 
         def cap_row():
@@ -2340,17 +2560,15 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
             most useful band and belongs to whole stones.
             """
             nonlocal xl, xr
-            # Under EDGE_FIRST the fill already seats cut stones at the rims and
-            # closes that side behind them. Capping on top of that adds a second
-            # cross to a side that has moved on, which is how three ended up
-            # mid-row. One mechanism or the other, never both.
-            if EDGE_FIRST:
-                return
+            # The fill now seats cut stones at the rims itself and closes that
+            # side behind them, so capping normally finds nothing left to do.
+            # It still runs: a side the fill closed for want of a WHOLE stone can
+            # sometimes take a cut one, and a cross there costs nothing.
             if row_h <= 0.0 or abs(y + row_h / 2.0) < CENTRE_BAND:
                 return
             for going_left in (False, True):
                 best = scan(y, xl if going_left else xr, row_h, False,
-                            going_left, want_cut=True)
+                            going_left, want_cut=True, level=level)
                 if not best:
                     continue
                 _key, s2, deg, g = best
@@ -2361,9 +2579,8 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
                     xr = max(xr, g.bounds[2] + clear)
 
         def fill_row():
-            """Fill the current row with WHOLE stones until neither side takes
-            another seat."""
-            nonlocal row_h, xl, xr
+            """Fill the current row until neither side takes another seat."""
+            nonlocal row_h, xl, xr, level
             while True:
                 # Level rows only. A taller seed is never admitted, even when the
                 # row would otherwise end early: letting one in raises the row's
@@ -2379,14 +2596,25 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
                     # and that alone made a centre-out pack take 62 s against 5 s.
                     if dead[going_left]:
                         continue
+                    # Cut stones compete for ordinary seats now, not just the
+                    # leftovers cap_row() can reach. They are still admitted only
+                    # at the outermost seat of a row with the cut facing out (see
+                    # scan), so what this opens up is the chance to WIN that seat
+                    # while the row is still being laid — after the fill has
+                    # finished there is nothing left to win, which is why 0 of 56
+                    # were being used once rows started packing to the chord.
                     best = scan(y, xl if going_left else xr, row_h, False,
-                                going_left,
-                                want_cut=None if EDGE_FIRST else False)
+                                going_left, level=level, want_cut=None)
                     if not best:
                         dead[going_left] = True
                         continue
                     _key, s, deg, g = best
                     record(s, deg, g)
+                    # The stone that OPENS the row fixes the line every other
+                    # stone in it must meet. The class picked from stock only
+                    # narrowed the field; this is the real height.
+                    if len(placed) == n0 + 1:
+                        level = g.bounds[3] - y
                     # Leave the requested gap before the next seat, and before the
                     # next row. free() already enforces it against every
                     # neighbour; advancing the cursors too stops the search
@@ -2403,54 +2631,327 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
                     # it and the cross is stranded mid-row against a flat
                     # neighbour — six such seats appeared on one plate before
                     # this rule, and the floor rejects every one.
-                    if EDGE_FIRST and s.get("poly"):
+                    if s.get("poly"):
                         dead[going_left] = True
                 if not took:
                     break
 
-        # Cut stones claim both rims BEFORE the row is filled; whole stones
-        # then fill inward between them.
-        anchored = seed_row_ends()
-        fill_row()
-        # ---- SQUEEZE: push the finished row against one rim and refill --------
-        # Centre-out leaves a little space at BOTH ends of a row, and neither
-        # half is wide enough for another stone. Slid together against one side
-        # they often are — one extra seat per row is worth more than the
-        # symmetry, and the row is still a straight line either way.
-        if row_h > 0.0 and fill == "centre" and len(placed) > n0 and not anchored:
+        def row_gap():
+            """Bare plate left at the two ENDS of this row, in mm of width."""
+            if row_h <= 0.0 or len(placed) <= n0:
+                return 0.0
             yout = max(abs(y), abs(y + row_h))
-            if yout < R:
-                chord = math.sqrt(R * R - yout * yout) - RIM_EPS
-                lo = min(p["x"] for p in placed[n0:])
-                hi = max(p["x"] + p["w"] for p in placed[n0:])
-                lgap, rgap = lo + chord, chord - hi
-                # Only worth doing when the two halves TOGETHER could seat a
-                # stone that neither could alone.
-                if min(lgap, rgap) > 0.01 and lgap + rgap >= narrowest:
-                    shift = -lgap if lgap <= rgap else rgap
-                    for i in range(n0, len(placed)):
-                        occ[i] = affinity.translate(occ[i], shift, 0.0)
-                        p = placed[i]
-                        p["x"] += shift
-                        p["lx"] += shift
-                        p["poly"] = [(round(px + shift, 3), py) for px, py in p["poly"]]
-                    reindex()
-                    xl = min(p["x"] for p in placed[n0:]) - clear
-                    xr = max(p["x"] + p["w"] for p in placed[n0:]) + clear
-                    # Reopen both sides, EXCEPT one already closed by a cut
-                    # stone — refilling past it is exactly what stranded crosses
-                    # in the middle of a row.
-                    outer_l = min(placed[n0:], key=lambda p: p["x"])
-                    outer_r = max(placed[n0:], key=lambda p: p["x"] + p["w"])
-                    dead = {False: bool(outer_r.get("irregular")),
-                            True: bool(outer_l.get("irregular"))}
-                    fill_row()
-        # Trade a stone for a different width if that lets one more in.
-        if row_h > 0.0 and swap_row(n0):
-            pass
-        # Cut stones go on LAST, into the crescent whole stones cannot reach.
-        cap_row()
+            if yout >= R:
+                return 0.0
+            ch = math.sqrt(R * R - yout * yout) - RIM_EPS
+            row = placed[n0:]
+            lo = min(p["x"] for p in row)
+            hi = max(p["x"] + p["w"] for p in row)
+            return max(lo + ch, 0.0) + max(ch - hi, 0.0)
+
+        def lay_row(lvl):
+            """Build this row from one height class. Returns the stone area seated."""
+            nonlocal row_h, xl, xr, dead, level, anchored
+            xr = half if fill == "centre" else -R
+            xl = -half
+            row_h = 0.0
+            dead = {False: False, True: False}
+            level = lvl
+            # Cut stones claim both rims BEFORE the row is filled; whole stones
+            # then fill inward between them.
+            anchored = seed_row_ends()
+            fill_row()
+            squeeze()
+            if row_h > 0.0:
+                swap_row(n0)
+            # Cut stones go on LAST, into the crescent whole stones cannot reach.
+            cap_row()
+            return sum(p["area"] for p in placed[n0:])
+
+        def squeeze():
+            """SQUEEZE: push the finished row against one rim and refill.
+
+            Centre-out leaves a little space at BOTH ends of a row, and neither
+            half is wide enough for another stone. Slid together against one side
+            they often are — one extra seat per row is worth more than the
+            symmetry, and the row is still a straight line either way.
+            """
+            nonlocal xl, xr, dead
+            if not (row_h > 0.0 and fill == "centre"
+                    and len(placed) > n0 and not anchored):
+                return
+            yout = max(abs(y), abs(y + row_h))
+            if yout >= R:
+                return
+            chord = math.sqrt(R * R - yout * yout) - RIM_EPS
+            lo = min(p["x"] for p in placed[n0:])
+            hi = max(p["x"] + p["w"] for p in placed[n0:])
+            lgap, rgap = lo + chord, chord - hi
+            # Only worth doing when the two halves TOGETHER could seat a
+            # stone that neither could alone.
+            if not (min(lgap, rgap) > 0.01 and lgap + rgap >= narrowest):
+                return
+            shift = -lgap if lgap <= rgap else rgap
+            for i in range(n0, len(placed)):
+                occ[i] = affinity.translate(occ[i], shift, 0.0)
+                p = placed[i]
+                p["x"] += shift
+                p["lx"] += shift
+                p["poly"] = [(round(px + shift, 3), py) for px, py in p["poly"]]
+            reindex()
+            xl = min(p["x"] for p in placed[n0:]) - clear
+            xr = max(p["x"] + p["w"] for p in placed[n0:]) + clear
+            # Reopen both sides, EXCEPT one already closed by a cut stone —
+            # refilling past it is exactly what stranded crosses in the middle
+            # of a row.
+            outer_l = min(placed[n0:], key=lambda p: p["x"])
+            outer_r = max(placed[n0:], key=lambda p: p["x"] + p["w"])
+            dead = {False: bool(outer_r.get("irregular")),
+                    True: bool(outer_l.get("irregular"))}
+            fill_row()
+
+        # TRY EACH HEIGHT CLASS the stock offers for this row and keep whichever
+        # covers the most plate. One class is a guess, however it is ranked: the
+        # census can only count what a class HAS, not whether those stones nest
+        # into this particular chord alongside what is already on the plate. A
+        # class that looked best on paper left a 7.6 mm hole at the right rim of
+        # one row; the runner-up filled the same row flush.
+        #
+        # This is the answer to "the inventory is large, so find a stone that
+        # fits" — the row is not locked to the first class that looked good, it
+        # is laid once per credible class and the best result kept.
+        levels = pick_level(y)
+        if not levels:
+            break
+        best_area, best_state = -1e18, None
+        for lvl in levels[:LEVEL_TRIES]:
+            mark_n, mark_used = len(placed), set(used)
+            # A class is judged on the plate it WINS, not the stone it seats:
+            # what it covers, less the bare strip it leaves at the row's ends.
+            #
+            # Ranking on seated area alone let a class that covered half the
+            # chord with tall stones beat one that covered all of it with
+            # shorter ones — on a thin pool that left a 30 mm strip at the end of
+            # a row while every row stayed level, so nothing in the level rules
+            # caught it. Gating on the gap instead was worse the other way: it
+            # threw away a class that seated far more stone over a 7 mm end gap,
+            # and cost 4 points on the full pool. Priced as area, the two are
+            # comparable and neither can bully the other.
+            area = lay_row(lvl) - row_gap() * row_h
+            if area > best_area:
+                # KEEP the winning row rather than laying it again. Re-running
+                # the best class after the trials cost a fourth pass over every
+                # row — a quarter of the packing time — to rebuild something
+                # that had just been built.
+                best_area = area
+                best_state = (placed[mark_n:], occ[mark_n:], srcs[mark_n:], row_h)
+            rollback(mark_n, mark_used)
+        if best_state is None:
+            break
+        row_p, row_g, row_s, row_h = best_state
+        for p_, g_, s_ in zip(row_p, row_g, row_s):
+            used.add(id(s_))
+            placed.append(p_)
+            occ.append(g_)
+            srcs.append(s_)
+        reindex()
         y += (row_h + clear) if row_h > 0 else ROW_PROBE
+
+    # ---- RECONSIDER: revisit finished rows and improve what greedy committed --
+    def _row_groups():
+        """placed indices grouped by row.
+
+        Clustered on the baseline the stones actually sit on, not on `y` rounded
+        to the millimetre. Rounding put stones from two different baselines in
+        one group — a sweep-up seat sits up to SWEEP_ROW_TOL off the line — and
+        the rebuild then re-laid the whole group at the LOWEST of them, which
+        drove it into the row below: 158 of 217 rebuild placements were refused
+        for want of space, and not one exchange survived.
+        """
+        rows, cur = [], []
+        for i in sorted(range(len(placed)), key=lambda i: placed[i]["y"]):
+            if cur and placed[i]["y"] - placed[cur[0]]["y"] > SWEEP_ROW_TOL:
+                rows.append(cur)
+                cur = []
+            cur.append(i)
+        if cur:
+            rows.append(cur)
+        return [r for r in rows if len(r) >= 2]
+
+    def _reconsider_row(idxs):
+        """One exchange on one row: take a stone out, put a different width in,
+        and seat one more. Applied only when the stone gained is wider than the
+        width given up, so the row can only improve."""
+        row = [placed[i] for i in idxs]
+        rh = max(p["h"] for p in row)
+        ry = min(p["y"] for p in row)
+        yout = max(abs(ry), abs(ry + rh))
+        if yout >= R:
+            return False
+        chord = math.sqrt(R * R - yout * yout) - RIM_EPS
+        lo = min(p["x"] for p in row)
+        hi = max(p["x"] + p["w"] for p in row)
+        gap = max(0.0, chord - hi) + max(0.0, lo + chord)
+        # Whole stones only, as in swap_row: a cut stone re-laid mid-row has no
+        # rim to face, and the notch check would drop it on the way back in.
+        spare = [t for t in queue if id(t) not in used and not t.get("poly")]
+
+        # The row's own height line, taken from the stones already in it, so a
+        # reconsidered row stays as level as the fill left it.
+        rlvl = min(p["h"] for p in row)
+
+        def sides(t):
+            # Capped at the row's OWN height, not at height + ROW_TOL. A
+            # finished row has the next row laid flush on top of it, so the
+            # vertical space is exactly what the row already occupies: a
+            # replacement even a fraction taller cannot be seated at all. That
+            # slack is why 136 of 196 rebuild placements were refused and no
+            # exchange ever survived.
+            L, W = float(t["L"]), float(t["W"])
+            return [(a, b) for a, b in ((L, W), (W, L))
+                    if rlvl - ROW_LEVEL_TOL <= b <= rh]
+
+        best = None
+        for k, b in enumerate(row):
+            if b.get("irregular"):
+                continue
+            for a in spare:
+                for wa, _h in sides(a):
+                    freed = gap + (b["w"] - wa)
+                    if freed <= 0.0:
+                        continue
+                    for c in spare:
+                        if c is a:
+                            continue
+                        for wc, _h2 in sides(c):
+                            if wc > freed:
+                                continue
+                            gain = wc - (b["w"] - wa)
+                            if gain > 0.05 and (best is None or gain > best[0]):
+                                best = (gain, k, a, wa, c, wc)
+        if best is None:
+            return False
+        _g, k, a, wa, c, wc = best
+        order = [(srcs[i], placed[i]["w"]) for i in idxs]
+        order[k] = (a, wa)
+        order.append((c, wc))
+        cuts = [t for t in order if t[0].get("poly")]
+        whole = [t for t in order if not t[0].get("poly")]
+        if cuts:
+            order = cuts[:1] + whole + cuts[1:]
+
+        keep = [(placed[i], occ[i], srcs[i]) for i in idxs]
+        for i in sorted(idxs, reverse=True):
+            used.discard(id(srcs[i]))
+            placed.pop(i)
+            occ.pop(i)
+            srcs.pop(i)
+        reindex()
+
+        def restore():
+            """Put the lifted row back exactly as it was."""
+            while len(placed) > n_before:
+                used.discard(id(srcs[-1]))
+                placed.pop()
+                occ.pop()
+                srcs.pop()
+            for p_, g_, s_ in keep:
+                used.add(id(s_))
+                placed.append(p_)
+                occ.append(g_)
+                srcs.append(s_)
+            reindex()
+            return False
+
+        n_before = len(placed)
+        # RE-LAY, NESTED. Each stone is laid against the chord and then slid back
+        # against its neighbour, exactly as fill_row() does.
+        #
+        # Abutting bounding boxes instead is why this pass never kept a single
+        # exchange: the fill NESTS its stones, so a row re-laid box-to-box comes
+        # out wider than the one it replaced, the last stone falls outside the
+        # chord, and the atomic check rolls the whole thing back. 37 exchanges
+        # were attempted on one plate and 0 survived.
+        x = -chord
+        seated = 0
+        for t, w in order:
+            pick = None
+            for deg, rg, ww, hh in poses[id(t)]:
+                if abs(ww - w) < 0.01 and hh <= rh + 1e-9:
+                    pick = (deg, rg)
+                    break
+            if pick is None:
+                continue
+            deg, rg = pick
+            g = affinity.translate(rg, x, ry)     # pose is origin-normalised
+            if not free(g):
+                continue
+            g = slide_left(g)
+            if t.get("poly") and _wasted_area(g, disc) > CUT_NOTCH_MAX:
+                continue
+            record(t, deg, g)
+            seated += 1
+            x = g.bounds[2] + clear
+        # A rebuild that did not actually GAIN a seat has made the plate worse;
+        # put the original row back rather than keep the damage.
+        if seated <= len(idxs):
+            return restore()
+
+        # BALANCED. The rebuilt row is nested tight against the left chord, so it
+        # now has all of its slack on the right — slide it back to the middle.
+        #
+        # Leaving it left-flush is what made this pass unusable the first time: a
+        # row the fill had balanced centre-out came back against the left rim, so
+        # an improved row left a bare block down the right of the plate and the
+        # whole plate read as shoved sideways. Every invariant passed and the
+        # seat count went UP, and it was still the wrong plate.
+        new = placed[n_before:]
+        lo2 = min(p["x"] for p in new)
+        hi2 = max(p["x"] + p["w"] for p in new)
+        shift = ((chord - hi2) - (lo2 + chord)) / 2.0
+        if abs(shift) > 0.005:
+            # Lift the row out of the index first, or every stone in it would be
+            # tested against where it used to be and refuse to move.
+            row_geoms = occ[n_before:]
+            moved = [affinity.translate(g, shift, 0.0) for g in row_geoms]
+            del occ[n_before:]
+            reindex()
+            ok = all(free(g) for g in moved)
+            occ.extend(moved if ok else row_geoms)
+            reindex()
+            if ok:
+                for i in range(n_before, len(placed)):
+                    p = placed[i]
+                    p["x"] += shift
+                    p["lx"] += shift
+                    p["poly"] = [(round(px + shift, 3), py)
+                                 for px, py in p["poly"]]
+        return True
+
+    if RECONSIDER:
+        for _round in range(RECONSIDER_ROUNDS):
+            changed = False
+            tried = set()
+            # The groups MUST be recomputed for every row. _reconsider_row pops
+            # the row it is working on out of `placed` and appends the result —
+            # and even a rolled-back rebuild puts the old stones back at the END
+            # — so every index after the first row processed is stale. Taking
+            # the groups once and looping over them therefore lifted stones from
+            # the wrong rows, which left same-row neighbours standing in the way
+            # of the rebuild: 140 of 204 placements refused, and no exchange
+            # could ever survive. Rows are identified by their baseline instead,
+            # so each is visited exactly once per round however `placed` moves.
+            while True:
+                groups = [g for g in _row_groups()
+                          if round(placed[g[0]]["y"], 1) not in tried]
+                if not groups:
+                    break
+                g = groups[0]
+                tried.add(round(placed[g[0]]["y"], 1))
+                if _reconsider_row(g):
+                    changed = True
+            if not changed:
+                break
 
     # ---- SWEEP-UP: whole seeds into the pockets the row sweep walked past -----
     # The row sweep fills strictly left to right and never returns, and a row
@@ -2468,6 +2969,12 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
     # sweep of the whole plate per leftover seed took 38 s a plate for the same
     # result.
     smallest = min((shapes[id(s)].area for s in queue), default=0.0)
+    # Sweep-up drops a stone wherever a pocket will take it, with no reference to
+    # the rows — which is how a stone ends up sitting proud of its row at the
+    # plate edge (always the highest seat number, because it is placed last).
+    # Restrict it to the row baselines already established: a leftover seat is
+    # only worth having if it sits ON a row.
+    row_ys = sorted({round(p["y"], 1) for p in placed})
     gap_region = disc.difference(unary_union(occ)) if occ else disc
     for _ in range(len(queue)):
         if gap_region.is_empty:
@@ -2499,6 +3006,14 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
                     anchors += [(vx, vy) for vx, vy in corners]
                     anchors += [(vx - w, vy) for vx, vy in corners]
                     for ax, ay in anchors:
+                        # The anchor IS the seat's bottom edge, so the row test
+                        # needs no geometry: asking the translated polygon for
+                        # its bounds cost 342k shapely calls a plate, plus the
+                        # translate itself for anchors that were never going to
+                        # be used.
+                        if row_ys and min(abs(ay - ry)
+                                          for ry in row_ys) > SWEEP_ROW_TOL:
+                            continue           # off the row line — skip it
                         cand = affinity.translate(g, ax - gb[0], ay - gb[1])
                         if free(cand):
                             chosen = (s, deg, slide_left(cand))
