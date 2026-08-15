@@ -1989,11 +1989,25 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
             chord2 = 2.0 * math.sqrt(R * R - yout * yout)
             stock = census[k][0]
             # Among classes that can finish the row, the best STOCKED wins, and
-            # height only breaks the tie. Ranking by height instead drains the
-            # tall classes a row at a time and leaves every class holding a
-            # little — none of them able to cover a chord — and the job then
-            # dribbles out over plates of 8, 7, 6 and 5 seats: 114 of 163 stones
-            # placed against 128 this way.
+            # height only breaks the tie.
+            #
+            # Both alternatives were tried and both are worse. Ranking by height
+            # drains the tall classes a row at a time and leaves every class
+            # holding a little, none able to cover a chord; the job dribbles out
+            # over plates of 14, 8, 6 and 5 seats. Weighting stock BY height
+            # spreads the size classes more evenly and narrows the seat-count gap
+            # against Arrange, which looks reassuring — and it costs coverage on
+            # every pool measured and puts a 22.89 mm hole back at the end of a
+            # row on thin stock:
+            #
+            #   ranking        163-stone pool        95-stone pool
+            #   stock          43 seats / 86.44%     50 / 82.40%, no holes
+            #   stock x height 42 / 83.94%           47 / 79.91%, 22.89 mm hole
+            #
+            # The gap against Arrange is not a quality measure — it tracks which
+            # stones each method happens to hold. This ranking is the one whose
+            # output was validated on a real plate on 2026-08-15; do not trade it
+            # for a more comfortable-looking comparison.
             return (1 if stock >= LEVEL_MARGIN * chord2 else 0, stock, k)
 
         return [census[k][1] for k in sorted(census, key=rank, reverse=True)]
