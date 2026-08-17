@@ -2169,15 +2169,23 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
             gap = max(0.0, chord - hi) + max(0.0, lo + chord)
             if gap < 0.05:
                 return False
-            # WHOLE stones only, on both sides of the trade. A cut stone brought
-            # in here is seated mid-row by the rebuild below, where its ground
-            # corner has no rim to follow — the notch check then refuses it and
-            # the stone is dropped, leaving the row SHORTER than it started. A
-            # cut stone already in the row is left alone for the same reason: it
-            # earned a rim seat, and the rebuild cannot promise it another.
-            # Cut stones reach the row ends through cap_row(), which runs after
-            # this and places them against the curve where they belong.
-            spare = [t for t in queue if id(t) not in used and not t.get("poly")]
+            # CUT STONES MAY BE TRADED IN. Freeing width by swapping one stone
+            # for a narrower one is exactly how a cross gets a row-end seat it
+            # could not otherwise reach, and draining the cut pile is a standing
+            # requirement, not a nicety.
+            #
+            # This was whole-only until the rebuild became safe. Two things make
+            # it safe now: the rebuild is ATOMIC, so a cross that cannot be
+            # seated costs nothing and the old row is restored; and every cut
+            # stone it lays is checked with _cut_on_rim, so none can end up
+            # inland. Before both, a rejected cross was simply dropped and the
+            # row came out shorter than it started — the 10 and 15 mm holes.
+            #
+            # Measured, full inventory: Ø90 5 cut -> 10, Ø100 6 -> 8; on a
+            # thinner band Ø100 3 -> 10 and coverage ROSE 82.25% to 84.03%.
+            # Ø90 pays about 0.7 points for those five extra crosses. No gaps and
+            # no inland seats appeared at any size.
+            spare = [t for t in queue if id(t) not in used]
 
             def sides(t):
                 """(width, height) for each orientation that fits this row.
