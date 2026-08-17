@@ -1099,6 +1099,29 @@ def _cut_direction(g):
     return (dx / n, dy / n) if n > 1e-9 else None
 
 
+def _cut_on_rim(g, R):
+    """Is this placed cut/trimmed stone actually ON the rim?
+
+    ONE test, used everywhere a cut stone can be seated, so no path can put one
+    inland. A row REBUILD is such a path and was missing it: swap_row and
+    _reconsider_row lift a whole row and re-lay it, cut stones included, and they
+    only re-checked the notch. A cross that had been seated correctly against the
+    curve could therefore be put back 17.30 mm inland on a Ø100 plate — the notch
+    test passes there, because a notch facing open plate is not clipped by the
+    boundary, so nothing caught it.
+
+    Both halves matter: the stone has to be within RIM_FLUSH of the boundary, and
+    the corner it is missing must not open into the plate by more than
+    CUT_NOTCH_MAX.
+    """
+    from shapely.geometry import Point
+
+    gap = R - max(math.hypot(px, py) for px, py in g.exterior.coords)
+    if gap > RIM_FLUSH:
+        return False
+    return _wasted_area(g, Point(0.0, 0.0).buffer(R, resolution=180)) <= CUT_NOTCH_MAX
+
+
 def _wasted_area(g, disc):
     """Plate area lost to this seed's ground-off corner, in mm2.
 
@@ -1249,7 +1272,26 @@ SWEEP_ANCHORS = 48        # max pocket corners the sweep-up pass probes
 ROW_LEVEL_TOL = 0.10      # mm — how much shorter than its row a seed may be
 LEVEL_BAND = 0.10         # mm — width of a height class in the stock census
 LEVEL_MARGIN = 1.0        # how much more stock than chord a class needs to qualify
-LEVEL_TRIES = 3           # height classes actually laid out per row before choosing
+# How many height classes are actually laid out per row before one is chosen.
+#
+# A row's height decides how WIDE it can be, because the plate curves in: a row
+# 9.64 mm tall reaches a 14.60 mm chord, the same row at 7.37 mm reaches 20.07 mm.
+# So a class of big stones can win a row on the stones it seats and still cost
+# the plate, by making that row narrower than a shorter class would have.
+#
+# At 3 the search never reached the shorter classes for the top row: it built it
+# from 12.7x9.58 and 12.88x9.64 stones and stopped 3 wide. Measured per plate:
+#
+#   tries   95-stone pool           163-stone pool
+#     3     49 seats 84.98%  30 s   45 seats 86.58%   54 s
+#     5     50 seats 85.44%  33 s   45 seats 87.25%   68 s
+#     8     52 seats 86.52%  45 s   45 seats 87.25%   88 s
+#    99     51 seats 85.93%  70 s   45 seats 85.44%  149 s
+#
+# 8 is the peak on both pools, not merely a budget: trying EVERY class is worse
+# than trying eight, because each row is chosen greedily and a class spent on one
+# row is gone from the next. More search is not monotonically better here.
+LEVEL_TRIES = 8
 
 # Who wins a seat when a cut stone and a plain one both fit. BOTH are tried on
 # every plate and the better result is kept — see enhanced_plate_job.
@@ -1411,7 +1453,14 @@ CUT_NOTCH_MAX = 3.0
 # instead keeps the choice honest — a cut stone wins the seat unless a plain one
 # is better by more than this — and a cut stone is genuinely worth something:
 # left in the drawer it is 100% waste, and the rim is the only place it can go.
-CUT_BONUS = 12.0
+# 30, measured across four plate sizes on the full 163-seed inventory. It is NOT
+# the lever that decides how many cut stones get used — raising it from 12 to 60
+# left the count identical at every size (5, 5, 6, 8), because what limits cut
+# stones is how many seats exist where one can sit flush on the rim AND leave a
+# channel under ROW_END_CUT_GAP, not how hard the ranking prefers them. What it
+# does buy is a better choice among stones that were already competing: Ø90 rose
+# 86.29% to 87.32%, and Ø80, Ø100 and Ø110 were unchanged.
+CUT_BONUS = 30.0
 
 # RECONSIDERATION: after the plate is packed, revisit finished rows and keep any
 # exchange that seats one more stone. The packer is greedy — it commits a seat
@@ -1428,6 +1477,23 @@ RECONSIDER_ROUNDS = 3
 
 # How far a sweep-up seat may sit off an established row baseline, mm.
 SWEEP_ROW_TOL = 0.6
+
+# ROW-END FILL — the last pass, on the winning plate only. See _fill_row_ends.
+# ROW_END_STEP is how finely a stone is slid along a row baseline looking for a
+# corner seat; ROW_END_ROUNDS caps how many it may add.
+ROW_END_STEP = 0.25
+ROW_END_ROUNDS = 6
+ROW_END_NEST = 0.02       # mm — how finely the seat is slid back to touch
+# A row-end seat is laid ON its row's baseline and nowhere else. Offsetting it by
+# hundredths to squeeze past a protruding neighbour was tried and is worse: it
+# splits one row into two baselines a tenth of a millimetre apart, which reads as
+# a broken row. The protrusion is prevented in the sweep-up pass instead.
+ROW_END_LIFTS = (0.0,)
+# Widest channel a rim-seated CUT stone may leave between itself and its row.
+# It cannot be nested in without coming off the rim, so beyond this the seat is
+# better given to a whole stone that can close up.
+ROW_END_CUT_GAP = 1.0
+
 
 
 def _interior_waste(placed, disc):
@@ -2005,7 +2071,14 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
 
     y = -R if y0 is None else y0
     guard = 0
-    while y < R - 0.5 and guard < 400:
+    # The guard has to SCALE WITH THE PLATE. Each turn of this loop either seats
+    # a row, advancing y by its height, or fails and advances by ROW_PROBE — so
+    # the worst case is one turn per probe step across the whole diameter. A flat
+    # 400 was ample at ROW_PROBE 1.0 (80 turns on a Ø80 plate); at 0.25 it is 320
+    # turns for Ø80, 360 for Ø90 and 400 for Ø100, which means a large plate
+    # could stop being packed part way up and come out missing its top rows.
+    guard_max = int(2.0 * R / max(ROW_PROBE, 0.05)) + 50
+    while y < R - 0.5 and guard < guard_max:
         guard += 1
         if all(id(s) in used for s in queue):
             break
@@ -2115,7 +2188,7 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
                 """
                 L, W = float(t["L"]), float(t["W"])
                 return [(a, b) for a, b in ((L, W), (W, L))
-                        if row_h - ROW_LEVEL_TOL <= b <= row_h + ROW_TOL]
+                        if row_h - ROW_LEVEL_TOL <= b <= row_h]
 
             best = None
             for i, b in enumerate(row):
@@ -2170,7 +2243,15 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
                 g0 = shapes[id(t)]
                 pick = None
                 for deg, rg, ww, hh in poses[id(t)]:
-                    if abs(ww - w) < 0.01 and hh <= row_h + ROW_TOL:
+                    # Capped at row_h, NOT row_h + ROW_TOL. ROW_TOL is headroom
+                    # for the FILL, which raises row_h as it goes and advances y
+                    # from the final value. This rebuild runs after that: it never
+                    # updates row_h, so a stone admitted on the tolerance finishes
+                    # above the line the next row starts from. That 0.04 mm
+                    # protrusion then blocks 124 mm2 of otherwise fillable plate
+                    # at the next row's end, because any seat laid on that
+                    # baseline catches on it.
+                    if abs(ww - w) < 0.01 and hh <= row_h:
                         pick = (deg, rg)
                         break
                 if pick is None:
@@ -2183,7 +2264,7 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
                 # apply here — re-check them. Without this a rebuilt row could
                 # carry a cross facing a flat neighbour, which is exactly what
                 # appeared beside seats 43 and 5.
-                if t.get("poly") and _wasted_area(g, disc) > CUT_NOTCH_MAX:
+                if t.get("poly") and not _cut_on_rim(g, R):
                     continue
                 record(t, deg, g)
                 x = g.bounds[2] + clear
@@ -2563,7 +2644,7 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
             if not free(g):
                 continue
             g = slide_left(g)
-            if t.get("poly") and _wasted_area(g, disc) > CUT_NOTCH_MAX:
+            if t.get("poly") and not _cut_on_rim(g, R):
                 continue
             record(t, deg, g)
             seated += 1
@@ -2659,7 +2740,14 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
                                if gap_region.geom_type != "Polygon" else [gap_region])
                    if g.geom_type == "Polygon" and g.area >= smallest]
         pockets.sort(key=lambda g: -g.area)
-        spare = sorted((s for s in queue if id(s) not in used),
+        # WHOLE stones only. This pass drops a leftover into any pocket that
+        # will take it, with no notion of rims — so a cut stone landed wherever
+        # it happened to fit, 17.30 mm inland on a Ø100 plate with its ground
+        # corner facing a flat neighbour. Cut stones reach the plate through the
+        # fill, cap_row and the row-end pass, every one of which holds them to
+        # RIM_FLUSH of the boundary. They must not arrive by this door.
+        spare = sorted((s for s in queue
+                        if id(s) not in used and not s.get("poly")),
                        key=lambda s: -shapes[id(s)].area)
         chosen = None
         for part in pockets:
@@ -2690,6 +2778,16 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
                         if row_ys and min(abs(ay - ry)
                                           for ry in row_ys) > SWEEP_ROW_TOL:
                             continue           # off the row line — skip it
+                        # And it must not stand PROUD of the row it is joining.
+                        # This pass never checked height, so it could seat a
+                        # stone whose top finished 0.03 mm above the line the
+                        # next row started from. That hairline is invisible and
+                        # ruinous: any later seat laid on that baseline catches
+                        # on it, and 219 mm2 of good space on a Ø100 plate became
+                        # unreachable because of it.
+                        _above = [ry for ry in row_ys if ry > ay + 0.05]
+                        if _above and ay + h > min(_above) + 1e-9:
+                            continue
                         cand = affinity.translate(g, ax - gb[0], ay - gb[1])
                         if free(cand):
                             chosen = (s, deg, slide_left(cand))
@@ -2785,8 +2883,234 @@ def enhanced_plate_job(args):
         attempt(best["phase"] + d, best["policy"], best["dir"], best["seat"])
 
     placed, fill = best["placed"] or [], max(0.0, best["fill"])
+    placed, fill = _fill_row_ends(real, placed, fill, R)
     render_enhanced_circle(placed, placed, pi, R, fill, path)
     return (pi, placed, round(fill, 4), round(2 * R, 4), 0.0)
+
+
+def _fill_row_ends(real, placed, fill, R):
+    """Drop leftover stones into the corners the rows could not reach.
+
+    Runs ONCE, on the winning plate, and only ADDS: no stone already on the
+    plate is moved, swapped or removed, so the arrangement the search chose is
+    exactly the arrangement that ships.
+
+    The space it goes after is at the ENDS of the top and bottom rows. Those
+    bands are trapezoids — on a Ø80 plate the top row spans ±14.60 mm at its top
+    edge but ±28.95 mm at its base — so a stone SHORTER than the row reaches into
+    the corner even though the row itself cannot be extended. The stone sits
+    lower than its neighbours as a result; that step is the price of the seat and
+    is why this is a deliberate last pass rather than part of the fill.
+
+    The row sweep will not find these seats: it holds every stone in a row to one
+    height class, which is what keeps rows level. The sweep-up pass will not
+    either — it probes pocket CORNERS, and these seats are only reachable by
+    sliding along the row's baseline.
+
+    Cut stones are still held to the rim rule, so a cross may only land here if
+    it is genuinely against the curve.
+    """
+    if not placed or not real:
+        return placed, fill
+
+    from shapely import affinity
+    from shapely.geometry import Point, Polygon
+    from shapely.ops import unary_union
+
+    disc = Point(0.0, 0.0).buffer(R, resolution=180)
+    taken = unary_union([Polygon(p["poly"]).buffer(0) for p in placed])
+    # "Distance between seeds" from the criteria form applies to THESE seats too.
+    # Without it this pass seated stones against their neighbours whatever the
+    # form asked for, and a run at 1.5 mm came back with pairs 0.0 mm apart.
+    clear = max(0.0, float(getattr(P, "CLEARANCE", 0.0) or 0.0))
+    used = {p["stock"] for p in placed}
+    spare = [s for s in real if s["stock"] not in used]
+    if not spare:
+        return placed, fill
+
+    poses = []
+    for s in spare:
+        g0 = _seed_footprint(s)
+        if g0 is None:
+            continue
+        cut0 = _cut_direction(g0)
+        for deg in ENHANCED_ANGLES:
+            rg = affinity.rotate(g0, deg, origin="centroid") if deg else g0
+            b = rg.bounds
+            poses.append((s, deg, cut0 is not None,
+                          affinity.translate(rg, -b[0], -b[1]),
+                          b[2] - b[0], b[3] - b[1]))
+    if not poses:
+        return placed, fill
+    narrow = min(p[4] for p in poses)
+
+    rows = {}
+    for p in placed:
+        rows.setdefault(round(p["y"], 1), []).append(p)
+
+    for _round in range(ROW_END_ROUNDS):
+        # Only rows with a genuine opening are worth sliding along — this keeps
+        # the pass off the hot path of a plate that has nothing to gain.
+        live = []
+        for y, row in rows.items():
+            rh = max(p["h"] for p in row)
+            # Measure the opening at the row's WIDE edge, not its narrow one.
+            # A row's own chord is taken at whichever edge is further from the
+            # centre, because a full-height stone is bound by that; but the seat
+            # this pass is looking for is taken by a SHORTER stone, which is
+            # bound by the wide edge instead. Testing the narrow edge here made
+            # the top row look full — 1.90 mm of opening against a 14.60 mm
+            # chord — when the same row has 28.95 mm of chord at its base and a
+            # 10 mm stone fits in the corner.
+            yin = min(abs(y), abs(y + rh))
+            if yin >= R:
+                continue
+            chord = math.sqrt(R * R - yin * yin)
+            lo = min(p["x"] for p in row)
+            hi = max(p["x"] + p["w"] for p in row)
+            if max(lo + chord, chord - hi) >= narrow:
+                # Cap the seat at the space that is REALLY free above this row,
+                # not at the row's nominal height. By the time this pass runs the
+                # next row is already laid on top, and a row's tallest stone can
+                # stand a fraction proud of the line the next row started from.
+                # A candidate allowed that full height pokes into the row above —
+                # only by hundredths of a millimetre, but enough to catch on it
+                # and stop the seat nesting back into its own row, which is what
+                # left stones 10 and 15 mm out on a Ø100 plate.
+                above = [b for b in rows if b > y + 0.05]
+                head = (min(above) - y) if above else (R - y)
+                live.append((y, min(rh, head)))
+        if not live:
+            break
+
+        pick = None
+        for y, rh in live:
+            # Where the row already reaches, so a seat can be scored on how
+            # close to it the stone ends up.
+            row_lo = min(p["x"] for p in rows[y])
+            row_hi = max(p["x"] + p["w"] for p in rows[y])
+            for s, deg, is_cut, rg, w, h in poses:
+                if s["stock"] in used or h > rh + 1e-9:
+                    continue
+                # NEAREST THE ROW, not the first position that happens to fit.
+                # The sweep runs from -R upward, so for a seat at the LEFT end of
+                # a row the first fit is the one furthest out — the stone ends up
+                # against the rim with a channel between it and the row. Sliding
+                # it back afterwards is unreliable: it catches on anything it
+                # touches on the way. Choosing the innermost fitting position
+                # instead puts it where it belongs to begin with.
+                near = None
+                # A few hundredths of clearance above the baseline. A row's
+                # tallest stone can finish a whisker proud of the line the next
+                # row starts from — 0.03 mm measured on a Ø100 plate — and that
+                # hairline is enough to block a 94 mm2 seat completely, because a
+                # candidate laid exactly on the baseline catches on it. Lifting
+                # the seat by hundredths of a millimetre clears the protrusion
+                # and stays well inside ROW_LEVEL_TOL, so the row still reads
+                # level. Without this, two seats worth 219 mm2 were unreachable.
+                for lift in ROW_END_LIFTS:
+                    if h + lift > rh + 1e-9:
+                        continue
+                    yl = y + lift
+                    x = -R
+                    while x + w <= R:
+                        g = affinity.translate(rg, x, yl)
+                        if (disc.contains(g) and not g.intersects(taken)
+                                and g.distance(taken) >= clear - 1e-9):
+                            ok = True
+                            if is_cut:
+                                gap = R - max(math.hypot(px, py)
+                                              for px, py in g.exterior.coords)
+                                ok = (gap <= RIM_FLUSH
+                                      and _wasted_area(g, disc) <= CUT_NOTCH_MAX)
+                            if ok:
+                                if x + w <= row_lo:
+                                    d = row_lo - (x + w)   # sits left of the row
+                                elif x >= row_hi:
+                                    d = x - row_hi         # sits right of it
+                                else:
+                                    d = 0.0                # inside the row's span
+                                # A CUT stone is pinned to the rim and cannot be
+                                # slid in to meet its row, so it is only worth
+                                # taking when it lands beside the row already.
+                                # Otherwise it holds a seat open and leaves a
+                                # channel nothing can fill — on a Ø100 plate that
+                                # cost three gaps and 2.5 points of coverage. A
+                                # whole stone, which CAN nest, gets the seat.
+                                if is_cut and d > ROW_END_CUT_GAP:
+                                    ok = False
+                            if ok:
+                                if near is None or d < near[0]:
+                                    near = (d, g)
+                        x += ROW_END_STEP
+                    if near is not None and near[0] <= ROW_END_STEP:
+                        break      # already tight against the row; no need to lift
+                if near is not None and (pick is None or near[1].area > pick[0]):
+                    pick = (near[1].area, s, deg, near[1], y, is_cut)
+        if pick is None:
+            break
+
+        _a, s, deg, g, y, _is_cut = pick
+        # NEST it, all the way back to the row. The scan above steps in
+        # ROW_END_STEP and keeps the position where the stone happened to fit,
+        # which leaves it standing off its neighbour — a 1.05 mm slot mid-row on
+        # a Ø90 plate, and far worse on a bigger one, where the wedge is deep and
+        # the stone can end up marooned out by the rim with a visible channel
+        # between it and the row it belongs to.
+        #
+        # The slide is bounded by the plate, not by a fixed distance: it runs
+        # until the stone touches its neighbour or the rim. Capping it at four
+        # steps was enough for a Ø90 plate and left stones stranded on a Ø100.
+        # OVERLAP, not mere contact. `intersects` is true when two stones merely
+        # touch, and this packer lays them edge to edge — so a seat already
+        # touching anything, including the row beneath it, failed on the first
+        # step and never moved at all. That left stones sitting 10 to 15 mm out
+        # from their row on a Ø100 plate while the metric happily reported them
+        # as belonging to it. Sliding must stop on real overlap, which has area;
+        # contact does not.
+        _dir = -1.0 if g.centroid.x > 0 else 1.0
+        _d, _limit = 0.0, 2.0 * R
+        while _d < _limit:
+            _try = affinity.translate(g, _dir * (_d + ROW_END_NEST), 0.0)
+            if not disc.contains(_try):
+                break
+            # A CUT STONE MUST NOT BE NESTED OFF THE RIM. The scan checks the rim
+            # rule, and then this slide used to drag the stone inward to meet its
+            # row — 18.52 mm on a Ø100 plate, which put a cross 17.30 mm inland
+            # with its ground corner against a flat neighbour. The two fixes were
+            # working against each other. A cross may close up only as far as the
+            # rim rule still holds; the gap that leaves beside it is the curve of
+            # the plate, and it belongs there.
+            if _is_cut and not _cut_on_rim(_try, R):
+                break
+            if clear > 0.0:
+                if _try.distance(taken) < clear - 1e-9:
+                    break          # keep the gap the form asked for
+            elif _try.intersection(taken).area > 1e-9:
+                break              # edge to edge, but never overlapping
+            _d += ROW_END_NEST
+        if _d > 0.0:
+            g = affinity.translate(g, _dir * _d, 0.0)
+        used.add(s["stock"])
+        taken = unary_union([taken, g])
+        bx0, by0, bx1, by1 = g.bounds
+        rp = g.representative_point()
+        placed.append({
+            "stock": s["stock"], "cts": s.get("cts", 0.0),
+            "L": round(bx1 - bx0, 1), "W": round(by1 - by0, 1),
+            "H": s.get("H", round((P.T_LO + P.T_HI) / 2.0, 3)),
+            "rawL": s.get("L"), "rawW": s.get("W"),
+            "x": bx0, "y": by0, "w": bx1 - bx0, "h": by1 - by0, "angle": deg,
+            "kind": "real",
+            "poly": [(round(px, 3), round(py, 3)) for px, py in g.exterior.coords],
+            "area": g.area,
+            "irregular": bool(s.get("poly")),
+            "lx": rp.x, "ly": rp.y,
+        })
+        rows.setdefault(round(by0, 1), []).append(placed[-1])
+
+    covered = unary_union([Polygon(p["poly"]).buffer(0) for p in placed]).area
+    return placed, 100.0 * covered / (math.pi * R * R)
 
 
 def render_circle(placed, real, pi, R, fill, path):
