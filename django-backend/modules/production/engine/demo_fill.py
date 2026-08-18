@@ -986,40 +986,6 @@ def render_enhanced_circle(placed, real, pi, R, fill, path):
     # NUMBER each seat (1..N) — a number fits any seat size.
     _draw_plate_numbers(ax, [(str(i + 1), p.get("lx"), p.get("ly"),
                               p.get("area", p["w"] * p["h"]), "white") for i, p in enumerate(placed)])
-    # HOW FAR EACH SEED IS TURNED, written on the seat itself.
-    #
-    # The seed list prints the stock's measured L×W, which is its size BEFORE it
-    # is turned. A seed laid at 90° therefore reads 9.68×7.72 in the list while
-    # the drawing wants it 7.72 wide and 9.68 tall — and on one Ø100 plate five
-    # of the seven seeds in a single row were turned, so the row could not be
-    # built from the list alone and the physical plate came out different.
-    #
-    # Only the turns that CHANGE something are marked, or the plate fills with
-    # noise: a plain rectangle at 180° occupies exactly the same footprint as at
-    # 0°, so it is left unmarked. For a cut/trimmed seed every angle counts,
-    # because turning it moves the ground corner to a different side.
-    #
-    # Drawing only — nothing here touches where a seed goes.
-    _turned = []
-    for p in placed:
-        deg = int(p.get("angle") or 0)
-        if deg == 0 or (deg == 180 and not p.get("irregular")):
-            continue
-        _turned.append((f"{deg}°", p.get("lx"), p.get("ly") - p["h"] * 0.32,
-                        p.get("area", p["w"] * p["h"])))
-    if _turned:
-        # Sized to be read at a glance off the printed sheet: the angle is the
-        # instruction the operator acts on, so it sits close to the seat
-        # number's own size, in a colour no seat fill uses, on an opaque badge
-        # so it never competes with the fill behind it.
-        _halo = [pe.withStroke(linewidth=2.6, foreground="#0d0d0d")]
-        for _lab, _lx, _ly, _area in _turned:
-            _fs = min(11.0, max(7.0, math.sqrt(max(_area, 1.0)) * 0.60))
-            ax.text(_lx, _ly, _lab, ha="center", va="center", fontsize=_fs,
-                    color="#ffb300", fontweight="bold", zorder=4,
-                    path_effects=_halo,
-                    bbox=dict(boxstyle="round,pad=0.14", facecolor="#12121ae0",
-                              edgecolor="#ffb300", linewidth=0.7))
     lim = PLATE / 2 + 3
     ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim); ax.set_aspect("equal"); ax.axis("off")
     circle_area = math.pi * R * R
