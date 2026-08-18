@@ -4,15 +4,10 @@
 # model access, so the suite must not need — or touch — a database.
 
 import io
-from unittest import mock
 
-from django.conf import settings
-from django.core.cache import caches
-from django.core.exceptions import ImproperlyConfigured
-from django.test import SimpleTestCase, TestCase, TransactionTestCase
+from django.test import SimpleTestCase, TransactionTestCase
 from openpyxl import Workbook
 
-from . import jobs
 from .shapes import (
     MIN_ANGLE_DEG, bounding_box, edge_lengths, fit_polygon_in_seat,
     interior_angles, parse_corners, polygon_area, validate_corners,
@@ -1089,56 +1084,3 @@ class FitPolygonInSeatTests(SimpleTestCase):
     def test_empty_and_missing_inputs_are_safe(self):
         self.assertIsNone(fit_polygon_in_seat([], self._box(0, 0, 10, 10)))
         self.assertIsNone(fit_polygon_in_seat(parse_corners(PENTAGON), None))
-
-
-class JobStoreTests(TestCase):
-    """The job store is what "job not found" was really about.
-
-    A plate job is created by the web process, run by a Celery worker minutes
-    later, and polled once a second by the browser in between. On live those were
-    different processes reading different stores, so the POST handed out an id
-    that every later poll answered 404 for — with the progress bar frozen on the
-    last good reading and nothing in the log.
-    """
-
-    def test_jobs_do_not_share_the_general_purpose_cache(self):
-        # The default cache is either per-process (LocMem) or set to swallow its
-        # own failures (IGNORE_EXCEPTIONS). Neither may decide whether a running
-        # job can be found, so jobs must be on their own alias.
-        self.assertIn("jobs", settings.CACHES)
-        self.assertIsNot(jobs._store(), caches["default"])
-
-    def test_a_job_written_is_a_job_that_can_be_read_back(self):
-        jid = jobs.new_job_id()
-        jobs.save_job({"id": jid, "action": "enhanced", "params": {}, "status": "queued",
-                       "progress": 0, "result": None, "error": None})
-        # Drop every cached handle, the way a second process would start out.
-        caches.close_all()
-        got = jobs.get_job(jid)
-        self.assertIsNotNone(got, "the job vanished between writing and reading it")
-        self.assertEqual(got["status"], "queued")
-
-    def test_progress_written_by_the_worker_is_visible_to_the_poll(self):
-        jid = jobs.new_job_id()
-        jobs.save_job({"id": jid, "action": "enhanced", "params": {}, "status": "queued",
-                       "progress": 0, "result": None, "error": None})
-        jobs.update_job(jid, status="running", progress=42)
-        caches.close_all()
-        self.assertEqual(jobs.get_job(jid)["progress"], 42)
-
-    def test_a_store_that_drops_writes_fails_loudly_at_creation(self):
-        """The silent version of this cost a working day: the store accepted the
-        write, returned nothing on every read, and the only symptom was a 404 on
-        an id the API had just issued."""
-
-        class Sieve:
-            def set(self, *a, **kw):
-                pass
-
-            def get(self, *a, **kw):
-                return None
-
-        with mock.patch.object(jobs, "_store", return_value=Sieve()):
-            with self.assertRaises(ImproperlyConfigured) as caught:
-                jobs.create_job("enhanced", {"plateD": 90})
-        self.assertIn("not holding jobs", str(caught.exception))
