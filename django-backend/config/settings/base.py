@@ -175,6 +175,44 @@ else:
         "default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"},
     }
 
+# ---- Arrangement job store --------------------------------------------------
+# An arrangement job is CREATED by the web process and FINISHED by a Celery
+# worker minutes later, and polled once a second by the browser in between. Every
+# one of those processes has to read the same row.
+#
+# The cache above cannot promise that. Without REDIS_URL it is LocMemCache, which
+# is private to one process — the poll lands on a different worker and answers
+# "job not found". With Redis it is configured IGNORE_EXCEPTIONS (right for page
+# caching, wrong here): a dropped write is swallowed, and the job that the POST
+# just handed out an id for can never be read back. Either way the job survives
+# only until the next app-pool recycle.
+#
+# So jobs get their own alias, stored in the database that is already running:
+# visible to every process, durable across restarts, never silently evicted, and
+# no extra service to install. Create its table once with
+#
+#     python manage.py createcachetable
+#
+# Set JOB_CACHE_URL to a redis:// url to use Redis for jobs instead — without
+# IGNORE_EXCEPTIONS, so a broken store fails loudly rather than losing work.
+JOB_CACHE_URL = env("JOB_CACHE_URL", default="")
+if JOB_CACHE_URL:
+    CACHES["jobs"] = {
+        "BACKEND": "django_redis.cache.RedisCache",
+        "LOCATION": JOB_CACHE_URL,
+        "OPTIONS": {"CLIENT_CLASS": "django_redis.client.DefaultClient"},
+        "KEY_PREFIX": env("CACHE_KEY_PREFIX", default="sonani"),
+    }
+else:
+    CACHES["jobs"] = {
+        "BACKEND": "django.core.cache.backends.db.DatabaseCache",
+        "LOCATION": env("JOB_CACHE_TABLE", default="django_job_cache"),
+        # Jobs are few and short-lived; the ceiling only exists so a forgotten
+        # table cannot grow without bound. Well above any real day's traffic, so
+        # culling never reaches a job a user is still polling.
+        "OPTIONS": {"MAX_ENTRIES": 10000, "CULL_FREQUENCY": 4},
+    }
+
 # ---- Auth -------------------------------------------------------------------
 AUTH_USER_MODEL = "accounts.User"
 
