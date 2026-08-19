@@ -22,7 +22,7 @@ Outputs per mode:
 Usage:
   .\venv\Scripts\python.exe pack_v2.py BLOCK.xlsx
 """
-import os, sys, math, openpyxl
+import os, math, openpyxl
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
