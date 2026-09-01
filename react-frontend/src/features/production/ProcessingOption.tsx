@@ -10,7 +10,7 @@ import { Card, Row, Col, Button, Space, Typography, Alert, Checkbox } from "antd
 import { useAuth } from "../auth/useAuth";
 import type { Action, Criteria } from "./types";
 import { SELECTED_BATCHES_KEY } from "./BatchSelection";
-import { CRITERIA_KEY } from "./CriteriaInput";
+import { CRITERIA_KEY, describeWidthBand } from "./CriteriaInput";
 import { FiGrid, FiPackage, FiCopy, FiZap, FiArrowRight, FiCheck, FiInfo } from "../../components/icons";
 import { notify } from "../../lib/notify";
 import { colors, alpha } from "../../theme";
@@ -102,7 +102,9 @@ export function ProcessingOption() {
           }}
           message={
             hasCriteria
-              ? `${selectedBatches.length || "All"} batch${selectedBatches.length === 1 ? "" : "es"} · shape ${criteria!.shape} · thickness ${criteria!.tLo}–${criteria!.tHi}mm · plate Ø ${criteria!.plateD}mm`
+              ? `${selectedBatches.length || "All"} batch${selectedBatches.length === 1 ? "" : "es"} · shape ${criteria!.shape} · thickness ${criteria!.tLo}–${criteria!.tHi}mm${
+                  describeWidthBand(criteria) ? ` · seed width ${describeWidthBand(criteria)}` : ""
+                } · plate Ø ${criteria!.plateD}mm`
               : "No criteria set — go back and set the criteria first."
           }
           description={<Text type="secondary">Choose how to process the selected seeds.</Text>}

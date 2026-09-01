@@ -147,3 +147,14 @@ GO
 IF COL_LENGTH('dbo.TRN_SeedArrangeDetails', 'CutPct') IS NULL
     ALTER TABLE dbo.TRN_SeedArrangeDetails ADD CutPct decimal(5, 2) NULL;
 GO
+
+-- Seed-width band (mm) the run was generated with — the SHORT side of a seed,
+-- min(Length, Width). NULL means unbounded at that end, which is what every row
+-- written before the criteria form gained these fields carries, so existing
+-- history keeps its exact meaning.
+IF COL_LENGTH('dbo.TRN_SeedArrange', 'WidthMin') IS NULL
+    ALTER TABLE dbo.TRN_SeedArrange ADD WidthMin decimal(9, 3) NULL;
+GO
+IF COL_LENGTH('dbo.TRN_SeedArrange', 'WidthMax') IS NULL
+    ALTER TABLE dbo.TRN_SeedArrange ADD WidthMax decimal(9, 3) NULL;
+GO

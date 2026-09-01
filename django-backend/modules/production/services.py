@@ -27,6 +27,29 @@ from .shapes import (
 )
 
 
+# Max ids per IN clause. SQL Server caps a statement at 2100 parameters, and
+# mssql-django's overflow path spills to a temp table that TRUNCATES 36-char
+# UUIDs to char(32) — so going over does not raise, it silently returns the
+# wrong rows. 900 leaves room for the query's other parameters.
+IN_CHUNK = 900
+
+
+def chunked_in(ids, fetch):
+    """Run `fetch(chunk)` over `ids` in safe-sized batches and chain the results.
+
+    Every `__in` clause keyed on arrangement or seed ids has to go through here.
+    The history screen passes EVERY active arrangement's id in one clause, which
+    is fine at today's 296 runs and breaks silently somewhere past 2100 — the
+    kind of fault that appears years later as "the history screen started
+    showing the wrong plate counts" with nothing in the logs.
+    """
+    ids = list(ids)
+    out = []
+    for i in range(0, len(ids), IN_CHUNK):
+        out.extend(fetch(ids[i:i + IN_CHUNK]))
+    return out
+
+
 def _uuid_or_error(value, field="arrangeId"):
     """Coerce an id to UUID, or raise DomainError.
 
@@ -84,9 +107,11 @@ class ArrangementService:
         from .models import SeedArrangePlate
 
         flags = {}
-        rows = SeedArrangePlate.objects.filter(arrange_id__in=arrange_ids).values_list(
-            "arrange_id", "arrange_image_path", "machine_cut_image_path", "enhanced_image_path", "excel_path",
-        )
+        rows = chunked_in(arrange_ids, lambda c: SeedArrangePlate.objects.filter(
+            arrange_id__in=c).values_list(
+            "arrange_id", "arrange_image_path", "machine_cut_image_path",
+            "enhanced_image_path", "excel_path",
+        ))
         for aid, a_img, m_img, e_img, xls in rows:
             f = flags.setdefault(aid, [False, False, False, False])
             f[0] |= bool(a_img)
@@ -114,9 +139,9 @@ class ArrangementService:
         ids = [r.arrange_id for r in rows]
         agg = {
             a["arrange_id"]: a
-            for a in SeedArrangePlate.objects.filter(arrange_id__in=ids)
-            .values("arrange_id")
-            .annotate(n=Count("arrange_plate_id"), t=Max("entry_date"))
+            for a in chunked_in(ids, lambda c: SeedArrangePlate.objects.filter(
+                arrange_id__in=c).values("arrange_id")
+                .annotate(n=Count("arrange_plate_id"), t=Max("entry_date")))
         }
         methods = cls._methods_by_run(ids)
 
@@ -136,8 +161,8 @@ class ArrangementService:
         from .models import SeedData
         held = {
             r["used_id"]: r["n"]
-            for r in SeedData.objects.filter(used_id__in=ids)
-            .values("used_id").annotate(n=Count("seed_id"))
+            for r in chunked_in(ids, lambda c: SeedData.objects.filter(used_id__in=c)
+                                .values("used_id").annotate(n=Count("seed_id")))
         }
         return [
             {
@@ -150,6 +175,10 @@ class ArrangementService:
                 "plateDiameter": cls._num(r.plate_diameter),
                 "thicknessMin": cls._num(r.thickness_min),
                 "thicknessMax": cls._num(r.thickness_max),
+                # Seed-width band the run used. null at either end = unbounded
+                # there, which is also every run made before the field existed.
+                "widthMin": cls._num(r.width_min),
+                "widthMax": cls._num(r.width_max),
                 # Stored as a comma-joined string; hand the UI a real list.
                 "batches": [b for b in (r.batches or "").split(",") if b.strip()],
                 "entryDate": r.entry_date.isoformat() if r.entry_date else None,
@@ -256,6 +285,8 @@ class ArrangementService:
             "plateDiameter": cls._num(header.plate_diameter),
             "thicknessMin": cls._num(header.thickness_min),
             "thicknessMax": cls._num(header.thickness_max),
+            "widthMin": cls._num(header.width_min),
+            "widthMax": cls._num(header.width_max),
             "batches": [b for b in (header.batches or "").split(",") if b.strip()],
             "entryDate": header.entry_date.isoformat() if header.entry_date else None,
             "isFinalized": bool(header.is_finalized),
@@ -462,10 +493,13 @@ class InventoryService:
         # than failing at the click. Happens when a second arrangement is
         # generated from the leftovers and assigned first.
         all_ids = InventoryService.seed_ids_for(arrange_id)
-        taken_elsewhere = set(
-            SeedData.objects.filter(seed_id__in=all_ids, is_used=True)
-            .exclude(used_id=arrange_id).values_list("seed_id", flat=True)
-        ) if all_ids else set()
+        # Chunked: a wide-band run places 60+ seeds per plate, so a multi-plate
+        # arrangement's seed list runs to several hundred ids and a big one would
+        # reach the 2100-parameter cap here first.
+        taken_elsewhere = set(chunked_in(all_ids, lambda c: SeedData.objects
+                                         .filter(seed_id__in=c, is_used=True)
+                                         .exclude(used_id=arrange_id)
+                                         .values_list("seed_id", flat=True))) if all_ids else set()
         plates = []
         for pn in sorted(p for p in named if p is not None):
             ids = InventoryService.seed_ids_for(arrange_id, pn)
@@ -611,13 +645,14 @@ class PlateService:
         aids = {r.arrange_id for r in rows}
         # Seeds per (run, plate) in one grouped query rather than one per row.
         counts = {}
-        for d in (SeedArrangeDetail.objects
-                  .filter(arrange_id__in=aids, seed_type=False)
-                  .values("arrange_id", "plate_id", "method")
-                  .annotate(n=Count("seed_id", distinct=True))):
+        for d in chunked_in(aids, lambda c: SeedArrangeDetail.objects
+                            .filter(arrange_id__in=c, seed_type=False)
+                            .values("arrange_id", "plate_id", "method")
+                            .annotate(n=Count("seed_id", distinct=True))):
             counts.setdefault((d["arrange_id"], d["plate_id"]), {})[d["method"] or ""] = d["n"]
         runs = {
-            a.arrange_id: a for a in SeedArrange.objects.filter(arrange_id__in=aids)
+            a.arrange_id: a
+            for a in chunked_in(aids, lambda c: SeedArrange.objects.filter(arrange_id__in=c))
         }
 
         def seeds_of(r):
@@ -660,6 +695,48 @@ class PlateService:
             str(pn): nm
             for pn, nm in SeedArrangePlate.objects.filter(arrange_id=arrange_id).values_list("plate_no", "plate_name")
         }
+
+
+# ---- Implausible-measurement guard (import time) -----------------------------
+# A seed whose measurement is nonsense must never reach TRN_SeedData. One that
+# does is not merely an unusable row: `pack_v2._mixed_one_plate` opens every
+# plate with a centre row taken from the head of the queue, and a seed too wide
+# for any chord makes that row come back empty, which returns None, which breaks
+# the caller's `while queue` loop. Every seed still behind it is dropped from the
+# arrangement with nothing reported. On the live inventory ONE such row
+# (DOMI002328, stored 1285.00 x 9.03 mm) stranded 190 of 634 eligible seeds.
+#
+# The engine now gates these out too (engine_runner._fits_the_plate), but that
+# gate depends on the plate size and only runs at packing time. Catching them at
+# IMPORT is what stops the bad row existing in the first place, and it puts the
+# problem in front of the person holding the datasheet, who can still fix it.
+#
+# The ceiling is set from the data, not picked round. Across 1766 sound rows the
+# longest side measured is 23.98 mm and nothing exceeds 30 mm; the three corrupt
+# rows are 1285-1288 mm. Anything from about 30 to 1000 separates them, so 60 mm
+# is 2.5x the largest real seed and 20x below the corrupt ones — it cannot reject
+# a plausible seed, and a seed longer than 60 mm could not be arranged on any
+# plate this shop runs (Ø90-Ø110) in any case.
+MAX_SEED_MM = 60.0
+# Below this a "measurement" is noise rather than a seed. The smallest real short
+# side in stock is 2.01 mm, so this floor is four times clear of live data and
+# only catches zeros and stray marks.
+MIN_SEED_MM = 0.5
+
+
+def _implausible(length, width, height):
+    """Reason this row's measurements cannot be a real seed, or None if fine."""
+    for name, v in (("length", length), ("width", width)):
+        f = float(v)
+        if f > MAX_SEED_MM:
+            return ("%s %.2f mm is above the %.0f mm limit — no seed is that "
+                    "large, so this is a mis-typed measurement (check the "
+                    "decimal point)" % (name, f, MAX_SEED_MM))
+        if f < MIN_SEED_MM:
+            return "%s %.2f mm is below the %.1f mm minimum" % (name, f, MIN_SEED_MM)
+    if float(height) <= 0:
+        return "thickness %.2f mm must be greater than zero" % float(height)
+    return None
 
 
 def _blank(v):
@@ -1003,6 +1080,16 @@ class SeedImportService:
                     "reason": "no %s — check the sheet has LENGTH and WIDTH for a "
                               "plain seed, or all four of L1 W2 L3 W4 for a cut one"
                               % " or ".join(missing),
+                })
+                continue
+            # Measurements that cannot describe a real seed. Reported like any
+            # other skip, so the row is visible on the import screen rather than
+            # quietly entering the table and breaking a packing run later.
+            nonsense = _implausible(r["length"], r["width"], r["height"])
+            if nonsense:
+                skipped.append({
+                    "stock_no": stock or None, "batch_no": r["batch_no"],
+                    "reason": nonsense,
                 })
                 continue
             bno = (r["batch_no"] or "").strip()

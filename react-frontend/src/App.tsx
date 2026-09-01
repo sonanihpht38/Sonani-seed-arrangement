@@ -7,7 +7,7 @@
 import { Suspense } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Navigate, Route, Routes } from "react-router-dom";
-import { Result, Spin } from "antd";
+import { Button, Result, Spin } from "antd";
 
 import { Login } from "./features/auth/Login";
 import { Register } from "./features/auth/Register";
@@ -30,6 +30,31 @@ function HomeRedirect() {
       <div style={{ display: "grid", placeItems: "center", minHeight: 240 }}>
         <Spin />
       </div>
+    );
+  }
+  // A FAILED catalogue call is not the same as an empty one. Both used to land
+  // on "No access", so a user whose request was throttled or whose network
+  // blipped signed in successfully and was then told their account had no
+  // screens — which sent people looking for a permissions problem that did not
+  // exist. Say what actually happened, and let them retry.
+  if (catalogueQ.isError) {
+    const err = catalogueQ.error as { status?: number; message?: string };
+    const throttled = err?.status === 429;
+    return (
+      <Result
+        status={throttled ? "warning" : "error"}
+        title={throttled ? "Too many requests" : "Could not load your screens"}
+        subTitle={
+          throttled
+            ? `${err.message ?? "The API is rate-limiting this account."} Your sign-in worked — this is a temporary limit, not a permissions problem.`
+            : (err?.message ?? "The server did not return your form list.")
+        }
+        extra={
+          <Button type="primary" onClick={() => catalogueQ.refetch()}>
+            Try again
+          </Button>
+        }
+      />
     );
   }
   const target = (catalogueQ.data ?? [])

@@ -518,6 +518,116 @@ class PlateInvariantTests(SimpleTestCase):
                     D._wasted_area(ShPoly(p["poly"]), disc), 3.0,
                     "%s sits inland and leaves a hole" % p["stock"])
 
+    def test_every_cut_seed_faces_outward(self):
+        """MANDATORY: a ground corner always points AWAY from the plate centre.
+
+        Turned inward it opens a wedge against a flat neighbour that no stone
+        can enter, and the shop floor rejects the seat — so this is a hard rule,
+        not a preference, and it has to hold for EVERY placed stone whichever
+        pass seated it. The main scan tested it inline; _fill_row_ends,
+        _fill_remaining_space and the row rebuilds went through _cut_on_rim,
+        which did not, and two inward-facing crosses reached a real Ø90 plate.
+        """
+        from shapely.geometry import Polygon as ShPoly
+
+        from .engine_runner import D
+        R = 45.0
+        _, placed, _f, _s, _ = self._plate(self._mix(), R=R, tag="outward")
+        checked = 0
+        for p in placed:
+            if not p.get("irregular"):
+                continue
+            g = ShPoly(p["poly"])
+            cut = D._cut_direction(g)
+            if cut is None:
+                continue
+            checked += 1
+            self.assertGreater(
+                D._outward_score(g, cut, 0), 0.0,
+                "%s has its cross facing INWARD" % p["stock"])
+        self.assertGreater(checked, 0, "no cut seed was placed — test proves nothing")
+
+    def test_the_rim_gate_refuses_an_inward_cross(self):
+        """_cut_on_rim is the single gate; prove it rejects on direction alone.
+
+        Same stone, same distance from the rim, same notch size — only the
+        orientation differs. The outward one must be accepted and the inward one
+        refused, or the gate is still only testing proximity.
+        """
+        from shapely import affinity
+        from shapely.geometry import Polygon as ShPoly
+
+        from .engine_runner import D
+        R = 45.0
+        # A 10 x 8 blank with the top-right corner ground off, seated hard
+        # against the RIGHT rim so the cut faces out (+x).
+        #
+        # The cut legs are 2 mm, giving a 2.0 mm2 triangle — deliberately UNDER
+        # CUT_NOTCH_MAX (3.0). A bigger cut fails the notch test on its own and
+        # the assertion would pass for the wrong reason, proving nothing about
+        # direction. This size is also representative: the corner triangles in
+        # stock run a median 2.22 mm2, which is exactly why inward-facing crosses
+        # slipped through a gate that only measured the notch.
+        outward = ShPoly([(0, 0), (10, 0), (10, 6), (8, 8), (0, 8)])
+        outward = affinity.translate(outward, R - 10.0, -4.0)
+        self.assertTrue(D._cut_on_rim(outward, R),
+                        "a cross facing outward at the rim must be allowed")
+
+        # The SAME stone rotated 180 degrees about its own centre: still at the
+        # rim, still the same notch area, cross now facing IN.
+        inward = affinity.rotate(outward, 180, origin="centroid")
+        self.assertFalse(D._cut_on_rim(inward, R),
+                         "a cross facing inward must be refused")
+
+        # A TANGENTIAL cross — the cut points along the rim rather than through
+        # it. This is the case the reported plate actually contained (+0.060),
+        # and the old `out > 0.0` rule admitted it.
+        tangential = None
+        for deg in range(0, 360, 5):
+            cand = affinity.rotate(outward, deg, origin="centroid")
+            score = D._outward_score(cand, D._cut_direction(cand), 0)
+            if 0.0 < score < D.CUT_OUTWARD_MIN:
+                tangential = (cand, score)
+                break
+        self.assertIsNotNone(tangential, "no tangential orientation found to test")
+        cand, score = tangential
+        self.assertFalse(
+            D._cut_on_rim(cand, R),
+            "a cross only %.3f outward passed the gate — 'not facing inward' is "
+            "not the rule; it must face OUT by at least %.2f" % (score, D.CUT_OUTWARD_MIN))
+
+    def test_the_rim_gate_matches_its_documented_rule_at_every_angle(self):
+        """The gate must be exactly: near the rim AND facing out AND small notch.
+
+        Property test over every orientation rather than a couple of examples —
+        this is what stops the three rules drifting apart again, which is how the
+        direction test came to be missing from the one place three seating paths
+        rely on.
+        """
+        import math
+
+        from shapely import affinity
+        from shapely.geometry import Point, Polygon as ShPoly
+
+        from .engine_runner import D
+        R = 45.0
+        disc = Point(0, 0).buffer(R, resolution=180)
+        stone = ShPoly([(0, 0), (10, 0), (10, 6), (8, 8), (0, 8)])
+        stone = affinity.translate(stone, R - 10.0, -4.0)
+
+        for deg in range(0, 360, 10):
+            g = affinity.rotate(stone, deg, origin="centroid")
+            gap = R - max(math.hypot(px, py) for px, py in g.exterior.coords)
+            cut = D._cut_direction(g)
+            score = D._outward_score(g, cut, 0) if cut is not None else 1.0
+            expected = (gap <= D.RIM_FLUSH
+                        and score >= D.CUT_OUTWARD_MIN
+                        and D._wasted_area(g, disc) <= D.CUT_NOTCH_MAX)
+            self.assertEqual(
+                D._cut_on_rim(g, R), expected,
+                "at %d deg the gate disagrees with its own rule "
+                "(gap %.2f, outward %.3f)" % (deg, gap, score))
+
 
 class PlateMasterUnassignTests(TransactionTestCase):
     """Freeing a plate from the Plate Master screen, and deleting one safely.
@@ -1084,3 +1194,862 @@ class FitPolygonInSeatTests(SimpleTestCase):
     def test_empty_and_missing_inputs_are_safe(self):
         self.assertIsNone(fit_polygon_in_seat([], self._box(0, 0, 10, 10)))
         self.assertIsNone(fit_polygon_in_seat(parse_corners(PENTAGON), None))
+
+
+# ============================================================================
+# Seed-width band, the unplaceable-seed gate, and centre-out row ordering.
+#
+# SimpleTestCase throughout: each of these is a pure function over plain dicts
+# or stub rows, so none of it needs a database.
+# ============================================================================
+
+class _SeedRow:
+    """Stand-in for a TRN_SeedData row, carrying only the fields the loader reads."""
+
+    def __init__(self, stock_no, length, width, height, corners_json=None, cts=1.0):
+        self.stock_no = stock_no
+        self.length = length
+        self.width = width
+        self.height = height
+        self.corners_json = corners_json
+        self.cts = cts
+
+
+class SeedWidthTests(SimpleTestCase):
+    """`seed_width` is the SHORT side, so the filter is rotation-invariant."""
+
+    def test_width_is_the_short_side(self):
+        from .engine_runner import seed_width
+
+        self.assertEqual(seed_width(15.0, 10.0), 10.0)
+        self.assertEqual(seed_width(10.0, 15.0), 10.0)
+
+    def test_the_same_stone_measured_either_way_agrees(self):
+        """The reason for not using the stored Width column: a stone entered as
+        15 x 10 and its twin entered 10 x 15 must qualify or fail together."""
+        from .engine_runner import seed_width
+
+        self.assertEqual(seed_width(15.0, 10.0), seed_width(10.0, 15.0))
+
+
+class FitsThePlateTests(SimpleTestCase):
+    """A seed fits at all only if its DIAGONAL clears the usable diameter."""
+
+    def test_a_normal_seed_fits(self):
+        from .engine_runner import _fits_the_plate
+
+        self.assertTrue(_fits_the_plate(12.0, 9.0, 40.0))
+
+    def test_the_live_corrupt_row_is_rejected(self):
+        """Stock DOMI002328 is stored 1285.0 x 9.03 mm on the live inventory."""
+        from .engine_runner import _fits_the_plate
+
+        self.assertFalse(_fits_the_plate(1285.0, 9.03, 40.0))
+
+    def test_a_seed_on_the_diagonal_limit_is_accepted(self):
+        """A square whose diagonal is exactly the usable diameter still fits."""
+        import math
+
+        from .engine_runner import _fits_the_plate
+
+        side = 40.0 * math.sqrt(2) / 1.0000001   # diagonal a hair under 2R
+        self.assertTrue(_fits_the_plate(side, side, 40.0))
+        self.assertFalse(_fits_the_plate(side * 1.01, side, 40.0))
+
+
+class WidthBandFilterTests(SimpleTestCase):
+    """`_blocks_from_seeds` honours the optional band at either end."""
+
+    ROWS = [
+        _SeedRow("NARROW", 20.0, 6.0, 0.70),      # width 6
+        _SeedRow("MID", 14.0, 10.0, 0.70),        # width 10
+        _SeedRow("WIDE", 18.0, 16.0, 0.70),       # width 16
+    ]
+
+    def _load(self, **kw):
+        from . import engine_runner as ER
+
+        ER.P.T_LO, ER.P.T_HI, ER.P.R = 0.67, 0.73, 40.0
+        blocks = ER._blocks_from_seeds(self.ROWS, {"square", "rectangle"}, 0.05, **kw)
+        return sorted(b["stock"] for b in blocks)
+
+    def test_no_band_keeps_everything(self):
+        """Both ends unset must reproduce the pre-feature behaviour exactly."""
+        self.assertEqual(self._load(), ["MID", "NARROW", "WIDE"])
+
+    def test_maximum_only(self):
+        self.assertEqual(self._load(w_hi=12.0), ["MID", "NARROW"])
+
+    def test_minimum_only(self):
+        self.assertEqual(self._load(w_lo=8.0), ["MID", "WIDE"])
+
+    def test_both_ends(self):
+        self.assertEqual(self._load(w_lo=8.0, w_hi=12.0), ["MID"])
+
+    def test_bounds_are_inclusive(self):
+        self.assertEqual(self._load(w_lo=10.0, w_hi=10.0), ["MID"])
+
+    def test_an_impossible_band_matches_nothing(self):
+        self.assertEqual(self._load(w_lo=30.0), [])
+
+    def test_the_band_reads_the_short_side_not_the_stored_column(self):
+        """NARROW is stored 20.0 x 6.0. A band of 4-8 must keep it (width 6);
+        a band of 18-22 must not, because its long side is irrelevant."""
+        self.assertIn("NARROW", self._load(w_lo=4.0, w_hi=8.0))
+        self.assertNotIn("NARROW", self._load(w_lo=18.0, w_hi=22.0))
+
+
+class SquareToleranceTests(SimpleTestCase):
+    """`squareTol` decides where "square" ends and "rectangle" begins.
+
+    It was hardcoded to 0 in the criteria form, which means a seed had to be
+    EXACTLY square. Nothing measured to two decimals ever is, so Shape = Square
+    matched nothing at all and Shape = Rectangle quietly matched everything —
+    making it identical to Shape = All.
+    """
+
+    ROWS = [
+        _SeedRow("NEAR-SQ", 11.89, 11.35, 0.70),   # 4.5% apart — square at 0.05
+        _SeedRow("EXACT-SQ", 10.00, 10.00, 0.70),  # square at any tolerance
+        _SeedRow("OBLONG", 14.35, 10.35, 0.70),    # 28% apart — never square
+    ]
+
+    def _load(self, shape, tol):
+        from . import engine_runner as ER
+
+        ER.P.T_LO, ER.P.T_HI, ER.P.R = 0.67, 0.73, 40.0
+        blocks = ER._blocks_from_seeds(self.ROWS, ER.SHAPE_SETS[shape], tol)
+        return sorted(b["stock"] for b in blocks)
+
+    def test_zero_tolerance_makes_square_useless(self):
+        """The reported defect: only an exactly-square seed qualifies."""
+        self.assertEqual(self._load("square", 0.0), ["EXACT-SQ"])
+
+    def test_zero_tolerance_makes_rectangle_match_everything_else(self):
+        """...and Rectangle then sweeps up the near-squares too."""
+        self.assertEqual(self._load("rectangle", 0.0), ["NEAR-SQ", "OBLONG"])
+
+    def test_five_percent_classifies_a_near_square_as_square(self):
+        self.assertEqual(self._load("square", 0.05), ["EXACT-SQ", "NEAR-SQ"])
+        self.assertEqual(self._load("rectangle", 0.05), ["OBLONG"])
+
+    def test_the_two_classes_always_partition_the_pool(self):
+        """Every seed lands in exactly one class, whatever the tolerance — so
+        no seed can be lost or counted twice by changing it."""
+        for tol in (0.0, 0.02, 0.05, 0.10, 0.5):
+            sq = set(self._load("square", tol))
+            rect = set(self._load("rectangle", tol))
+            self.assertEqual(sq | rect, {"NEAR-SQ", "EXACT-SQ", "OBLONG"}, tol)
+            self.assertEqual(sq & rect, set(), tol)
+
+    def test_shape_all_is_UNAFFECTED_by_the_tolerance(self):
+        """THE GUARANTEE. Shape = All accepts both classes, so the threshold
+        cannot change which seeds are arranged — every plate ever generated with
+        Shape = All is identical whatever this value is set to. This is what
+        makes fixing the default safe for existing output."""
+        base = self._load("all", 0.0)
+        self.assertEqual(base, ["EXACT-SQ", "NEAR-SQ", "OBLONG"])
+        for tol in (0.02, 0.05, 0.10, 0.5, 1.0):
+            self.assertEqual(self._load("all", tol), base,
+                             "shape=all changed at squareTol %s" % tol)
+
+
+class OversizeGateTests(SimpleTestCase):
+    """One unplaceable row must not cost the run every seed behind it."""
+
+    def _pool(self):
+        return [
+            _SeedRow("GOOD-1", 12.0, 9.0, 0.70),
+            _SeedRow("BAD", 1285.0, 9.03, 0.70),   # the live corrupt row
+            _SeedRow("GOOD-2", 11.0, 9.0, 0.70),
+            _SeedRow("GOOD-3", 10.0, 8.0, 0.70),
+        ]
+
+    def test_the_oversized_row_is_excluded_and_reported(self):
+        from . import engine_runner as ER
+
+        ER.P.T_LO, ER.P.T_HI, ER.P.R = 0.67, 0.73, 40.0
+        dropped = []
+        blocks = ER._blocks_from_seeds(self._pool(), {"square", "rectangle"}, 0.05,
+                                       oversize=dropped)
+        self.assertEqual(dropped, ["BAD"])
+        self.assertEqual(sorted(b["stock"] for b in blocks),
+                         ["GOOD-1", "GOOD-2", "GOOD-3"])
+
+    def test_every_good_seed_still_reaches_a_plate(self):
+        """Regression. Unfiltered, BAD reaches the head of the queue, no row can
+        take it, `_mixed_one_plate` returns None, and the caller's `while queue`
+        loop breaks — silently dropping GOOD-2 and GOOD-3 from the arrangement.
+        On the live inventory that one row stranded 190 of 634 seeds."""
+        from . import engine_runner as ER
+        from .engine import pack_v2 as P
+
+        ER.P.T_LO, ER.P.T_HI, ER.P.R = 0.67, 0.73, 40.0
+        P.R = 40.0
+        blocks = ER._blocks_from_seeds(self._pool(), {"square", "rectangle"}, 0.05)
+
+        queue = P._mixed_landscape(blocks)
+        placed = []
+        while queue:
+            plate = P._mixed_one_plate(queue)
+            if not plate:
+                break
+            placed.extend(plate)
+        self.assertEqual(sorted(p["stock"] for p in placed),
+                         ["GOOD-1", "GOOD-2", "GOOD-3"])
+
+
+class CentreOutRowTests(SimpleTestCase):
+    """Biggest seeds toward the middle of a row, smallest at the two ends."""
+
+    def _row(self, *widths):
+        return [{"stock": "S%d" % i, "w": w, "h": 9.0} for i, w in enumerate(widths)]
+
+    def test_the_widest_seed_lands_in_the_middle(self):
+        from .engine.pack_v2 import _centre_out_row
+
+        widths = [b["w"] for b in _centre_out_row(self._row(4, 13, 6, 12, 5))]
+        self.assertEqual(widths.index(max(widths)), len(widths) // 2)
+
+    def test_widths_taper_outward_from_the_centre(self):
+        from .engine.pack_v2 import _centre_out_row
+
+        widths = [b["w"] for b in _centre_out_row(self._row(4, 13, 6, 12, 5, 11))]
+        mid = len(widths) // 2
+        self.assertEqual(widths[:mid], sorted(widths[:mid]))                 # rises to the middle
+        self.assertEqual(widths[mid:], sorted(widths[mid:], reverse=True))   # falls away after
+
+    def test_the_row_keeps_exactly_its_own_seeds(self):
+        """A reorder, never a filter — the row's contents and total width are
+        what the chord check upstream was computed against."""
+        from .engine.pack_v2 import _centre_out_row
+
+        row = self._row(4, 13, 6, 12, 5)
+        out = _centre_out_row(row)
+        self.assertEqual(len(out), len(row))
+        self.assertEqual(sorted(b["stock"] for b in out), sorted(b["stock"] for b in row))
+        self.assertAlmostEqual(sum(b["w"] for b in out), sum(b["w"] for b in row))
+
+    def test_ordering_is_deterministic(self):
+        """generate_final re-packs a saved run to redraw it, so two packs of the
+        same seeds must lay out identically whatever order they arrive in."""
+        from .engine.pack_v2 import _centre_out_row
+
+        row = self._row(9, 9, 9, 12, 12)
+        first = [b["w"] for b in _centre_out_row(row)]
+        second = [b["w"] for b in _centre_out_row(list(reversed(row)))]
+        self.assertEqual(first, second)
+
+    def test_a_single_seed_row_is_unchanged(self):
+        from .engine.pack_v2 import _centre_out_row
+
+        self.assertEqual(_centre_out_row(self._row(7)), self._row(7))
+
+
+class RimPocketFillTests(SimpleTestCase):
+    """The rim-pocket pass may only ADD, and only against a neighbour.
+
+    It is the pass that reclaims the crescent between the outermost stones and
+    the plate edge. The rule that separates it from the residual fill that was
+    turned off is attachment: a stone floating in open space is what made that
+    one produce unbuildable plates.
+    """
+
+    def _plate(self, pool, R=45.0, tag="rim"):
+        import os
+        import tempfile
+
+        from .engine_runner import D
+        tmp = tempfile.mkdtemp(prefix="rim-")
+        return D.enhanced_plate_job(
+            (list(pool), 1, 2 * R, R, 2.0, os.path.join(tmp, tag + ".png")))
+
+    def _mix(self):
+        pool = [_rect_seed(f"R{i}", 11.0 + (i % 3) * 0.05, 9.0 + (i % 3) * 0.05)
+                for i in range(24)]
+        pool += [_rect_seed(f"S{i}", 3.0 + (i % 4) * 0.5, 2.6 + (i % 4) * 0.4)
+                 for i in range(24)]
+        pool += [_cut_seed(f"C{i}", 10.0, 8.0, 2.0, 2.0) for i in range(4)]
+        return pool
+
+    def test_added_stones_touch_the_arrangement(self):
+        """Every rim-pocket stone must land against something already placed."""
+        from shapely.geometry import Polygon as ShPoly
+
+        _, placed, _f, _s, _ = self._plate(self._mix(), tag="touch")
+        gs = [ShPoly(p["poly"]).buffer(0) for p in placed]
+        for i, g in enumerate(gs):
+            near = min((g.distance(h) for j, h in enumerate(gs) if j != i), default=0.0)
+            self.assertLessEqual(
+                near, 0.6,
+                "%s is floating %.2f mm from anything" % (placed[i]["stock"], near))
+
+    def test_the_pass_only_adds(self):
+        """Turning it off must leave a strict SUBSET of the same plate — no seed
+        moved or resized, only fewer of them."""
+        from .engine_runner import D
+
+        pool = self._mix()
+        try:
+            D.RIM_POCKET_FILL = False
+            _, without, f_off, _s, _ = self._plate(pool, tag="off")
+            D.RIM_POCKET_FILL = True
+            _, with_, f_on, _s, _ = self._plate(pool, tag="on")
+        finally:
+            D.RIM_POCKET_FILL = True
+
+        self.assertGreaterEqual(len(with_), len(without))
+        self.assertGreaterEqual(f_on + 1e-9, f_off)
+        # Every seed of the smaller plate survives unchanged in the larger one.
+        seats = {(p["stock"], round(p["x"], 3), round(p["y"], 3),
+                  round(p["w"], 3), round(p["h"], 3)) for p in with_}
+        for p in without:
+            self.assertIn(
+                (p["stock"], round(p["x"], 3), round(p["y"], 3),
+                 round(p["w"], 3), round(p["h"], 3)), seats,
+                "%s moved when the rim pass ran — it must only ADD" % p["stock"])
+
+    def test_no_stone_is_used_twice(self):
+        _, placed, _f, _s, _ = self._plate(self._mix(), tag="dup")
+        stocks = [p["stock"] for p in placed]
+        self.assertEqual(len(stocks), len(set(stocks)))
+
+
+class JobPollThrottleTests(SimpleTestCase):
+    """Polling a job must not spend the user's general API budget.
+
+    An arrangement can run for half an hour, and the Result screen polls until
+    it finishes. Charging those polls to the 1000/hour "user" bucket exhausted
+    it mid-run, after which EVERY authenticated endpoint refused — /me and the
+    form catalogue included — so a user could sign in successfully and then find
+    the app would not open. That is one bug with two faces, and this pins it.
+    """
+
+    def test_the_poll_endpoint_uses_its_own_scope(self):
+        from rest_framework.throttling import ScopedRateThrottle
+
+        from .views import JobDetailView
+
+        self.assertEqual(JobDetailView.throttle_scope, "job_poll")
+        self.assertEqual(JobDetailView.throttle_classes, [ScopedRateThrottle])
+
+    def test_the_poll_endpoint_is_not_charged_to_the_user_bucket(self):
+        """Listing only ScopedRateThrottle REPLACES the defaults. If
+        UserRateThrottle crept back into that list the lockout returns."""
+        from rest_framework.throttling import UserRateThrottle
+
+        from .views import JobDetailView
+
+        for cls in JobDetailView.throttle_classes:
+            self.assertFalse(issubclass(cls, UserRateThrottle),
+                             "job polling is charged to the user bucket again")
+
+    def test_the_scope_has_a_configured_rate(self):
+        """A scope with no rate silently throttles to nothing."""
+        from django.conf import settings
+
+        rates = settings.REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"]
+        self.assertIn("job_poll", rates)
+        count, _, period = rates["job_poll"].partition("/")
+        self.assertGreater(int(count), 1000,
+                           "job_poll must exceed the general user rate or it is pointless")
+
+    def test_other_endpoints_keep_the_default_throttles(self):
+        """Only the poll is exempt — everything else stays rate-limited.
+
+        APIView always defines `throttle_classes` from the settings default, so
+        the test is whether a view OVERRODE it, not whether it has one.
+        """
+        from rest_framework.settings import api_settings
+
+        from .views import ArrangementListView, JobsView, SeedImportView
+
+        default = list(api_settings.DEFAULT_THROTTLE_CLASSES)
+        for view in (JobsView, SeedImportView, ArrangementListView):
+            self.assertEqual(list(view.throttle_classes), default,
+                             f"{view.__name__} should use the project defaults")
+
+
+class RotationDisplayTests(SimpleTestCase):
+    """The turn printed on the plate must be the one the floor should perform.
+
+    Reference only — nothing here feeds the packer — but a wrong number here
+    sends an operator the wrong way round, which lands a cut corner facing the
+    wrong side. So it is tested like any other output.
+    """
+
+    def test_stored_angles_are_converted_to_clockwise(self):
+        """shapely.affinity.rotate turns COUNTER-clockwise for a positive angle,
+        so a stored 90 is a 270 degree clockwise turn on the bench."""
+        from .engine.pack_v2 import __name__ as _  # noqa: F401  (engine importable)
+
+        from .engine_runner import D
+        self.assertEqual(D.cw_degrees(0), 0)
+        self.assertEqual(D.cw_degrees(90), 270)
+        self.assertEqual(D.cw_degrees(180), 180)
+        self.assertEqual(D.cw_degrees(270), 90)
+
+    def test_conversion_is_safe_on_junk(self):
+        from .engine_runner import D
+        for v in (None, "", "abc"):
+            self.assertEqual(D.cw_degrees(v), 0)
+
+    def test_a_cut_seed_keeps_all_four_orientations(self):
+        """Which way a ground corner points is the whole question, so a cut
+        seed's angle is reported exactly."""
+        from .engine_runner import D
+        self.assertEqual(D.display_turn({"angle": 90, "irregular": True}), 270)
+        self.assertEqual(D.display_turn({"angle": 180, "irregular": True}), 180)
+
+    def test_a_plain_rectangle_is_folded_onto_half_a_turn(self):
+        """180 degrees leaves a rectangle identical, so 270 and 90 are the same
+        instruction — telling the floor 270 makes them do a three-quarter turn
+        to reach a position a quarter turn gives."""
+        from .engine_runner import D
+        self.assertEqual(D.display_turn({"angle": 90, "irregular": False}), 90)
+        self.assertEqual(D.display_turn({"angle": 180, "irregular": False}), 0)
+        self.assertEqual(D.display_turn({"angle": 270, "irregular": False}), 90)
+
+    def test_the_band_caption_reports_both_bands(self):
+        from .engine_runner import D, P
+
+        P.T_LO, P.T_HI = 0.67, 0.73
+        P.W_LO, P.W_HI = 2.0, 12.0
+        cap = D.band_caption()
+        self.assertIn("0.67", cap)
+        self.assertIn("0.73", cap)
+        self.assertIn("2–12 mm", cap)
+
+    def test_the_band_caption_handles_an_open_band(self):
+        from .engine_runner import D, P
+
+        P.T_LO, P.T_HI = 0.5, 0.8
+        P.W_LO, P.W_HI = None, 12.0
+        self.assertIn("≤ 12 mm", D.band_caption())
+        P.W_LO, P.W_HI = 8.0, None
+        self.assertIn("≥ 8 mm", D.band_caption())
+        P.W_LO = P.W_HI = None
+        self.assertIn("any", D.band_caption())
+
+
+class ImplausibleMeasurementTests(SimpleTestCase):
+    """Nonsense measurements are refused at IMPORT, before they can strand a run."""
+
+    def _reason(self, L, W, H=0.70):
+        from .services import _implausible
+
+        return _implausible(L, W, H)
+
+    def test_the_three_live_corrupt_rows_are_caught(self):
+        """DOMI002328 / DOMI002296 / DOMI002278 as stored on the live table."""
+        for L, W in ((1285.00, 9.03), (1288.00, 8.39), (1288.00, 8.03)):
+            self.assertIsNotNone(self._reason(L, W), f"{L} x {W} should be refused")
+
+    def test_the_message_points_at_the_decimal_point(self):
+        self.assertIn("decimal point", self._reason(1285.00, 9.03))
+
+    def test_the_largest_real_seed_in_stock_is_accepted(self):
+        """23.98 x 23.44 mm is the biggest sound row on the live inventory —
+        the guard must clear it by a wide margin, not squeak past it."""
+        self.assertIsNone(self._reason(23.98, 23.44))
+
+    def test_the_smallest_real_seed_in_stock_is_accepted(self):
+        """2.01 mm is the narrowest sound row; the floor sits well below it."""
+        self.assertIsNone(self._reason(12.0, 2.01))
+
+    def test_an_ordinary_seed_is_accepted(self):
+        self.assertIsNone(self._reason(12.85, 9.03))
+
+    def test_zero_and_negative_are_refused(self):
+        self.assertIsNotNone(self._reason(0.0, 9.0))
+        self.assertIsNotNone(self._reason(12.0, 0.0))
+
+    def test_a_bad_thickness_is_refused(self):
+        self.assertIsNotNone(self._reason(12.0, 9.0, H=0.0))
+
+    def test_either_side_can_trip_it(self):
+        """The corrupt value can land in Length or in Width — the sheet's column
+        order is not fixed, and `_mixed_landscape` swaps them anyway."""
+        self.assertIsNotNone(self._reason(1285.0, 9.0))
+        self.assertIsNotNone(self._reason(9.0, 1285.0))
+
+
+class ImportRejectsImplausibleRowsTests(SimpleTestCase):
+    """The guard is wired into import_seeds and costs only the offending row."""
+
+    def _sheet(self, rows):
+        wb = Workbook()
+        ws = wb.active
+        ws.append(["BatchNo", "StockNo", "Pcs", "Cts", "Length", "Width", "Height"])
+        for r in rows:
+            ws.append(list(r))
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        return buf
+
+    def test_a_corrupt_row_is_skipped_and_the_rest_import(self):
+        """One bad row must cost that row and nothing else — the same rule the
+        missing-dimension check already follows."""
+        from unittest import mock
+
+        from .services import SeedImportService
+
+        sheet = self._sheet([
+            ("B1", "GOOD-1", 1, 1.0, 12.85, 9.03, 0.70),
+            ("B1", "BAD", 1, 1.37, 1285.00, 9.03, 0.68),
+            ("B1", "GOOD-2", 1, 1.0, 11.60, 11.00, 0.71),
+        ])
+        created = []
+        with mock.patch.object(SeedImportService, "_ensure_batches", return_value=[]), \
+             mock.patch("modules.production.services.BatchRepository.id_by_no", return_value={"B1": None}), \
+             mock.patch("modules.production.services.SeedRepository.existing_stock_nos", return_value=set()), \
+             mock.patch("modules.production.services.SeedRepository.bulk_create",
+                        side_effect=lambda rows: created.extend(rows)):
+            result = SeedImportService.import_seeds(sheet)
+
+        self.assertEqual(result["imported"], 2)
+        self.assertEqual([s.stock_no for s in created], ["GOOD-1", "GOOD-2"])
+        reasons = {s["stock_no"]: s["reason"] for s in result["skipped"]}
+        self.assertIn("BAD", reasons)
+        self.assertIn("60 mm limit", reasons["BAD"])
+
+
+class EagerJobDispatchTests(SimpleTestCase):
+    """Local dev (CELERY_TASK_ALWAYS_EAGER) must still return the job id at once.
+
+    `.delay()` under eager mode runs the task INSIDE the caller, so
+    POST /production/jobs did not answer until the whole engine had finished —
+    minutes on a real pool. The browser and the Vite proxy give up long before
+    that, so the client never received a job id and nothing could be polled:
+    plate generation appeared simply not to work on a local stack.
+    """
+
+    def _fake_task(self, record):
+        import time
+
+        def run(job_id):
+            time.sleep(0.4)          # stand-in for the packing engine
+            record.append(job_id)
+        return run
+
+    def test_create_job_returns_before_the_engine_finishes(self):
+        import time
+        from unittest import mock
+
+        from django.test import override_settings
+
+        from . import jobs as J
+
+        done = []
+        with override_settings(CELERY_TASK_ALWAYS_EAGER=True,
+                               CACHES={"default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"}}):
+            with mock.patch("modules.production.tasks.run_arrangement_job",
+                            self._fake_task(done)):
+                started = time.monotonic()
+                job_id = J.create_job("arrange", {"plateD": 90})
+                elapsed = time.monotonic() - started
+
+                self.assertTrue(job_id)
+                # The whole point: the POST does not wait for the engine.
+                self.assertLess(elapsed, 0.3,
+                                "create_job blocked on the task instead of "
+                                "dispatching it to a thread")
+                # The job row is readable straight away, so polling works.
+                self.assertEqual(J.get_job(job_id)["status"], "queued")
+
+                for _ in range(60):        # let the worker thread finish
+                    if done:
+                        break
+                    time.sleep(0.05)
+                self.assertEqual(done, [job_id])
+
+    def test_a_real_broker_still_goes_through_celery(self):
+        """Production is untouched — with eager off, dispatch must use .delay()."""
+        from unittest import mock
+
+        from django.test import override_settings
+
+        from . import jobs as J
+
+        # NOT locmem: with a real broker the job row has to live somewhere both
+        # the web process and the worker can read, and `_assert_shared_cache`
+        # rightly refuses a per-process cache. Any non-locmem backend satisfies
+        # that guard, which is all this test needs.
+        with override_settings(CELERY_TASK_ALWAYS_EAGER=False,
+                               CACHES={"default": {"BACKEND": "django.core.cache.backends.dummy.DummyCache"}}):
+            with mock.patch("modules.production.tasks.run_arrangement_job") as task:
+                job_id = J.create_job("arrange", {"plateD": 90})
+                task.delay.assert_called_once_with(job_id)
+
+
+class SizeGradientTests(SimpleTestCase):
+    """Larger seeds toward the middle, smaller toward the rim — and a MIXTURE.
+
+    The defect this guards against: pick_level ranked height classes on
+    (fits, stock), so the single best-stocked class won every row whatever its
+    position. A live Ø70 plate came back using nothing under 9.42 mm although
+    132 of its 236 stones were smaller than that. CENTRE_SIZE_BIAS could not fix
+    it — it adds its term to `stock`, a total width in mm, and at a rim row the
+    stock gap was 106.7 mm against a bias worth at most 18.4 mm.
+
+    FIXTURE NOTE, learned the hard way. A handful of classes a whole millimetre
+    apart proves nothing: the tolerance ties everything within its band, so
+    three of five such classes tie at every row, stock decides, and BOTH
+    rankings produce the same plate. The pool has to have the shape a real
+    inventory has — many classes at LEVEL_BAND spacing with a stock peak in the
+    middle of the range — before the two paths diverge at all.
+
+    THESE ARE REQUIREMENT TESTS, NOT CHANGE DETECTORS, and there is deliberately
+    no "the flag changes the output" case here. Whether it changes anything is
+    POOL DEPENDENT: on a shallow pool or a plate with few rows the tolerance
+    ties every candidate class, stock decides as before, and the two settings
+    agree — correctly. A test asserting they must differ fails on exactly the
+    fixtures a unit test can afford to build, and it would be asserting a
+    property the feature does not have. That the knob bites on real stock is
+    established by the three-plate validation table beside SIZE_GRADIENT_FRAC in
+    demo_fill.py, which is the evidence to update when the inventory changes.
+    """
+
+    def _plate(self, pool, R=30.0, tag="grad"):
+        import os
+        import tempfile
+
+        from .engine_runner import D
+        tmp = tempfile.mkdtemp(prefix="grad-")
+        return D.enhanced_plate_job(
+            (list(pool), 1, 2 * R, R, 2.0, os.path.join(tmp, tag + ".png")))
+
+    def _graded_pool(self):
+        """Classes every 0.1 mm from 7.0 to 11.4, stock peaked near 9.4."""
+        import math
+
+        pool, n, h = [], 0, 7.0
+        while h <= 11.45:
+            k = round(h, 1)
+            for i in range(2 + int(6 * math.exp(-((k - 9.4) ** 2) / 1.2))):
+                pool.append(_rect_seed("S%d" % n, 9.0 + (i % 4) * 1.1, k))
+                n += 1
+            h += 0.1
+        return pool
+
+    def _sizes(self, placed):
+        return {round(min(p["w"], p["h"]), 1) for p in placed}
+
+    def _corr(self, placed):
+        """Rank correlation of a seed's radius against its short side."""
+        import math
+
+        from shapely.geometry import Polygon as ShPoly
+
+        rad, short = [], []
+        for p in placed:
+            c = ShPoly(p["poly"]).buffer(0).centroid
+            rad.append(math.hypot(c.x, c.y))
+            short.append(min(p["w"], p["h"]))
+
+        def rk(xs):
+            order = sorted(range(len(xs)), key=lambda i: xs[i])
+            out = [0.0] * len(xs)
+            i = 0
+            while i < len(order):
+                j = i
+                while j + 1 < len(order) and xs[order[j + 1]] == xs[order[i]]:
+                    j += 1
+                for t in range(i, j + 1):
+                    out[order[t]] = (i + j) / 2.0
+                i = j + 1
+            return out
+
+        a, b = rk(rad), rk(short)
+        n = len(a)
+        ma, mb = sum(a) / n, sum(b) / n
+        num = sum((a[i] - ma) * (b[i] - mb) for i in range(n))
+        da = math.sqrt(sum((x - ma) ** 2 for x in a))
+        db = math.sqrt(sum((x - mb) ** 2 for x in b))
+        return num / (da * db) if da and db else 0.0
+
+    def test_the_plate_spends_more_than_one_height_class(self):
+        """The live failure was 3 classes out of 25 available, everything else
+        left in the drawer because one class out-stocked it at every row."""
+        _, placed, _f, _s, _ = self._plate(self._graded_pool(), tag="mix")
+        sizes = self._sizes(placed)
+        self.assertGreaterEqual(
+            len(sizes), 5,
+            "the plate was built from %d height class(es) %s — the packer is "
+            "spending one class and ignoring the rest of the user's range"
+            % (len(sizes), sorted(sizes)))
+
+    def test_bigger_seeds_sit_nearer_the_middle(self):
+        """The gradient itself: size must fall off with radius."""
+        _, placed, _f, _s, _ = self._plate(self._graded_pool(), tag="grad")
+        c = self._corr(placed)
+        self.assertLess(
+            c, 0.0,
+            "seed size does not fall off outward (rank correlation %+.3f); "
+            "larger seeds belong toward the centre" % c)
+
+
+
+class EmptyResultDiagnosisTests(SimpleTestCase):
+    """When nothing matches, name the filter that actually did it.
+
+    The screen used to guess, and guessed from the wrong field: any empty run
+    with a seed-width band set was reported as "the seed width filter may be too
+    narrow". On the live inventory a user asked 0.67-0.73 mm of stock that runs
+    0.34-0.65 mm — thickness removed all 190 seeds and the width band matched
+    every one of them — and the message still sent them to widen the width band.
+    """
+
+    def _apply(self, tlo, thi, plate_d=90):
+        from .engine_runner import _apply_globals
+        return _apply_globals({
+            "mode": "mixed", "shape": "all", "squareTol": 0.05,
+            "tLo": tlo, "tHi": thi, "plateD": plate_d, "margin": 5,
+            "minSeed": 2, "clearance": 0, "grid": 0})
+
+    def _run(self, rows, tlo=0.67, thi=0.73, w_lo=None, w_hi=None, plate_d=90):
+        from .engine_runner import _blocks_from_seeds, _why_no_seeds, SHAPE_SETS
+        self._apply(tlo, thi, plate_d)
+        reject = {}
+        blocks = _blocks_from_seeds(rows, SHAPE_SETS["all"], 0.05,
+                                    w_lo=w_lo, w_hi=w_hi, oversize=[],
+                                    reject=reject)
+        return blocks, _why_no_seeds(reject)
+
+    def test_thickness_is_named_when_thickness_is_the_cause(self):
+        """The live case: every seed is inside the width band and outside the
+        thickness range. Width must NOT be blamed."""
+        rows = [_SeedRow("S%d" % i, 9.0, 8.0, 0.50) for i in range(10)]
+        blocks, why = self._run(rows, tlo=0.67, thi=0.73, w_lo=7.0, w_hi=12.0)
+        self.assertEqual(blocks, [])
+        self.assertEqual(why["reason"], "thickness")
+        self.assertEqual(why["removed"], 10)
+        self.assertEqual(why["counts"]["width"], 0,
+                         "the width band matched every seed and must not be "
+                         "reported as the cause")
+        self.assertEqual(why["thicknessSeen"], [0.5, 0.5],
+                         "the message quotes the range the STOCK holds")
+
+    def test_width_is_named_when_width_is_the_cause(self):
+        rows = [_SeedRow("S%d" % i, 9.0, 8.0, 0.70) for i in range(10)]
+        blocks, why = self._run(rows, tlo=0.67, thi=0.73, w_lo=20.0, w_hi=30.0)
+        self.assertEqual(blocks, [])
+        self.assertEqual(why["reason"], "width")
+        self.assertEqual(why["counts"]["thickness"], 0)
+        self.assertEqual(why["widthSeen"], [8.0, 8.0])
+
+    def test_the_gate_that_removed_the_most_wins(self):
+        """Mixed causes: whichever excluded more rows is the one worth naming."""
+        rows = ([_SeedRow("T%d" % i, 9.0, 8.0, 0.20) for i in range(8)]
+                + [_SeedRow("W%d" % i, 9.0, 8.0, 0.70) for i in range(2)])
+        blocks, why = self._run(rows, tlo=0.67, thi=0.73, w_lo=20.0, w_hi=30.0)
+        self.assertEqual(blocks, [])
+        self.assertEqual(why["reason"], "thickness")
+        self.assertEqual(why["counts"], {"thickness": 8, "width": 2,
+                                         "oversize": 0, "shape": 0,
+                                         "incomplete": 0})
+
+    def test_an_oversize_row_is_named_as_oversize(self):
+        """The live corrupt row shape: fits no orientation of the plate."""
+        rows = [_SeedRow("BAD", 1285.0, 9.03, 0.70)]
+        blocks, why = self._run(rows, tlo=0.67, thi=0.73)
+        self.assertEqual(blocks, [])
+        self.assertEqual(why["reason"], "oversize")
+
+    def test_a_row_missing_a_measurement_is_named(self):
+        rows = [_SeedRow("NOH", 9.0, 8.0, None)]
+        blocks, why = self._run(rows, tlo=0.67, thi=0.73)
+        self.assertEqual(blocks, [])
+        self.assertEqual(why["reason"], "incomplete")
+
+    def test_no_seeds_at_all_says_so(self):
+        """An empty batch is not a filter problem and must not blame one."""
+        blocks, why = self._run([], tlo=0.67, thi=0.73, w_lo=7.0, w_hi=12.0)
+        self.assertEqual(blocks, [])
+        self.assertEqual(why["reason"], "empty")
+        self.assertEqual(why["examined"], 0)
+
+    def test_counting_is_free_when_no_diagnosis_is_asked_for(self):
+        """`reject` is optional — every existing caller passes nothing and must
+        behave exactly as before."""
+        from .engine_runner import _blocks_from_seeds, SHAPE_SETS
+        self._apply(0.40, 0.60)
+        rows = [_SeedRow("S%d" % i, 9.0, 8.0, 0.50) for i in range(5)]
+        blocks = _blocks_from_seeds(rows, SHAPE_SETS["all"], 0.05)
+        self.assertEqual(len(blocks), 5)
+
+
+class SeedListLayoutTests(SimpleTestCase):
+    """The seed list must stay readable however many seeds are on the plate.
+
+    It used to be one column whatever its length, and a column cannot grow past
+    the page: a Ø158 plate carries 150 seeds into a 9.6 inch panel, which is a
+    0.06 inch row pitch under a 5.5 pt font, so the rows printed over each other.
+    Nothing about that is specific to Ø158 — it is the seed COUNT, so any
+    diameter hits it once enough seeds fit.
+    """
+
+    PANEL_H = 9.6 * 0.92          # the list area, less title and subtitle
+
+    def test_every_row_has_room_for_its_text(self):
+        """The invariant: pitch never falls below the readable minimum, at any
+        seed count. This is what the single-column layout could not hold."""
+        from .engine_runner import D
+
+        for n in (1, 18, 36, 80, 150, 400, 1000):
+            _ncols, per_col = D._legend_shape(n, self.PANEL_H)
+            pitch = self.PANEL_H / per_col
+            self.assertGreaterEqual(
+                pitch, D.LEGEND_MIN_ROW_IN * 0.999,
+                "%d seeds gives a %.3f in row pitch, under the %.3f in minimum "
+                "— the list will print on top of itself"
+                % (n, pitch, D.LEGEND_MIN_ROW_IN))
+
+    def test_every_seed_gets_a_row(self):
+        """Columns x rows must cover the list — no seed may be dropped off the
+        end of a column."""
+        from .engine_runner import D
+
+        for n in (1, 17, 50, 150, 397):
+            ncols, per_col = D._legend_shape(n, self.PANEL_H)
+            self.assertGreaterEqual(
+                ncols * per_col, n,
+                "%d seeds only get %d x %d = %d slots"
+                % (n, ncols, per_col, ncols * per_col))
+
+    def test_a_short_list_stays_one_column(self):
+        """Small plates must render exactly as they did — the fix is for lists
+        that overflow, and it must not reformat the ones that never did."""
+        from .engine_runner import D
+
+        for n in (1, 18, 36, 50):
+            ncols, _ = D._legend_shape(n, self.PANEL_H)
+            self.assertEqual(ncols, 1, "%d seeds should not need columns" % n)
+            self.assertEqual(D._legend_panel_in(n, self.PANEL_H),
+                             D.LEGEND_MIN_PANEL_IN,
+                             "%d seeds should not widen the panel" % n)
+
+    def test_a_long_list_widens_the_panel_to_hold_its_columns(self):
+        """Columns need somewhere to go: the panel grows with them, rather than
+        the columns being squeezed into a fixed width and overlapping."""
+        from .engine_runner import D
+
+        ncols, _ = D._legend_shape(150, self.PANEL_H)
+        self.assertGreater(ncols, 1, "150 seeds must flow into columns")
+        self.assertGreaterEqual(
+            D._legend_panel_in(150, self.PANEL_H), ncols * D.LEGEND_COL_IN,
+            "the panel is narrower than the columns it has to hold")
+
+    def test_columns_are_balanced(self):
+        """A stub last column wastes the width it cost — 150 over 3 columns is
+        50 each, not 55/55/40."""
+        from .engine_runner import D
+
+        ncols, per_col = D._legend_shape(150, self.PANEL_H)
+        last = 150 - per_col * (ncols - 1)
+        self.assertGreater(last, 0, "the last column is empty")
+        self.assertLessEqual(
+            per_col - last, per_col * 0.5,
+            "columns are lopsided: %d x %d with %d in the last"
+            % (ncols, per_col, last))

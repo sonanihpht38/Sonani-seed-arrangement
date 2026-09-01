@@ -15,6 +15,7 @@ from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
 from modules.access.permissions import HasFormPermission
@@ -38,7 +39,14 @@ _PLATE_PERM = {
 }
 
 _VALID_ACTIONS = {"arrange", "machinefill", "compare", "enhanced"}
-_REQUIRED_NUM = ["plateD", "margin", "tLo", "tHi", "minSeed", "squareTol", "clearance", "grid"]
+# Seed-width band (wLo/wHi, mm) is REQUIRED. The band is a manufacturing
+# constraint, not a convenience: an unbounded pool mixes 2 mm stones with 14 mm
+# ones, and the plate that comes back covers well on paper but is not something
+# the floor will build. Forcing the operator to state the range is what keeps the
+# output consistent, so both ends must be given before a job can start.
+_REQUIRED_NUM = ["plateD", "margin", "tLo", "tHi", "minSeed", "squareTol",
+                 "clearance", "grid", "wLo", "wHi"]
+_WIDTH_KEYS = ["wLo", "wHi"]
 
 
 def _not_number(v):
@@ -47,6 +55,35 @@ def _not_number(v):
         return False
     except (TypeError, ValueError):
         return True
+
+
+def _blank(v):
+    return v is None or (isinstance(v, str) and not v.strip())
+
+
+def _width_band_error(params):
+    """Validate the seed-width band. Returns a message, or None if it is sound.
+
+    Presence is already covered by _REQUIRED_NUM; this checks the values make a
+    usable band. Checked HERE rather than in the engine because a bad band is a
+    bad request: the user should be told at the click, not have a job queued
+    that quietly packs nothing. An impossible band (min above max) matches zero
+    seeds, which otherwise looks exactly like "your inventory is empty" — a far
+    more alarming and much harder to diagnose message than the truth.
+    """
+    for key in _WIDTH_KEYS:
+        v = params.get(key)
+        if _blank(v) or _not_number(v):
+            continue                      # _REQUIRED_NUM already reported it
+        if float(v) < 0:
+            return "seed width cannot be negative"
+    lo, hi = params.get("wLo"), params.get("wHi")
+    if _blank(lo) or _blank(hi) or _not_number(lo) or _not_number(hi):
+        return None                       # presence is _REQUIRED_NUM's business
+    if float(lo) > float(hi):
+        return (f"minimum seed width ({float(lo):g} mm) is greater than the "
+                f"maximum ({float(hi):g} mm) — no seed can match")
+    return None
 
 
 class JobsView(APIView):
@@ -63,6 +100,9 @@ class JobsView(APIView):
         bad = [k for k in _REQUIRED_NUM if _not_number(params.get(k))]
         if bad:
             return Response({"detail": "missing or invalid values: " + ", ".join(bad)}, status=status.HTTP_400_BAD_REQUEST)
+        width_err = _width_band_error(params)
+        if width_err:
+            return Response({"detail": width_err}, status=status.HTTP_400_BAD_REQUEST)
         raw = params.get("batches") or []
         if isinstance(raw, str):
             raw = [raw]
@@ -72,9 +112,20 @@ class JobsView(APIView):
 
 
 class JobDetailView(APIView):
-    """Poll a job's status / progress / result."""
+    """Poll a job's status / progress / result.
+
+    THROTTLED ON ITS OWN SCOPE, and deliberately NOT on the default classes.
+    Listing only ScopedRateThrottle here replaces DEFAULT_THROTTLE_CLASSES for
+    this view, which is the point: leaving UserRateThrottle in place would keep
+    charging every poll against the 1000/hour a person gets for real work, and a
+    single half-hour arrangement issues far more polls than that. When it ran
+    out, every other endpoint started refusing too — including /me and the form
+    catalogue, so signing in appeared to succeed and then the app would not open.
+    """
 
     permission_classes = [HasFormPermission.require("result_generation", "view")]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "job_poll"
 
     def get(self, request, job_id):
         j = get_job(job_id)

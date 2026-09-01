@@ -29,12 +29,3 @@ def paginate_envelope(items, total, page, page_size):
     }
 
 
-def paginate_queryset(qs, request, serializer_class, *, default_size=20, max_size=100,
-                      serializer_kwargs=None):
-    """Count + slice + serialize a queryset into the standard envelope."""
-    page, page_size = page_params(request, default_size=default_size, max_size=max_size)
-    total = qs.count()
-    start = (page - 1) * page_size
-    rows = serializer_class(qs[start:start + page_size], many=True,
-                            **(serializer_kwargs or {})).data
-    return paginate_envelope(rows, total, page, page_size)

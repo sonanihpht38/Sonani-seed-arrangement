@@ -78,7 +78,17 @@ services:
   worker:
     build:
       context: ./django-backend
-    command: ["celery", "-A", "config", "worker", "-l", "info", "--concurrency=4"]
+    # THREADS pool, not the default prefork. The Max Coverage sweep runs its 20
+    # independent packs across CPU cores (engine/parallel_pack.py), and prefork
+    # workers are daemonic — a daemonic process may not have children, so the
+    # sweep would silently fall back to running them one at a time. A threads
+    # worker can spawn the pack pool; the task itself is not thread-bound
+    # because the real work happens in those subprocesses.
+    #
+    # Concurrency 2, not 4: each running job opens a pack pool of PACK_WORKERS,
+    # so the machine sees concurrency x PACK_WORKERS processes at peak.
+    command: ["celery", "-A", "config", "worker", "-l", "info",
+              "--pool=threads", "--concurrency=2"]
     env_file: .env
     environment:
       DJANGO_ENV: production
@@ -89,6 +99,9 @@ services:
       CELERY_RESULT_BACKEND: redis://redis:6379/2
       RUN_MIGRATIONS: "false"   # never migrate from a worker
       COLLECT_STATIC: "false"
+      # Cores each arrangement job may use for its pack sweep. Keep
+      # concurrency x PACK_WORKERS at or under the host's core count.
+      PACK_WORKERS: "4"
     # The arrangement job writes plate PNGs / Excel here; web serves them.
     volumes:
       - media_data:/app/media

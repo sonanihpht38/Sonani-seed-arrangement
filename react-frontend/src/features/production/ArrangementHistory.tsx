@@ -42,6 +42,13 @@ function pct(v: number | null | undefined) {
 
 const num = (v: number | null | undefined, suffix = "") => (v == null ? "—" : `${v}${suffix}`);
 
+/** Seed-width band as text. Both ends null = no band was set on that run. */
+function widthBandText(lo: number | null, hi: number | null) {
+  if (lo == null && hi == null) return "—";
+  if (lo != null && hi != null) return `${lo}–${hi}mm`;
+  return lo != null ? `≥ ${lo}mm` : `≤ ${hi}mm`;
+}
+
 /** The seeds placed on a plate, shown under that plate's images. */
 const SEED_COLS: ColDef<ArrangementSeed>[] = [
   { headerName: "Stock", field: "stock", minWidth: 140 },
@@ -169,6 +176,14 @@ export function ArrangementHistory() {
         valueGetter: (p) =>
           p.data?.thicknessMin == null ? "—" : `${p.data.thicknessMin}–${p.data.thicknessMax}mm`,
       },
+      {
+        // Seed-width band the run used. "—" covers both "no band set" and every
+        // run made before the criteria form had the field, which are the same
+        // thing: the whole thickness window was eligible.
+        headerName: "Seed width",
+        minWidth: 130,
+        valueGetter: (p) => widthBandText(p.data?.widthMin ?? null, p.data?.widthMax ?? null),
+      },
       { headerName: "Shape", field: "shape", minWidth: 100 },
       {
         headerName: "Batches",
@@ -250,6 +265,9 @@ export function ArrangementHistory() {
               </Descriptions.Item>
               <Descriptions.Item label="Thickness">
                 {detail.thicknessMin == null ? "—" : `${detail.thicknessMin}–${detail.thicknessMax}mm`}
+              </Descriptions.Item>
+              <Descriptions.Item label="Seed width">
+                {widthBandText(detail.widthMin, detail.widthMax)}
               </Descriptions.Item>
               <Descriptions.Item label="Shape">{detail.shape ?? "—"}</Descriptions.Item>
               <Descriptions.Item label="Batches">{detail.batches.length}</Descriptions.Item>

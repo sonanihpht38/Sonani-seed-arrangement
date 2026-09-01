@@ -11,9 +11,9 @@ import { Card, Space, Typography, Alert, Progress, Button, Row, Col, Pagination,
 import type { ColDef } from "ag-grid-community";
 import { useAuth } from "../auth/useAuth";
 import { productionApi } from "./productionApi";
-import type { Action, Criteria, DimRow, Job } from "./types";
+import type { Action, Criteria, DimRow, EmptyReason, Job } from "./types";
 import { SELECTED_BATCHES_KEY } from "./BatchSelection";
-import { CRITERIA_KEY } from "./CriteriaInput";
+import { CRITERIA_KEY, describeWidthBand } from "./CriteriaInput";
 import { ACTION_KEY, COMPARE_METHODS_KEY } from "./ProcessingOption";
 import { DataGrid } from "../../components/DataGrid";
 import { FiCheck, FiDownload, FiRefreshCw } from "../../components/icons";
@@ -38,6 +38,56 @@ const ACTION_LABEL: Record<Action, string> = {
   compare: "Compare",
   enhanced: "Max Coverage",
 };
+
+const mm = (n: number) => `${Number(n.toFixed(2))} mm`;
+const span = (r: [number, number]) =>
+  r[0] === r[1] ? mm(r[0]) : `${Number(r[0].toFixed(2))}–${mm(r[1])}`;
+
+/**
+ * Why a run came back with nothing, named from the backend's own count of what
+ * each filter removed.
+ *
+ * This screen used to GUESS, and the guess was wired to the wrong field: any
+ * empty run with a seed-width band set was reported as "the seed width filter
+ * may be too narrow". A live run asked 0.67–0.73 mm of an inventory that holds
+ * 0.34–0.65 mm, so thickness excluded all 190 seeds while the width band matched
+ * every one of them — and the user was still told to widen the width band. Say
+ * which gate emptied the pool, and quote the range the stock actually spans so
+ * the message is an instruction rather than a hint.
+ */
+export function describeEmptyResult(
+  r: EmptyReason | null,
+  criteria: Criteria | null,
+  widthBandLabel: string | null,
+): string {
+  const generic = "No seeds matched the selected criteria. Widen the thickness range, change the shape, or pick different batches.";
+  if (!r || r.reason === "empty") {
+    return r && r.examined === 0
+      ? "No seeds matched: the selected batches hold no seeds at all. Pick different batches, or import stock first."
+      : generic;
+  }
+  const of = `${r.removed ?? 0} of ${r.examined} seed${r.examined === 1 ? "" : "s"}`;
+  switch (r.reason) {
+    case "thickness": {
+      const asked = criteria ? ` (${criteria.tLo}–${criteria.tHi} mm)` : "";
+      const has = r.thicknessSeen ? ` — the selected stock runs ${span(r.thicknessSeen)}` : "";
+      return `No seeds matched. The THICKNESS range${asked} excluded ${of}${has}. Adjust the thickness range to cover the stock you have.`;
+    }
+    case "width": {
+      const asked = widthBandLabel ? ` (${widthBandLabel})` : "";
+      const has = r.widthSeen ? ` — the selected stock runs ${span(r.widthSeen)}` : "";
+      return `No seeds matched. The SEED WIDTH band${asked} excluded ${of}${has}. Widen the seed width band to cover the stock you have.`;
+    }
+    case "oversize":
+      return `No seeds matched. ${of} are too large for a Ø${criteria?.plateD ?? "?"} mm plate in any orientation. Use a larger plate, or check those rows in Seed Import for a mis-typed Length or Width.`;
+    case "shape":
+      return `No seeds matched. The SHAPE filter excluded ${of}. Set Shape to "All", or adjust the square tolerance.`;
+    case "incomplete":
+      return `No seeds matched. ${of} are missing a Length, Width or Height. Fix those rows in Seed Import.`;
+    default:
+      return generic;
+  }
+}
 
 interface PlateItem {
   plateNo: number;
@@ -114,9 +164,13 @@ export function ResultGeneration() {
     [],
   );
 
+  const widthBandLabel = useMemo(() => describeWidthBand(criteria), [criteria]);
+
   const [jobId, setJobId] = useState<string | null>(null);
   const [page, setPage] = useState(1);
   const startedRef = useRef(false);
+  /** When the current job started, so the poll can slow down as it runs on. */
+  const pollStartRef = useRef(0);
 
   const jobMut = useMutation({
     mutationFn: () =>
@@ -125,7 +179,7 @@ export function ResultGeneration() {
         batches,
         ...(action === "compare" ? { methods: compareMethods } : {}),
       }),
-    onSuccess: (r) => { setJobId(r.id); setPage(1); },
+    onSuccess: (r) => { setJobId(r.id); setPage(1); pollStartRef.current = Date.now(); },
     onError: (e) => notify.error(e instanceof Error ? e.message : "Failed to start the job"),
   });
 
@@ -133,9 +187,23 @@ export function ResultGeneration() {
     queryKey: ["prod-job", jobId],
     queryFn: () => productionApi.getJob(jobId!),
     enabled: !!jobId,
+    // BACK OFF as the job runs on. A fixed 1 s was fine when a plate took
+    // seconds; a Max Coverage run can take half an hour, and 1 s polling for
+    // that long issues ~2000 requests for ONE job — which exhausted the API
+    // throttle mid-run and then locked the whole account out of every other
+    // endpoint, sign-in included.
+    //
+    // Stepping to 10 s brings the same run down to roughly 200 requests. The
+    // first seconds stay responsive so a short job still feels instant, and
+    // nothing about the job itself changes — only how often we ask about it.
     refetchInterval: (q) => {
       const s = q.state.data?.status;
-      return s === "done" || s === "failed" ? false : 1000;
+      if (s === "done" || s === "failed") return false;
+      const elapsed = Date.now() - (pollStartRef.current || Date.now());
+      if (elapsed < 15_000) return 1_000;
+      if (elapsed < 60_000) return 2_000;
+      if (elapsed < 300_000) return 5_000;
+      return 10_000;
     },
     refetchIntervalInBackground: true, // keep polling even when the tab isn't focused
   });
@@ -270,8 +338,22 @@ export function ResultGeneration() {
           <Alert type="error" showIcon message="Job failed" description={<pre style={{ whiteSpace: "pre-wrap", margin: 0 }}>{job?.error}</pre>} />
         )}
 
+        {/* Rows the plate cannot hold at any size — a data problem, not a
+            packing outcome, so it is reported even on a successful run.
+            Previously these were dropped silently, and one mis-keyed row could
+            strand hundreds of seeds with nothing said anywhere. */}
+        {job?.status === "done" && !!job.seedsOversize && (
+          <Alert
+            type="warning"
+            showIcon
+            style={{ marginTop: 12 }}
+            message={`${job.seedsOversize} seed${job.seedsOversize === 1 ? " was" : "s were"} too large for a Ø${criteria?.plateD ?? "?"} mm plate and left out`}
+            description="These rows do not fit the plate in any orientation — usually a mis-typed Length or Width in the datasheet. Check them in Seed Import."
+          />
+        )}
+
         {noSeeds && (
-          <Empty description="No seeds matched the selected criteria. Widen the thickness range, change the shape, or pick different batches." />
+          <Empty description={describeEmptyResult(job?.emptyReason ?? null, criteria, widthBandLabel)} />
         )}
       </Card>
 

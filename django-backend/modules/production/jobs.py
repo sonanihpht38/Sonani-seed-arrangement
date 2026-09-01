@@ -56,6 +56,37 @@ def save_job(job):
     cache.set(_key(job["id"]), job, JOB_TTL)
 
 
+def _dispatch_eagerly(run_arrangement_job, job_id):
+    """Run the job on a background THREAD instead of inline.
+
+    With CELERY_TASK_ALWAYS_EAGER (the local dev setup — no Redis, no worker)
+    `.delay()` executes the task inside the caller, so POST /production/jobs did
+    not return until the whole engine had finished. On the live pool that is
+    minutes, and the browser, the Vite proxy or gunicorn gives up long before —
+    which is exactly the "plate generation doesn't work locally" symptom: the
+    request hangs, no job id ever reaches the client, and nothing can be polled.
+
+    A thread restores the contract the frontend is written against — POST
+    returns a job id immediately, GET polls until done — using the same locmem
+    cache, which is shared across threads of one process even though it is not
+    shared across processes. Production is unaffected: a real broker is
+    configured there, so this branch is never taken.
+    """
+    import threading
+
+    from django.db import connections
+
+    def _run():
+        try:
+            run_arrangement_job(job_id)
+        finally:
+            # Each thread gets its own connections; hand them back rather than
+            # leaking one per job for the life of the dev server.
+            connections.close_all()
+
+    threading.Thread(target=_run, name=f"arrange-{job_id}", daemon=True).start()
+
+
 def create_job(action, params):
     """Register a queued job and hand it to Celery. Returns the job id.
 
@@ -70,7 +101,10 @@ def create_job(action, params):
         "id": job_id, "action": action, "params": dict(params),
         "status": "queued", "progress": 0, "result": None, "error": None,
     })
-    run_arrangement_job.delay(job_id)
+    if getattr(settings, "CELERY_TASK_ALWAYS_EAGER", False):
+        _dispatch_eagerly(run_arrangement_job, job_id)
+    else:
+        run_arrangement_job.delay(job_id)
     return job_id
 
 
@@ -109,4 +143,8 @@ def job_to_json(j):
         "enhancedAvg": result.get("enhancedAvg", 0),
         "arrangeId": result.get("arrangeId"),
         "seedsMatched": result.get("seedsMatched"),
+        "seedsOversize": result.get("seedsOversize", 0),
+        # Which filter emptied the pool, when nothing matched. None on any run
+        # that produced seeds — the UI must not guess at the cause.
+        "emptyReason": result.get("emptyReason"),
     }

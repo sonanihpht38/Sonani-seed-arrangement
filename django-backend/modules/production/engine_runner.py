@@ -13,9 +13,12 @@ images + dimension tables) into a private directory under MEDIA_ROOT and returns
 a dict shaped exactly like the frontend `Job` contract.
 """
 import json
+import logging
 import math
 import os
 import sys
+
+_log = logging.getLogger(__name__)
 
 # Headless matplotlib — MUST be set before the engine imports matplotlib.
 os.environ.setdefault("MPLBACKEND", "Agg")
@@ -56,6 +59,22 @@ def _num(params, key):
     default. Missing/blank/non-numeric raises (the API validates first, so this
     only fires on a genuinely bad request)."""
     return float(params[key])
+
+
+def _opt_num(params, key):
+    """Read an OPTIONAL numeric param: None when absent, blank or unreadable.
+
+    The seed-width bounds use this because "no minimum" and "no maximum" are
+    ordinary choices, not errors — the user may bound one end, both or neither.
+    A blank string is what an emptied Ant Design InputNumber sends, so it has to
+    mean the same as the key being missing."""
+    v = params.get(key)
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
 
 
 # Deal the Max Coverage stone pool out across the plates by height class, so no
@@ -117,6 +136,12 @@ def _apply_globals(params):
     P.GRID = _num(params, "grid")
     P.CLEARANCE = _num(params, "clearance")
     P.MINSEED = _num(params, "minSeed")
+    # Seed-width band, carried as engine globals the same way the thickness gate
+    # is. The packer does NOT read these — the band is applied when the pool is
+    # loaded (_blocks_from_seeds) — they exist so the plate IMAGE can state which
+    # band produced it. Either may be None, meaning unbounded at that end.
+    P.W_LO = _opt_num(params, "wLo")
+    P.W_HI = _opt_num(params, "wHi")
     return P.R
 
 
@@ -340,21 +365,111 @@ def _poly_from_seed(s):
     return (pts, assumed) if len(pts) >= 3 else (None, False)
 
 
-def _blocks_from_seeds(seeds, shapes, square_tol):
+def _fits_the_plate(L, W, R):
+    """Can a seed this size sit on the plate AT ALL, in any orientation?
+
+    A w x h rectangle centred on the plate fits the usable circle exactly when
+    its DIAGONAL clears the usable diameter: (w/2)^2 + (h/2)^2 <= R^2. Rotating
+    or moving it cannot help — the centre is the most generous position there
+    is — so a seed failing this can never be placed on any plate of this size.
+
+    This gate is not defensive padding; without it ONE bad row halts the whole
+    run. `pack_v2._mixed_one_plate` opens each plate with a centre row taken
+    from the FRONT of the queue, and `take_row` stops at the first seed too wide
+    for the budget. A seed wider than any chord therefore yields an empty centre
+    row, which makes `_mixed_one_plate` return None, which breaks the caller's
+    `while queue` loop — every seed still behind it is silently dropped from the
+    arrangement.
+
+    Measured on the live inventory: stock DOMI002328 is stored 1285.0 x 9.03 mm
+    (a mis-keyed length — no seed is 1.3 metres long). On a Ø90 plate it stranded
+    190 of 634 eligible seeds and truncated the run at 36 plates, with nothing
+    reported anywhere. Excluding it is both correct and what the user would want:
+    the row is unusable data, not a seed the packer failed to place.
+    """
+    return (L / 2.0) ** 2 + (W / 2.0) ** 2 <= R * R
+
+
+def seed_width(L, W):
+    """The seed's WIDTH as the criteria form means it: its SHORT side.
+
+    Deliberately min(L, W) and not the stored Width column. A seed is placed in
+    whichever of its two orientations suits the seat — `_mixed_landscape` turns
+    every seed landscape before packing, and Max Coverage tries all four right
+    angles — so the same physical stone can arrive as 15 x 10 on one datasheet
+    row and 10 x 15 on another. Filtering the stored column would then admit one
+    and reject its twin, which reads as a bug from the shop floor and is one.
+
+    The short side is also the number the packing already turns on: it is the
+    height a seed lies flat at, so it is what `_mixed_landscape` sorts by and
+    what Max Coverage's row-height census is built from. Constraining it is
+    therefore the filter that most directly narrows the search.
+    """
+    return min(L, W)
+
+
+def _blocks_from_seeds(seeds, shapes, square_tol, w_lo=None, w_hi=None, oversize=None,
+                       reject=None):
     """Apply the SAME thickness-gate + shape filter as pack_v2.load_blocks, but to
     SeedData rows (objects with .length/.width/.height/.stock_no/.cts) instead of an
-    Excel file. Reads the P.T_LO/P.T_HI globals set by _apply_globals."""
+    Excel file. Reads the P.T_LO/P.T_HI/P.R globals set by _apply_globals.
+
+    `w_lo` / `w_hi` bound the seed WIDTH (see seed_width) in mm. Either may be
+    None, which means "no bound on that end" — so a user may give a maximum
+    only, a minimum only, both, or neither. Neither reproduces the behaviour
+    that predates the feature exactly.
+
+    `oversize`, when a list is passed, collects the stock numbers rejected for
+    being too large for the plate, so the caller can report them.
+
+    `reject`, when a dict is passed, counts how many rows each gate removed and
+    records the thickness and width actually present in the stock. An empty
+    result is otherwise indistinguishable from any other, and the UI was left
+    guessing: it blamed the seed-width band on every empty run, which sent a user
+    to widen a filter that was already matching 190 of 190 seeds while the
+    thickness range — asking 0.67-0.73 mm of stock that runs 0.34-0.65 — was what
+    had actually emptied the set. Counting is what lets the message name the
+    gate that really did it.
+    """
+    def _bump(key):
+        if reject is not None:
+            reject[key] = reject.get(key, 0) + 1
+
+    def _seen(key, v):
+        if reject is None:
+            return
+        lo, hi = reject.get(key, (v, v))
+        reject[key] = (min(lo, v), max(hi, v))
+
     out = []
     for s in seeds:
+        _bump("examined")
         L = float(s.length) if s.length is not None else None
         W = float(s.width) if s.width is not None else None
         H = float(s.height) if s.height is not None else None
         if None in (L, W, H):
+            _bump("incomplete")
             continue
+        _seen("thicknessSeen", H)
+        _seen("widthSeen", seed_width(L, W))
         if not (P.T_LO <= H <= P.T_HI):          # thickness first
+            _bump("thickness")
+            continue
+        sw = seed_width(L, W)                     # then the user's width band
+        if w_lo is not None and sw < w_lo:
+            _bump("width")
+            continue
+        if w_hi is not None and sw > w_hi:
+            _bump("width")
+            continue
+        if not _fits_the_plate(L, W, P.R):       # unplaceable at this plate size
+            if oversize is not None:
+                oversize.append(s.stock_no)
+            _bump("oversize")
             continue
         sh = "square" if abs(L - W) <= square_tol * max(L, W) else "rectangle"
         if sh not in shapes:                      # shape filter (secondary)
+            _bump("shape")
             continue
         blk = {"stock": s.stock_no, "cts": float(s.cts or 0.0), "L": L, "W": W, "H": H, "shape": sh}
         # Optional true outline for an irregular seed, as [(x, y), ...] in mm.
@@ -372,10 +487,48 @@ def _blocks_from_seeds(seeds, shapes, square_tol):
     return out
 
 
-def load_blocks_from_db(shapes, square_tol, batches=None):
+def _why_no_seeds(reject):
+    """Name the gate that actually emptied the pool, in the user's own numbers.
+
+    Returned only when nothing survived the filters. The UI used to guess, and
+    guessed wrong: it blamed the seed-width band whenever one was set, so a run
+    whose width band matched every seed in stock still told the user to widen it.
+    The gate that removed the MOST rows is the one worth naming, and quoting the
+    range the stock actually spans turns "no seeds matched" into an instruction.
+    """
+    examined = reject.get("examined", 0)
+    if not examined:
+        return {"reason": "empty", "examined": 0}
+
+    def _rng(key):
+        v = reject.get(key)
+        return [round(v[0], 3), round(v[1], 3)] if v else None
+
+    counts = {k: reject.get(k, 0)
+              for k in ("thickness", "width", "oversize", "shape", "incomplete")}
+    top = max(counts, key=lambda k: counts[k])
+    if not counts[top]:
+        return {"reason": "empty", "examined": examined}
+    return {
+        "reason": top,
+        "examined": examined,
+        "removed": counts[top],
+        "counts": counts,
+        "thicknessSeen": _rng("thicknessSeen"),
+        "widthSeen": _rng("widthSeen"),
+    }
+
+
+def load_blocks_from_db(shapes, square_tol, batches=None, w_lo=None, w_hi=None, oversize=None,
+                        reject=None):
     """Read the seeds to arrange straight from the TRN_SeedData table (optionally
     filtered to one or more Batch_IDs). This is the source of truth — no Excel file
-    needed. `batches` is a list of Batch_IDs (uuids); empty/None = all seeds."""
+    needed. `batches` is a list of Batch_IDs (uuids); empty/None = all seeds.
+
+    `w_lo`/`w_hi` are the criteria form's seed-width band (mm); either may be
+    None. The band is applied in Python rather than SQL because the width is
+    min(Length, Width) — a rotation-invariant expression the stored columns
+    cannot be indexed on, and the row set is already bounded by batch."""
     from .models import SeedData
 
     qs = SeedData.objects.all()
@@ -387,7 +540,9 @@ def load_blocks_from_db(shapes, square_tol, batches=None):
     qs = qs.exclude(is_used=True)
     if batches:
         qs = qs.filter(batch_id__in=list(batches))
-    return _blocks_from_seeds(qs.iterator(), shapes, square_tol)
+    return _blocks_from_seeds(qs.iterator(), shapes, square_tol,
+                              w_lo=w_lo, w_hi=w_hi, oversize=oversize,
+                              reject=reject)
 
 
 def run(action, params, out_dir, media_base, progress=lambda p: None):
@@ -406,12 +561,29 @@ def run(action, params, out_dir, media_base, progress=lambda p: None):
     square_tol = _num(params, "squareTol")
     min_seed = _num(params, "minSeed")
     plate_d = _num(params, "plateD")
+    # Seed-width band from the criteria form. Optional at both ends.
+    w_lo, w_hi = _opt_num(params, "wLo"), _opt_num(params, "wHi")
     raw_batches = params.get("batches") or []
     if isinstance(raw_batches, str):  # tolerate a single id sent as a string
         raw_batches = [raw_batches]
     batches = [str(b).strip() for b in raw_batches if str(b).strip()]
 
-    blocks = load_blocks_from_db(shape_set, square_tol, batches)
+    oversize = []
+    reject = {}
+    blocks = load_blocks_from_db(shape_set, square_tol, batches,
+                                 w_lo=w_lo, w_hi=w_hi, oversize=oversize,
+                                 reject=reject)
+    empty_reason = _why_no_seeds(reject) if not blocks else None
+    if oversize:
+        # Loud in the log, counted in the result. These are rows the inventory
+        # cannot use at this plate size — usually a mis-keyed measurement — and
+        # silently dropping them is how a corrupt row went unnoticed while it
+        # truncated whole runs.
+        _log.warning(
+            "%d seed(s) too large for a %.1f mm plate and excluded: %s",
+            len(oversize), plate_d,
+            ", ".join(str(s) for s in oversize[:10]) + (" ..." if len(oversize) > 10 else ""),
+        )
 
     # Exclude the user's stock numbers AND the occupied (finalized) seeds frozen in
     # occupiedExclude — both kept in the stored params so a re-generate matches exactly.
@@ -419,6 +591,133 @@ def run(action, params, out_dir, media_base, progress=lambda p: None):
     if exclude_raw:
         excluded = {s.strip() for s in exclude_raw if s.strip()}
         blocks = [b for b in blocks if str(b["stock"]).strip() not in excluded]
+
+
+    # ------------------------------------------------------------------
+    # Max Coverage: SINGLE BEST PLATE MODE
+    #
+    # For standalone Max-Coverage, do NOT first split the eligible inventory
+    # into Arrange-style plates. Pass the complete eligible pool directly to
+    # enhanced_plate_job(), which selects the best buildable/high-coverage
+    # single plate.
+    #
+    # Arrange, Machine-Cut and Compare continue through the original code
+    # below unchanged.
+    # ------------------------------------------------------------------
+    if action == "enhanced":
+        arrange_dir = os.path.join(out_dir, "arrange")
+        machine_dir = os.path.join(out_dir, "machinefill")
+        enhanced_dir = os.path.join(out_dir, "enhanced")
+        excel_dir = os.path.join(out_dir, "excel")
+
+        for d in (arrange_dir, machine_dir, enhanced_dir, excel_dir):
+            os.makedirs(d, exist_ok=True)
+
+        # No eligible seeds -> no plate.
+        if not blocks:
+            return {
+                "plates": [],
+                "pairs": [],
+                "arrangeAvg": 0.0,
+                "machineAvg": 0.0,
+                "enhancedAvg": 0.0,
+                "arrangeId": None,
+                "seedsStored": 0,
+                "dummiesStored": 0,
+                "seedsMatched": 0,
+                "seedsOversize": len(oversize),
+                "emptyReason": empty_reason,
+            }
+
+        progress(5)
+
+        epath = os.path.join(enhanced_dir, "plate_01.png")
+
+        # Pass ALL eligible seeds to Max Coverage. Do not pre-split them
+        # using _mixed_landscape/_mixed_one_plate.
+        _, eplaced, efill, _, _ = D.enhanced_plate_job(
+            (list(blocks), 1, plate_d, R, min_seed, epath)
+        )
+
+        progress(90)
+
+        erows = dim_rows(eplaced)
+        ereals = [p for p in eplaced if not p.get("filler")]
+
+        # Standalone Max Coverage -> exactly one Excel file.
+        enhanced_xlsx_name = "plate_01.xlsx"
+        _write_single_xlsx(
+            os.path.join(excel_dir, enhanced_xlsx_name),
+            1,
+            "Plate 01 — Max Coverage",
+            "MAX COVERAGE",
+            epath,
+            erows,
+        )
+
+        total_area = round(math.pi * R * R, 2)
+        enhanced_avg = round(efill, 1)
+
+        per_plate_real = [(1, ereals)]
+        per_plate_dummy = []
+
+        per_method_real = {
+            "arrange": [],
+            "machinefill": [],
+            "enhanced": [(1, ereals)],
+        }
+
+        plate_meta = [{
+            "plateNo": 1,
+            "arrangeImg": None,
+            "machineImg": None,
+            "enhancedImg": f"{media_base}/enhanced/plate_01.png",
+            "excelPath": f"{media_base}/excel/{enhanced_xlsx_name}",
+            "arrangeFill": None,
+            "machineFill": None,
+            "enhancedFill": round(efill, 2),
+            "totalArea": total_area,
+            "arrangeCovered": None,
+            "machineCovered": None,
+            "realCount": len(ereals),
+            "dummyCount": 0,
+        }]
+
+        saved = _save_arrangement(
+            action,
+            params,
+            per_plate_real,
+            per_plate_dummy,
+            batches,
+            enhanced_avg,
+            per_method_real=per_method_real,
+        )
+
+        if saved.get("arrangeId"):
+            _save_plate_rows(saved["arrangeId"], plate_meta)
+
+        progress(100)
+
+        return {
+            "plates": [{
+                "plateNo": 1,
+                "fillPct": round(efill, 1),
+                "dummyCount": 0,
+                "imageUrl": f"{media_base}/enhanced/plate_01.png",
+                "seeds": erows,
+                "exportUrl": f"{media_base}/excel/{enhanced_xlsx_name}",
+            }],
+            "pairs": [],
+            "arrangeAvg": 0.0,
+            "machineAvg": 0.0,
+            "enhancedAvg": enhanced_avg,
+            "arrangeId": saved.get("arrangeId"),
+            "seedsStored": saved.get("seedsStored", 0),
+            "dummiesStored": saved.get("dummiesStored", 0),
+            "seedsMatched": len(blocks),
+            "seedsOversize": len(oversize),
+            "emptyReason": empty_reason,
+        }
 
     queue = P._mixed_landscape(blocks)
     real_plates = []
@@ -481,6 +780,8 @@ def run(action, params, out_dir, media_base, progress=lambda p: None):
     plate_meta = []       # per-plate summary + image paths → TRN_SeedPlate
 
     for idx, real in enumerate(real_plates, 1):
+        # Always define the per-plate workbook name before any branch can use it.
+        xlsx_name = f"plate_{idx:02d}.xlsx"
         arows = mrows = erows = None
         afill = mfill = efill = 0.0
         e_made = False   # did Max Coverage produce a plate (pool not yet exhausted)?
@@ -544,15 +845,14 @@ def run(action, params, out_dir, media_base, progress=lambda p: None):
                 real_count = len(ereals)
                 dummy_count = 0
             if action != "compare":              # standalone Max Coverage → its own per-plate xlsx
-                exlsx_name = f"plate_{idx:02d}.xlsx"
                 _write_single_xlsx(
-                    os.path.join(excel_dir, exlsx_name), idx,
+                    os.path.join(excel_dir, xlsx_name), idx,
                     f"Plate {idx:02d} — Max Coverage", "MAX COVERAGE", epath, erows,
                 )
                 enhanced_plates.append({
                     "plateNo": idx, "fillPct": round(efill, 1), "dummyCount": 0,
                     "imageUrl": f"{media_base}/enhanced/plate_{idx:02d}.png",
-                    "seeds": erows, "exportUrl": f"{media_base}/excel/{exlsx_name}",
+                    "seeds": erows, "exportUrl": f"{media_base}/excel/{xlsx_name}",
                 })
             else:
                 enhanced_plates.append({
@@ -635,9 +935,14 @@ def run(action, params, out_dir, media_base, progress=lambda p: None):
         "arrangeId": saved.get("arrangeId"),
         "seedsStored": saved.get("seedsStored", 0),
         "dummiesStored": saved.get("dummiesStored", 0),
-        # How many seeds passed the selected criteria (shape / thickness / batch /
-        # excludes). 0 → nothing matched, so no plate was generated → UI shows a notice.
+        # How many seeds passed the selected criteria (shape / thickness / WIDTH
+        # band / batch / excludes). 0 → nothing matched, so no plate was
+        # generated → UI shows a notice.
         "seedsMatched": len(blocks),
+        # Rows excluded for being too large for this plate at all — a data
+        # problem, not a packing outcome, so it is reported separately.
+        "seedsOversize": len(oversize),
+        "emptyReason": empty_reason,
     }
 
 
@@ -688,6 +993,11 @@ def _save_arrangement(action, params, per_plate_real, per_plate_dummy, batches, 
         square_tol=_f("squareTol"),
         thickness_min=_f("tLo"),
         thickness_max=_f("tHi"),
+        # NULL, not 0, when the user left an end unbounded — 0 would read back
+        # as "minimum width 0 mm", which is a different (and wrong) statement
+        # about how the run was made.
+        width_min=_f("wLo"),
+        width_max=_f("wHi"),
         plate_diameter=_f("plateD"),
         margin=_f("margin"),
         min_filler_size=_f("minSeed"),
@@ -910,7 +1220,12 @@ def generate_final(params, arrange_id, out_dir, media_base):
     # Re-derive the ORIGINAL layout (deterministic given the same seeds + params).
     # Apply the SAME exclude filter the run used (user excludes + the occupied seeds
     # frozen into occupiedExclude at job creation) so the re-pack reproduces it exactly.
-    blocks = load_blocks_from_db(shape_set, square_tol, batches)
+    # The SAME seed-width band the run was generated with, or the re-pack builds
+    # a different pool and every seat shifts — the finalized image would then
+    # disagree with the arrangement it claims to show. The band lives in the
+    # stored job params for exactly this reason.
+    blocks = load_blocks_from_db(shape_set, square_tol, batches,
+                                 w_lo=_opt_num(params, "wLo"), w_hi=_opt_num(params, "wHi"))
     exclude_raw = ((params.get("exclude") or "") + " " + (params.get("occupiedExclude") or "")).replace(",", " ").split()
     if exclude_raw:
         excluded = {s.strip() for s in exclude_raw if s.strip()}

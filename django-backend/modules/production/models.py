@@ -140,6 +140,12 @@ class SeedArrange(models.Model):
     square_tol = models.DecimalField(max_digits=9, decimal_places=3, null=True, blank=True, db_column="SquareTol")
     thickness_min = models.DecimalField(max_digits=9, decimal_places=3, null=True, blank=True, db_column="ThicknessMin")
     thickness_max = models.DecimalField(max_digits=9, decimal_places=3, null=True, blank=True, db_column="ThicknessMax")
+    # Seed-width band the run was generated with, in mm — the SHORT side of a
+    # seed (see engine_runner.seed_width). NULL at either end means "unbounded
+    # on that end", which is also what every row written before the criteria
+    # form gained these fields carries.
+    width_min = models.DecimalField(max_digits=9, decimal_places=3, null=True, blank=True, db_column="WidthMin")
+    width_max = models.DecimalField(max_digits=9, decimal_places=3, null=True, blank=True, db_column="WidthMax")
     plate_diameter = models.DecimalField(max_digits=9, decimal_places=2, null=True, blank=True, db_column="PlateDiameter")
     margin = models.DecimalField(max_digits=9, decimal_places=2, null=True, blank=True, db_column="Margin")
     min_filler_size = models.DecimalField(max_digits=9, decimal_places=2, null=True, blank=True, db_column="MinFillerSize")

@@ -297,6 +297,49 @@ def _mixed_landscape(blocks):
     items.sort(key=lambda d: -d["h"])
     return items
 
+# SEED-SIZE OPTIMISATION — biggest seeds in the middle of the plate, smallest
+# toward the rim.
+#
+# The VERTICAL half of that rule was already here and is untouched:
+# _mixed_landscape sorts the queue tall-first and rows are laid centre-out, so
+# the tallest seeds settle into the middle rows and the short ones end up in the
+# shallow rows against the rim.
+#
+# What was missing is the HORIZONTAL half. Within a row, seeds were laid in
+# whatever order the queue happened to hand them over, so a row could read
+# 4-13-6-12-5 across the plate. _centre_out_row re-orders each row into an
+# "organ pipe": widest in the middle, tapering to the narrowest at both chord
+# ends.
+#
+# This is a REORDER and nothing else. The row keeps the same seeds, the same
+# height (rhh = max h, unchanged by permutation) and the same total width, and
+# it is still centred on x = 0 — so it occupies the identical x-interval and
+# every chord/overlap property the packer relies on is preserved by
+# construction. No seed is added, dropped, resized or rotated.
+CENTRE_OUT_ROWS = True
+
+
+def _centre_out_row(row):
+    """Order one row widest-in-the-middle, narrowest at the two ends.
+
+    Sort widest first, then deal alternately to the right and left of centre and
+    read the row back out left-to-right. The two widest seeds end up adjacent in
+    the middle and each successive pair steps outward, which is the arrangement
+    the shop floor asks for: the big stones where the plate is fullest and the
+    small ones where it curves away.
+
+    Ties are broken by the seed's own height so the result is deterministic —
+    `generate_final` re-packs a saved run to redraw it, and two runs of the same
+    pool must lay out identically or the finalized image would not match the
+    arrangement it claims to show.
+    """
+    ordered = sorted(row, key=lambda b: (-b["w"], -b["h"], str(b.get("stock", ""))))
+    left, right = [], []
+    for i, b in enumerate(ordered):
+        (right if i % 2 == 0 else left).append(b)
+    return left[::-1] + right
+
+
 def _mixed_one_plate(queue):
     """Build ONE center-out mixed plate, popping the seeds it uses off `queue`
     (mutated in place). Each row spans the FULL circle chord at its height and is
@@ -348,6 +391,8 @@ def _mixed_one_plate(queue):
             break
     placed = []
     for r, yb, rhh in rows:
+        if CENTRE_OUT_ROWS:
+            r = _centre_out_row(r)               # widest seeds to the middle
         tw = sum(b["w"] for b in r) + c * (len(r) - 1); x = -tw / 2   # center row; `c` gap between seeds
         for b in r:
             placed.append({**b, "x": x, "y": yb}); x += b["w"] + c

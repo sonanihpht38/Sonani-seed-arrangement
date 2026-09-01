@@ -23,6 +23,7 @@ from matplotlib.collections import PatchCollection
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 import pack_v2 as P
+import parallel_pack as _parallel
 
 
 def _largest_rect(free, n, mind):
@@ -292,36 +293,168 @@ def guillo_plate_job(args):
     return (pi, placed, round(fill, 4), round(span, 4), 0.0)
 
 
-def _draw_plate_numbers(ax, items):
-    """Label each seat on the plate with just a NUMBER (or D-number) — bold with a dark
-    halo so it stays readable in any seat size / fill colour. items = list of
-    (label, lx, ly, area, color)."""
+def cw_degrees(deg):
+    """Stored rotation -> the CLOCKWISE angle the floor should actually turn.
+
+    Every pose in this engine is produced by `shapely.affinity.rotate`, which
+    turns COUNTER-clockwise for a positive angle. The shop floor works
+    clockwise, so a stored 90 means "turn it 270 degrees clockwise" — printing
+    the stored number on the plate would send the operator the wrong way round
+    and land a cut corner facing the wrong side.
+
+    Display only. Nothing in the packing reads this.
+    """
+    try:
+        d = float(deg or 0.0)
+    except (TypeError, ValueError):
+        return 0
+    return int(round((-d) % 360.0)) % 360
+
+
+def display_turn(p):
+    """The CLOCKWISE turn to show for one placed seed.
+
+    A CUT seed has four distinct orientations and every one of them matters —
+    which way the ground corner points is the whole question — so its angle is
+    reported as-is.
+
+    A plain rectangle does not: turning it 180 degrees leaves the identical
+    footprint, so 270 and 90 are the same instruction. Reporting 270 there is
+    not more precise, it is more confusing — the operator does a three-quarter
+    turn to reach a position a quarter turn would have given. Rectangles are
+    therefore folded onto 0 or 90.
+    """
+    cw = cw_degrees(p.get("angle"))
+    return cw if p.get("irregular") else cw % 180
+
+
+def band_caption():
+    """One line naming the THICKNESS and SEED-WIDTH bands the run used.
+
+    Read off the engine globals set by engine_runner._apply_globals, so the
+    caption always describes the run that produced the image rather than
+    whatever the reader assumes. A width band is optional at both ends, so it is
+    reported as a range, a bound, or "any".
+    """
+    lo = getattr(P, "W_LO", None)
+    hi = getattr(P, "W_HI", None)
+    if lo is None and hi is None:
+        width = "any"
+    elif lo is not None and hi is not None:
+        width = f"{lo:g}–{hi:g} mm"
+    elif lo is not None:
+        width = f"≥ {lo:g} mm"
+    else:
+        width = f"≤ {hi:g} mm"
+    return (f"thickness {getattr(P, 'T_LO', 0):g}–{getattr(P, 'T_HI', 0):g} mm"
+            f"  ·  seed width {width}")
+
+
+# Smallest seat, in mm2, that a rotation label is drawn inside. Below this the
+# text is wider than the stone and overlaps its neighbours, which makes the plate
+# harder to read rather than easier — those seeds carry their angle in the seed
+# list beside the plate instead, where every seed appears whatever its size.
+ANGLE_LABEL_MIN_MM2 = 45.0
+
+
+def _draw_plate_numbers(ax, items, angles=None):
+    """Label each seat with its NUMBER — bold with a dark halo so it stays
+    readable in any seat size / fill colour. items = list of
+    (label, lx, ly, area, color).
+
+    `angles`, when given, is a parallel list of CLOCKWISE degrees; a seat big
+    enough to hold it also gets its turn printed under the number, so the floor
+    can read the intended orientation straight off the plate.
+    """
     halo = [pe.withStroke(linewidth=2.6, foreground="#0d0d0dee")]
-    for label, lx, ly, area, color in items:
+    for i, (label, lx, ly, area, color) in enumerate(items):
         fs = min(14.0, max(8.0, math.sqrt(max(area, 1.0)) * 0.7))
-        ax.text(lx, ly, label, ha="center", va="center", fontsize=fs,
+        cw = angles[i] if angles is not None and i < len(angles) else None
+        if cw is None or area < ANGLE_LABEL_MIN_MM2:
+            ax.text(lx, ly, label, ha="center", va="center", fontsize=fs,
+                    color=color, fontweight="bold", zorder=3, path_effects=halo)
+            continue
+        # Number above, turn below, so neither has to shrink to fit the other.
+        ax.text(lx, ly + fs * 0.030, label, ha="center", va="bottom", fontsize=fs,
                 color=color, fontweight="bold", zorder=3, path_effects=halo)
+        ax.text(lx, ly - fs * 0.030, f"↻{cw}°", ha="center", va="top",
+                fontsize=max(5.0, fs * 0.62), color=color, fontweight="bold",
+                zorder=3, path_effects=halo)
+
+
+# SEED LIST GEOMETRY. The list used to be one column however long it was, and a
+# column cannot grow past the height of the page: a Ø158 plate carries 138 seeds
+# into a 9.6 inch panel, which is a 0.07 inch row pitch under a 5.5 pt font, so
+# the rows printed on top of each other and the list was unreadable. Nothing
+# about that is specific to Ø158 — it is purely the seed COUNT, so any plate
+# reaches it once enough seeds fit, and a bigger plate reaches it sooner.
+#
+# The row pitch is therefore fixed and the list flows into as many columns as it
+# needs, with the panel widened to hold them. Legibility then does not depend on
+# the plate diameter, the seed count, or the band.
+LEGEND_MIN_ROW_IN = 0.16    # inches — row pitch that keeps ~8 pt text clear
+# Width one column needs. A seed row runs about 40 characters — "DOMI001169
+# 14.35x10.35  H 0.73  turn 0deg" — and DejaVu Sans averages ~0.6 em per
+# character, so at the ~7 pt this pitch yields the text alone wants 2.3 inches,
+# plus the swatch and the number field. 2.8 was measured too tight: the trailing
+# angle of one column printed over the next column's number.
+LEGEND_COL_IN = 3.4
+LEGEND_MIN_PANEL_IN = 5.0   # inches — never narrower than the original panel
+
+
+def _legend_shape(n, panel_h_in):
+    """(columns, rows per column) for `n` seed-list rows in a panel that tall."""
+    n = max(int(n), 1)
+    per_col = max(1, int(panel_h_in / LEGEND_MIN_ROW_IN))
+    ncols = max(1, int(math.ceil(n / float(per_col))))
+    # Re-balance so the last column is not a stub — 138 over 2 columns is 69
+    # each, not 71 and 67.
+    return ncols, int(math.ceil(n / float(ncols)))
+
+
+def _legend_panel_in(n, panel_h_in):
+    """How wide the seed-list panel has to be to hold `n` rows legibly."""
+    ncols, _ = _legend_shape(n, panel_h_in)
+    return max(LEGEND_MIN_PANEL_IN, ncols * LEGEND_COL_IN)
 
 
 def _draw_legend_list(axl, title, subtitle, entries):
     """Draw the seed list beside the plate. entries = list of
-    (swatch_color, swatch_edge, number_text, description_text, text_color)."""
+    (swatch_color, swatch_edge, number_text, description_text, text_color).
+
+    Flows into columns rather than growing one column past the page — see
+    LEGEND_MIN_ROW_IN. The caller sizes the panel with _legend_panel_in() so the
+    columns have somewhere to go.
+    """
     axl.axis("off"); axl.set_xlim(0, 1); axl.set_ylim(0, 1)
     axl.text(0.0, 0.995, title, fontsize=12, fontweight="bold", va="top")
     top = 0.955
     if subtitle:
         axl.text(0.0, 0.965, subtitle, fontsize=8.5, va="top", color="#7a3d00")
-        top = 0.925
+        # Give the list back one line's worth of room per EXTRA subtitle line,
+        # or a two-line subtitle prints straight over the first few seeds.
+        top = 0.925 - 0.022 * subtitle.count("\n")
     n = max(len(entries), 1)
     bot = 0.005
-    rh = (top - bot) / n
-    lfs = min(8.6, max(5.5, 190.0 / n))
+    panel_h = float(axl.figure.get_size_inches()[1])
+    ncols, per_col = _legend_shape(n, panel_h * (top - bot))
+    rh = (top - bot) / per_col
+    # Size the text from the pitch it actually has, not from the seed count. The
+    # old `190 / n` bottomed out at its floor on any long list and then said
+    # nothing about whether the rows had room.
+    lfs = min(8.6, max(5.5, rh * panel_h * 72.0 * 0.55))
+    colw = 1.0 / ncols
     for i, (color, edge, num, text, tcolor) in enumerate(entries):
-        y = top - (i + 0.5) * rh
-        axl.add_patch(Rect((0.005, y - rh * 0.34), 0.045, rh * 0.68, facecolor=color,
-                      edgecolor=edge, lw=1.0, transform=axl.transAxes, clip_on=False))
-        axl.text(0.065, y, num, fontsize=lfs, va="center", fontweight="bold")
-        axl.text(0.135, y, text, fontsize=lfs, va="center", color=tcolor)
+        c, r = divmod(i, per_col)
+        x0 = c * colw
+        y = top - (r + 0.5) * rh
+        axl.add_patch(Rect((x0 + 0.005 * colw / 1.0, y - rh * 0.34), 0.045 * colw,
+                      rh * 0.68, facecolor=color, edgecolor=edge, lw=1.0,
+                      transform=axl.transAxes, clip_on=False))
+        # The number field has to clear a THREE digit seat number: a Ø158 plate
+        # numbers past 100, and at 0.135 "150." ran into the stock code.
+        axl.text(x0 + 0.060 * colw, y, num, fontsize=lfs, va="center", fontweight="bold")
+        axl.text(x0 + 0.165 * colw, y, text, fontsize=lfs, va="center", color=tcolor)
 
 
 def render_enhanced_circle(placed, real, pi, R, fill, path):
@@ -337,15 +470,18 @@ def render_enhanced_circle(placed, real, pi, R, fill, path):
     margin = max(0.0, PLATE / 2.0 - R)
     seed_gap = max(0.0, float(getattr(P, "CLEARANCE", 0.0) or 0.0))
     nr = len(placed)
-    n_clip = sum(1 for p in placed if p.get("clipped"))
     cmap = plt.cm.viridis
     facecolors = [cmap(i / max(1, nr - 1)) for i in range(nr)]
 
     # Two panels: the plate (each seed labelled with a NUMBER only, so it stays readable in
     # any seat) and, beside it, a full seed LIST — a colour swatch matching the seat plus the
     # stock, size, thickness, and (for trimmed seeds) how much was cut off.
-    fig = plt.figure(figsize=(14.5, 9.6))
-    gs = fig.add_gridspec(1, 2, width_ratios=[9.6, 5.0], wspace=0.02)
+    # Widen the panel for the seed list rather than squeezing the list into a
+    # fixed one — see LEGEND_MIN_ROW_IN. The plate panel keeps its 9.6 inches,
+    # so the plate itself renders exactly as before at every diameter.
+    _lw = _legend_panel_in(len(placed), 9.6 * 0.92)
+    fig = plt.figure(figsize=(9.6 + _lw, 9.6))
+    gs = fig.add_gridspec(1, 2, width_ratios=[9.6, _lw], wspace=0.02)
     ax = fig.add_subplot(gs[0, 0])
     axl = fig.add_subplot(gs[0, 1]); axl.axis("off")
 
@@ -375,9 +511,13 @@ def render_enhanced_circle(placed, real, pi, R, fill, path):
         linewidths = [1.4 if p.get("clipped") else 1.0 for p in placed]
         ax.add_collection(PatchCollection([MplPoly(p["poly"], closed=True) for p in placed],
                           facecolor=facecolors, edgecolors=edgecolors, linewidths=linewidths, zorder=2))
-    # NUMBER each seat (1..N) — a number fits any seat size.
+    # NUMBER each seat (1..N) — a number fits any seat size — plus the CLOCKWISE
+    # turn for seats large enough to carry it. Reference only: the angle is read
+    # back from the placement the packer already chose, never used to compute it.
+    _cw = [display_turn(p) for p in placed]
     _draw_plate_numbers(ax, [(str(i + 1), p.get("lx"), p.get("ly"),
-                              p.get("area", p["w"] * p["h"]), "white") for i, p in enumerate(placed)])
+                              p.get("area", p["w"] * p["h"]), "white") for i, p in enumerate(placed)],
+                        angles=_cw)
     lim = PLATE / 2 + 3
     ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim); ax.set_aspect("equal"); ax.axis("off")
     circle_area = math.pi * R * R
@@ -389,7 +529,11 @@ def render_enhanced_circle(placed, real, pi, R, fill, path):
         f"Max Coverage · Plate {pi:02d} · {covered:.0f} of {circle_area:.0f} mm² covered "
         f"({fill:.1f}%)\n"
         f"plate Ø{PLATE:g} · margin {margin:g} mm → usable Ø{2 * R:g} · "
-        f"distance between seeds {seed_gap:g} mm",
+        f"distance between seeds {seed_gap:g} mm\n"
+        # Which BANDS produced this plate. Without them two plates of the same
+        # inventory are indistinguishable on paper, and the band is now the main
+        # control the operator sets.
+        f"{band_caption()}",
         fontsize=10.5)
 
     # ---- seed list on the right ----
@@ -412,14 +556,20 @@ def render_enhanced_circle(placed, real, pi, R, fill, path):
         # Exact stored measurement (decimal(18,2)) — no round-off, trailing zeros trimmed.
         sdw = f"{float(dw):.2f}".rstrip("0").rstrip(".")
         sdh = f"{float(dh):.2f}".rstrip("0").rstrip(".")
+        # Every seed's CLOCKWISE turn, including the small rim stones whose seat
+        # is too tight to carry the label on the plate itself.
         entries.append((facecolors[i], "#e67e22" if i in trimmed else "#555", f"{i + 1}.",
-                        f"{p['stock']}   {sdw}×{sdh}   H {p['H']:.2f}{cut}", tcolor))
+                        f"{p['stock']}   {sdw}×{sdh}   H {p['H']:.2f}   ↻{_cw[i]}°{cut}", tcolor))
     # The old subtitle counted trimmed seeds and is now permanently zero, so it
     # said nothing. Report the settings the reader actually needs instead.
     _draw_legend_list(
         axl, f"Seeds on this plate ({nr})",
-        f"all placed whole (nothing cut) · {seed_gap:g} mm between seeds"
-        if seed_gap > 0 else "all placed whole (nothing cut) · seeds touching",
+        ("all placed whole (nothing cut) · "
+         + (f"{seed_gap:g} mm between seeds" if seed_gap > 0 else "seeds touching")
+         # Say which way ↻ means, once, where the angles are listed. A number
+         # with no stated direction is worse than none: half the time it is read
+         # the wrong way round.
+         + "\n↻ = turn CLOCKWISE from the seed as measured"),
         entries)
 
     fig.savefig(path, dpi=125, bbox_inches="tight")
@@ -462,7 +612,7 @@ def _cut_direction(g):
 
 
 def _cut_on_rim(g, R):
-    """Is this placed cut/trimmed stone actually ON the rim?
+    """Is this placed cut/trimmed stone actually ON the rim, facing OUT?
 
     ONE test, used everywhere a cut stone can be seated, so no path can put one
     inland. A row REBUILD is such a path and was missing it: swap_row and
@@ -472,14 +622,37 @@ def _cut_on_rim(g, R):
     test passes there, because a notch facing open plate is not clipped by the
     boundary, so nothing caught it.
 
-    Both halves matter: the stone has to be within RIM_FLUSH of the boundary, and
-    the corner it is missing must not open into the plate by more than
-    CUT_NOTCH_MAX.
+    THREE halves matter, and the third was missing until a real plate showed it:
+
+      * the stone has to be within RIM_FLUSH of the boundary;
+      * the corner it is missing must not open into the plate by more than
+        CUT_NOTCH_MAX;
+      * the corner must POINT OUTWARD, away from the plate centre.
+
+    The direction test is not a refinement of the notch test — a small ground
+    corner turned inward passes the notch test outright. The corner triangles in
+    stock run a median 2.22 mm2 against a CUT_NOTCH_MAX of 3.0, so most cut
+    stones could sit at the rim with the cross facing IN and nothing objected.
+    The main scan in _pack_once has always tested the direction inline
+    (`out > 0.0`), but the three paths that seat a stone WITHOUT going through
+    that scan — _fill_row_ends, _fill_remaining_space and the row rebuilds — all
+    came here instead, and this function did not. That is how two inward-facing
+    crosses reached a finished Ø90 plate.
+
+    A cross pointing inward is not a cosmetic defect: the missing corner opens a
+    wedge against a flat neighbour that no stone can enter, and the shop floor
+    rejects the seat. Outward it follows the curve the stone was ground for and
+    costs nothing.
     """
     from shapely.geometry import Point
 
     gap = R - max(math.hypot(px, py) for px, py in g.exterior.coords)
     if gap > RIM_FLUSH:
+        return False
+    # `g` is already in plate coordinates, so its cut direction needs no further
+    # rotation — score it as placed (deg = 0).
+    cut = _cut_direction(g)
+    if cut is not None and _outward_score(g, cut, 0) < CUT_OUTWARD_MIN:
         return False
     return _wasted_area(g, Point(0.0, 0.0).buffer(R, resolution=180)) <= CUT_NOTCH_MAX
 
@@ -826,17 +999,741 @@ SWEEP_ROW_TOL = 0.6
 # ROW_END_STEP is how finely a stone is slid along a row baseline looking for a
 # corner seat; ROW_END_ROUNDS caps how many it may add.
 ROW_END_STEP = 0.25
-ROW_END_ROUNDS = 6
+# How many row-end seats this pass may add. A BUDGET, not a target: the pass
+# stops early when it runs out of seats it can legally fill.
+#
+# Held at the validated 6. It was briefly raised to 12 after measuring that the
+# cap was binding on a wide band (63 -> 68 seats, 90.52% -> 91.20%), and that
+# was the wrong trade: the extra seats are small stones dotted along the rim,
+# which is precisely the appearance the shop floor rejected. Coverage is not the
+# objective — a buildable, uniform plate is. See ROW_END_MIN_HEIGHT_FRAC.
+#
+# Back up to 20 now that the seats this pass finds are constrained on quality
+# rather than on count. When it was raised to 12 before, the only limit on a
+# seat was that it fitted, so a bigger budget bought more scattered stones and
+# the plate got worse. Two rules now decide admission instead —
+# ROW_END_MIN_HEIGHT_FRAC (how big a step the seat leaves) and ROW_END_MAX_GAP
+# (whether it is attached to its row at all) — so the budget can go back to
+# being a runaway guard rather than the thing shaping the plate.
+ROW_END_ROUNDS = 20
+
+# How tall a row-end stone must be relative to the ROW it joins, as a fraction.
+#
+# This pass exists to reach the trapezoid corners a full-height row cannot, so
+# the stone it seats is legitimately SHORTER than its row — but there is a limit
+# past which the result stops looking like a row with a corner filled and starts
+# looking like debris swept against the rim. A 2.4 mm stone at the end of an
+# 11.3 mm row leaves a 9 mm step; on the plate that reads as a gap with a chip in
+# it, and the floor will not build it.
+#
+# Measured on the rejected Ø90 wide-band plate, the row-end stones were 3.91,
+# 2.41, 4.94, 4.83, 3.40 and 2.41 mm against rows of 11.29, 10.35, 10.23, 10.23,
+# 6.44 and 6.44 mm — ratios of 0.35, 0.23, 0.48, 0.47, 0.53 and 0.37.
+#
+# 0.45 rather than the 0.60 first tried. A row END is a TRAPEZOID: the row is
+# bounded by its narrow outer edge, so the space beyond the last stone is a
+# triangle that is only tall enough for a shorter stone. Measured on the current
+# Ø90 plate, the eight rows leave 1.6, 7.6, 8.8, 12.1, 12.1, 12.7, 13.4 and
+# 29.7 mm of chord unused at their ends — that is where the plate's remaining
+# 13% lives, and a 0.60 floor refuses almost every stone that could reach it.
+#
+# The height ratio alone was never the thing that made the rejected plate look
+# wrong, either. What made it look wrong was stones sitting apart from anything,
+# which is what ROW_END_MAX_GAP now governs. Ratio controls how big a STEP the
+# seat leaves; the gap rule controls whether it reads as attached at all.
+ROW_END_MIN_HEIGHT_FRAC = 0.45
+
+# How far a row-end stone may finish from the row it is filling beside, in mm.
+#
+# This is the rule that separates "the corner of a row is filled" from "there is
+# debris against the rim". A stone tucked hard against the last seed of its row
+# reads as part of that row however much shorter it is; the same stone sitting
+# 3 mm out with a channel behind it reads as a loose chip, and the channel is
+# unfillable besides.
+#
+# The pass already applied exactly this rule to CUT stones (ROW_END_CUT_GAP,
+# 1.0 mm) with the reasoning that a stone which cannot nest in "holds a seat open
+# and leaves a channel nothing can fill". That is just as true of a whole stone;
+# it simply was not enforced, so whole stones were free to land anywhere the
+# sweep first found room. Applying it to every stone is what lets the height
+# ratio be relaxed without the plate degenerating again.
+ROW_END_MAX_GAP = 1.0
+
+# The RESIDUAL fill — a final sweep for any pocket a real seed still fits,
+# without requiring it to line up with a row at all.
+#
+# OFF. It is the single largest source of both the appearance the floor rejected
+# and the generation time users complain about, and it loses on both counts at
+# once. Measured on the live Ø90 pool, band 2-12 mm:
+#
+#                              seats   fill%    plate structure        time
+#   row sweep only             49      86.25    9 rows, 0.18 mm spread  715 s
+#   + row-end + residual       63      90.52    16 baselines, 6 of      +620 s
+#                                               them a single stone
+#
+# The 4.27 points it adds are 14 small stones scattered around the rim as
+# isolated blobs — its own docstring says it "does NOT require the additional
+# seed to match an existing row height", which is exactly the property that
+# makes a plate unbuildable. And it costs as much wall-clock as the entire
+# 20-pack search that produced the good plate.
+#
+# Left in place rather than deleted: the pocket search is sound work and could
+# be reused if it is taught row discipline. Turning it on again needs a plate
+# rendered and looked at, not a coverage number.
+RESIDUAL_FILL = False
 ROW_END_NEST = 0.02       # mm — how finely the seat is slid back to touch
-# A row-end seat is laid ON its row's baseline and nowhere else. Offsetting it by
-# hundredths to squeeze past a protruding neighbour was tried and is worse: it
-# splits one row into two baselines a tenth of a millimetre apart, which reads as
-# a broken row. The protrusion is prevented in the sweep-up pass instead.
-ROW_END_LIFTS = (0.0,)
+# A row-end seat is laid FLUSH WITH ONE OF ITS ROW'S TWO EDGES, and nowhere
+# between them. Offsetting it by hundredths to squeeze past a protruding
+# neighbour was tried and is worse: it splits one row into two baselines a tenth
+# of a millimetre apart, which reads as a broken row. The protrusion is prevented
+# in the sweep-up pass instead.
+#
+# Which edge matters enormously, and trying only the baseline is why this pass
+# found nothing on the lower half of the plate. A row-end gap is a TRIANGLE, and
+# it is widest at the row's INNER edge — the side nearer the plate centre, where
+# the chord is longest. For a row above centre that is its baseline; for a row
+# BELOW centre it is its top, and probing the baseline there probes the one part
+# of the wedge with no room in it.
+#
+# Measured on the Ø80 usable plate, room for a 4 mm stone at each row end:
+#
+#   row y     bottom-flush   top-flush
+#   -37.50      0.22 mm      10.22 mm
+#   -28.06     -0.69 mm       4.45 mm    (baseline has NO room at all)
+#   -17.62      0.21 mm       2.98 mm
+#    -6.18      0.57 mm       0.82 mm
+#    +4.25      3.74 mm       1.47 mm    <- above centre, baseline wins
+#   +15.51      4.37 mm       0.05 mm
+#   +25.76      2.18 mm      -5.20 mm
+#
+# So both are tried and the seat scoring picks between them. A top-flush stone is
+# not a floating one: its top edge lies on the line the NEXT ROW starts from, so
+# the row above rests on it and the eye reads one continuous seam.
+ROW_END_LIFTS = (0.0,)          # kept: the baseline is always one of the candidates
+
+
+def _row_end_lifts(rh, h):
+    """Flush positions for a stone of height `h` in a row-end gap `rh` tall.
+
+    Always the row's baseline, plus the top-flush position when the stone is
+    genuinely shorter than the gap. Never anything between the two.
+    """
+    lifts = [0.0]
+    top = rh - h
+    if top > 1e-6:
+        lifts.append(top)
+    return lifts
 # Widest channel a rim-seated CUT stone may leave between itself and its row.
 # It cannot be nested in without coming off the rim, so beyond this the seat is
 # better given to a whole stone that can close up.
 ROW_END_CUT_GAP = 1.0
+
+# CENTRE-TO-OUTER SEED SIZING for Max Coverage: bias tall height classes toward
+# the middle rows of the plate and short ones toward the rim.
+#
+# 0.0 = OFF, and off is the shipped default. Read the note in pick_level() before
+# raising it: ranking classes by height was already tried there and LOST coverage
+# on every pool measured (86.44% -> 83.94% on the 163-stone pool), because
+# draining the tall classes a row at a time leaves no class able to cover a
+# chord. This knob is not that change — it only shifts the preference by WHERE
+# the row sits, and leaves the "can this class finish the chord" gate untouched —
+# but it is the same family, so it does not go on without numbers behind it.
+#
+# The Arrange packer gets centre-out sizing unconditionally (see
+# pack_v2._centre_out_row); there it is a pure reorder within a row and cannot
+# cost anything. Here it changes which stones are picked, so it must be paid for.
+#
+# MEASURED INERT — do not expect this knob to do anything, and do not raise it
+# hoping for a centre-to-outer gradient. It was added when the outward-cross rule
+# was still `out > 0.0`, and against THAT broken baseline it appeared to gain
+# 0.69 points. Once CUT_OUTWARD_MIN was fixed the apparent gain vanished:
+#
+#   band     bias   seats   fill%    inner mm2   outer mm2   ratio
+#   8-12     0.0    35      85.01    123.3       108.5       1.14
+#   8-12     3.0    35      85.01    123.3       108.5       1.14   identical
+#   2-12     0.0    63      90.52    112.9        30.4       3.72
+#   2-12     3.0    63      90.52    112.9        30.4       3.72   identical
+#
+# The lever that actually produces the gradient is the SEED-WIDTH BAND on the
+# criteria form. Widening it from 8-12 to 2-12 moves the inner/outer area ratio
+# from 1.14 to 3.72 and coverage from 85.01% to 90.52%, because the row-height
+# census in pick_level then HAS short classes to open the narrow rim rows with.
+# Starve it of small stones and no ranking bias can invent them; give it them and
+# it sorts them outward on its own. That is why the band is the user-facing
+# control and this is not.
+#
+# Kept, not deleted, because the pick_level ranking it hooks into is pool
+# dependent and a different inventory could make it bite. If you do turn it on,
+# measure against the current default first — and remember the 2026-08-15
+# physical validation was run at 0.0.
+CENTRE_SIZE_BIAS = 0.0
+
+# CENTRE-TO-OUTER SIZE GRADIENT, second attempt — the one that can actually move
+# the ranking. How wide a band counts as "equally suited to this row", as a
+# FRACTION of the height span the pool actually offers; 0.0 = OFF.
+#
+# WHY CENTRE_SIZE_BIAS CANNOT DO THIS. It adds its term to `stock`, and `stock`
+# is a total stocked WIDTH in mm, so the two are not the same size of number.
+# Measured on the live Ø70 feed, 236 stones, band 7-12, at a rim row (chord
+# 11.5 mm) every one of the 15 classes clears `fits` — the 7.00 class holds
+# 37.8 mm against an 11.5 mm chord — and the ranking still goes to class 9.40 on
+# 193.6 mm of stock. Second place is 86.9 mm, a gap of 106.7 mm, while
+# CENTRE_SIZE_BIAS at 3.0 can move a class by at most 18.4 mm. It is an order of
+# magnitude short, which is exactly why it measured byte-identical.
+#
+# The small classes are not being REFUSED, they are being out-stocked, and they
+# are out-stocked at the rim by the same margin as at the centre. That is the
+# whole defect: one best-stocked class wins every row whatever its position, so
+# the plate comes out of a single size with no gradient and no mixture. On the
+# Ø70 7-12 plate nothing under 9.42 mm was placed although 132 of the 236 stones
+# are smaller than that.
+#
+# WHAT THIS DOES. Among the classes that already pass `fits`, prefer the one
+# whose height suits WHERE the row sits: the tallest fitting class at the middle
+# of the plate, the shortest at the rim, interpolated in between. Classes within
+# the tolerance of that target tie, and `stock` breaks the tie exactly as it does
+# today — so the anti-fragmentation property that ranking buys is kept, and only
+# the choice BETWEEN equally-well-stocked-enough classes changes.
+#
+# WHY A FRACTION AND NOT MILLIMETRES. This shipped as an absolute 1.5 mm and that
+# was a latent bug, not a tuning choice: the TARGET is interpolated across the
+# span the pool offers, so comparing it against a fixed millimetre count means
+# the rule changes character whenever the stock does. Measured, on Ø90:
+#
+#   pool                       span     best tol   as a fraction
+#   old, width 7.01-11.44      4.43 mm  1.5 mm     34%
+#   new, width 7.00-9.91       2.91 mm  1.0 mm     34%
+#
+# The same fraction, a different number of millimetres. Left at 1.5 mm the new
+# inventory ran at 52% of its span, which ties over half the classes at every
+# row, hands the decision back to `stock`, and lands WORSE than switching the
+# gradient off — 43 seats/85.66% against 44/86.35% off and 47/87.21% at 34%.
+# A fixed millimetre value has to be re-measured against every new inventory;
+# a fraction does not, which is the whole point.
+#
+# Bounded below by LEVEL_BAND so the tolerance can never be finer than the census
+# can resolve, and disabled outright when the span is one band or less — with a
+# single height in play there is nothing to grade.
+#
+# `fits` stays the primary key and is untouched. A class that cannot finish the
+# chord still never opens the row, which is the gate that stops the tall classes
+# being drained a row at a time — the failure mode documented in pick_level().
+#
+# VALIDATED ON EVERY SUPPORTED PLATE SIZE before being turned on, band 7-12,
+# 236-stone pool, against the ranking that preceded it:
+#
+#   plate   seats            fill%              radius/size corr   classes used
+#   Ø70     18 -> 22         79.47 -> 81.80     +0.025 -> -0.640    3 -> 8
+#   Ø90     36 -> 38         83.96 -> 86.16     -0.315 -> -0.338    ? -> 8
+#   Ø158    150 -> 155       90.01 -> 90.61     -0.251 -> -0.344    ? -> 24
+#
+# Seats up and coverage up on all three, the correlation negative on all three
+# (bigger toward the middle), and the plate drawn from many classes instead of
+# one. The Ø70 plate had been using NOTHING under 9.42 mm; it now runs 7.03 to
+# 10.44 across 8 classes.
+#
+# The response is NOT monotonic in the fraction — on the old pool at Ø90, 23%
+# gave 35 seats/83.06% and 45% gave 34/84.34%, both regressions, while 34% gave
+# 38/86.16%. So this is still a measured value and not a free parameter: re-run
+# the three-size validation before moving it. What it no longer needs is
+# re-measuring for every new INVENTORY, which is what the millimetre form did.
+#
+# WHAT IT DOES NOT FIX: the horizontal bands between rows on Ø158. Those come
+# from stones being shorter than the row they sit in, and the gradient slightly
+# WORSENS that measure (229 -> 249 mm2 lost to height mismatch, worst spread
+# 2.11 -> 3.82 mm) even as it cuts total empty plate from 1719 to 1615 mm2. It
+# buys more seats and more coverage, not flusher rows. Closing those bands is a
+# row-height-discipline change and is still open.
+SIZE_GRADIENT_FRAC = 0.34
+
+# HOW FAR OUTWARD a ground corner must actually point, as the cosine of the
+# angle between the cut direction and the radius through the stone.
+#
+#   1.00  straight out along the radius
+#   0.71  45 degrees off
+#   0.50  60 degrees off
+#   0.00  exactly tangential — the cut points ALONG the rim, not through it
+#
+# The rule used to be `out > 0.0`, which is not "facing outward" but merely "not
+# facing inward". A stone scoring +0.06 has its cross within four degrees of
+# tangential: on the plate it reads as a notch in the side of the row, and the
+# floor rejects it exactly as it rejects an inward one. Two of the four cut
+# stones on the reported Ø90 plate passed at +0.060 and +0.543.
+#
+# Set from the plate, not picked round. Measured on the live Ø90 pool, seed
+# width 8-12 mm, 202 stones of which 82 are cut, CENTRE_SIZE_BIAS 3.0:
+#
+#   min    seats   fill%    cut used   worst outward on the plate
+#   0.00   34      84.27    4          0.060   <- tangential, the reported defect
+#   0.35   35      85.01    4          0.603
+#   0.50   35      85.01    4          0.603
+#   0.71   34      84.01    0          none placed — too strict to satisfy
+#
+# 0.50 was the first fix and was NOT enough. It admits a cross 60 degrees off
+# radial, and on the Ø90 2-12 mm plate one stone (DOMI002072) sat at +0.531 while
+# every other cut stone scored 0.918 or better. At a glance it reads as facing
+# sideways, and the floor rejected it exactly as it rejects an inward one — the
+# distribution is bimodal, so a threshold in the middle of the gap admits the
+# outlier and nothing else.
+#
+# Re-measured on the Ø90 pool, band 2-12 mm, with the residual pass off:
+#
+#   min    seats   fill%    cut used   worst cross on the plate
+#   0.50   51      86.63    4          +0.531   <- the reported defect
+#   0.70   46      87.58    3          +0.934
+#
+# 0.70 costs one cut stone and BUYS coverage (86.63 -> 87.58): the rim seat that
+# stone was holding goes to a whole stone that fits it better. An earlier sweep
+# found 0.71 unusable, but that was on the 8-12 mm band where only four cut
+# stones existed at all; on a band that carries the small cut stock it is
+# comfortably satisfiable.
+CUT_OUTWARD_MIN = 0.70
+
+
+# RIM POCKET FILL — the last pass, after the rows and the row ends are settled.
+#
+# What is left at that point is the crescent between the outermost stones and the
+# rim, broken into small pockets. Measured on the accepted Ø90 2-12 mm plate:
+# 546 mm2 across the ring, of which eight pockets can each take a real stone from
+# the leftover inventory — worth 1.84 points (89.14% -> 90.98%).
+#
+# This is NOT the old residual fill that was turned off. That one placed a stone
+# anywhere it fitted, which is how the plate ended up with stones floating in
+# open space. The rule that makes this acceptable is RIM_POCKET_TOUCH: a stone
+# may only take a pocket if it lands against something already on the plate. Plus
+# the rules the rest of the plate already obeys — inside the usable circle, the
+# form's seed spacing, and a cut stone only where _cut_on_rim allows it, so the
+# outward-cross requirement is carried into this pass unchanged.
+#
+# Nothing already placed is moved, resized, rotated or removed.
+RIM_POCKET_FILL = True
+# Ignore free scraps below this. Sized from the SMALLEST stone the run could
+# ever place — P.MINSEED, the criteria form's "min filler size" — rather than a
+# fixed number, so a run whose stones are all large does not waste time probing
+# slivers, and a run carrying 2 mm stock still sees the pockets that suit it.
+RIM_POCKET_MIN_FACTOR = 0.8
+# Candidates are collapsed by size so the same seat is not probed once per stone
+# that would fill it identically. One representative is tried and the stock
+# number is drawn from the matching stones only once a seat is won.
+#
+# The match must be EXACT. Bucketing to a tolerance (0.1 mm was tried) places the
+# representative's outline and then labels it with a different stone's number, so
+# the plate shows a seat the chosen stone does not actually have. It surfaced as
+# three seeds reported "trimmed" on a plate where nothing is ever cut — the
+# stored rawL x rawW no longer matched the polygon drawn. Measurements are held
+# to 2 dp, so exact matching still collapses genuine duplicates; it simply never
+# claims two different stones are interchangeable when they are not.
+RIM_POCKET_SIZE_RES = None  # exact match only — see above
+RIM_POCKET_CELL = 8.0       # mm — neighbourhood each search is bounded to
+RIM_POCKET_STEP = 0.5       # mm — finest probe spacing
+# How many probe positions across a pocket, per axis. The old search tried each
+# corner of the pocket plus a couple of nudges — 25 positions — which is dense
+# enough for a pocket the size of the stone and far too sparse for a big one. A
+# 22.4 x 13.0 mm sliver on the reference plate could take a 2.58 x 2.04 stone and
+# the corner probes all missed it, because the only seat was in the middle.
+#
+# Sampling a fixed COUNT per axis rather than a fixed step keeps the cost
+# constant whatever the pocket's size: a small pocket is probed finely, a large
+# one coarsely but everywhere, and neither explodes.
+#
+# It is a FALLBACK, not a replacement for the corner probes. Sweeping the pocket
+# uniformly INSTEAD of trying its corners was measured and is worse — 61 seats
+# and 90.88% against 63 and 92.20% — because a stone belongs tucked into a corner
+# of a gap, and a uniform grid spends most of its probes in the middle where
+# nothing can sit. Corners first, then the grid for what the corners miss.
+RIM_POCKET_PROBES = 14
+_NUDGES = (0.0, RIM_POCKET_STEP, -RIM_POCKET_STEP,
+           2 * RIM_POCKET_STEP, -2 * RIM_POCKET_STEP)
+RIM_POCKET_TOUCH = 0.05     # mm — how close counts as "against a neighbour"
+RIM_POCKET_MAX = 40         # runaway guard, not a target
+# Revisiting this pass's own seats to see whether a bigger stone now fits.
+#
+# OFF (0 rounds). It WORKS — on the reference plate it found seed 60, a
+# 2.08 x 2.56 stone sitting in a hole that later placements had grown to take a
+# 3.12 x 3.91 one. It is simply not worth what it costs. Measured on the live
+# Ø90 2-12 mm plate, rim pass only:
+#
+#   configuration                       seats added   fill%    rim pass
+#   corners + grid                          19        92.72     1010 s
+#   + vertex probe + upgrade (3 rounds)     21        92.88     2635 s
+#
+# 0.16 points of coverage for 27 extra minutes a plate, against a target of 90%
+# that the cheap configuration already clears by 2.7 points. Raise it only if a
+# particular inventory leaves obvious upgrades on the plate and the time is
+# acceptable that day.
+RIM_UPGRADE_ROUNDS = 0
+RIM_UPGRADE_MIN_GAIN = 0.5  # mm2 — ignore swaps that gain next to nothing
+# How far beyond its own seat an upgrade may reach, in mm. A stone can only grow
+# into space that touches it, and bounding the region here is what makes the
+# candidate filter bite — see the note in the upgrade loop.
+RIM_UPGRADE_REACH = 4.0
+# Probe the free region's OWN vertices as well as its bounding-box corners.
+# Shape-aware, and it does find seats the corners and the grid both miss — but it
+# runs for every candidate the corners rejected, which is most of them. Together
+# with the upgrade pass above it turned a 1010 s pass into 2635 s for two extra
+# stones. OFF for the same reason: see the table beside RIM_UPGRADE_ROUNDS.
+RIM_VERTEX_PROBE = True
+RIM_POCKET_ROUNDS = 8       # how many times the ring is re-examined
+
+
+def _fill_rim_pockets(real, placed, fill, R):
+    """Seat leftover stones in the rim pockets. Additive only.
+
+    Works pocket-first rather than stone-first: the leftover ring is diced on a
+    coarse grid, and each pocket asks the unused inventory for the LARGEST stone
+    that legally fits it. Sweeping every stone over the whole plate instead is
+    what made the old residual pass cost as much as the entire row search.
+    """
+    if not RIM_POCKET_FILL or not placed or not real:
+        return placed, fill
+
+    from shapely import affinity
+    from shapely.geometry import Point, Polygon, box as shbox
+    from shapely.ops import unary_union
+    from shapely.strtree import STRtree
+
+    disc = Point(0.0, 0.0).buffer(R, resolution=180)
+    RSQ = (R - RIM_EPS) ** 2
+    geoms = [Polygon(p["poly"]).buffer(0) for p in placed]
+    clear = max(0.0, float(getattr(P, "CLEARANCE", 0.0) or 0.0))
+    # Smallest scrap worth probing, derived from the run's own minimum seed size
+    # rather than hard-coded — see RIM_POCKET_MIN_FACTOR.
+    min_seed = max(0.5, float(getattr(P, "MINSEED", 2.0) or 2.0))
+    min_area = (min_seed ** 2) * RIM_POCKET_MIN_FACTOR
+
+    used = {p["stock"] for p in placed}
+    # Build ONE candidate per distinct (size, orientation, cut?) and remember
+    # which stones can supply it. Cut stones are never collapsed together: their
+    # outlines differ in ways a bounding box does not capture, and which way the
+    # ground corner faces is the whole question for them.
+    by_shape = {}
+    for s in real:
+        if s["stock"] in used:
+            continue
+        g0 = _seed_footprint(s)
+        if g0 is None or g0.is_empty:
+            continue
+        cut = bool(s.get("poly"))
+        for deg in ENHANCED_ANGLES:
+            rg = affinity.rotate(g0, deg, origin="centroid") if deg else g0
+            b = rg.bounds
+            w, h = b[2] - b[0], b[3] - b[1]
+            # Cut stones are never collapsed at all: their outlines differ in
+            # ways a bounding box does not capture, and which way the ground
+            # corner faces is the whole question for them.
+            key = (s["stock"] if cut else (round(w, 6), round(h, 6)), deg, cut)
+            entry = by_shape.get(key)
+            if entry is None:
+                by_shape[key] = [affinity.translate(rg, -b[0], -b[1]),
+                                 w, h, cut, deg, [s]]
+            else:
+                entry[5].append(s)
+    if not by_shape:
+        return placed, fill
+    # LARGEST first. A pocket should be filled by the biggest stone that fits it,
+    # not the first one tried — two 3 mm stones where one 6 mm stone belongs is a
+    # worse plate for the same coverage.
+    poses = sorted(by_shape.values(), key=lambda e: -e[0].area)
+
+    added = []
+
+    tree = [STRtree(geoms)]
+
+    # A box-level prefilter was tried here — compute the candidate's bounds
+    # arithmetically and skip the translate when the index shows no neighbour
+    # within touch range. It is logically sound (legal() cannot pass without a
+    # neighbour) and produced byte-identical plates, but it is SLOWER: 1209.7 s
+    # -> 1552.1 s. Almost every probe in a rim crescent DOES have a neighbour,
+    # so the prefilter never fires and only adds a box construction and an index
+    # query per candidate. Do not reintroduce it without measuring.
+    def legal(g):
+        # Analytic rim test first — disc.contains() walks a 180-gon and this is
+        # the hottest call in the pass. A bounding box inside the circle
+        # guarantees the stone inside it is too.
+        bx0, by0, bx1, by1 = g.bounds
+        if max(bx0 * bx0, bx1 * bx1) + max(by0 * by0, by1 * by1) > RSQ:
+            if not disc.contains(g):
+                return False
+        # Then only the handful of stones that could possibly be in the way,
+        # via the spatial index rather than all of them. The query region is the
+        # stone's BOX grown by the tolerance, not g.buffer() — buffering a
+        # polygon rounds every corner with a fresh ring of vertices and, called
+        # once per candidate seat, it dominated this pass outright.
+        t = clear + RIM_POCKET_TOUCH
+        near = tree[0].query(shbox(bx0 - t, by0 - t, bx1 + t, by1 + t))
+        touching = False
+        for i in near:
+            o = geoms[i]
+            if g.intersection(o).area > 1e-9:
+                return False
+            d = g.distance(o)
+            if clear > 0.0 and d < clear - 1e-9:
+                return False
+            if d <= clear + RIM_POCKET_TOUCH:
+                touching = True
+        # ATTACHED, not floating — the rule the old residual pass lacked. The
+        # query radius is exactly the touch distance, so anything it returned at
+        # that range IS a neighbour; an empty result means the stone is adrift.
+        return touching
+
+    # Re-examine the ring after every round: placing one stone changes the free
+    # space, and a pocket that held one 6 mm stone often still has room for a
+    # 3 mm one beside it. The fixed-grid version served each cell once and moved
+    # on, which is what left large regions holding a single small stone.
+    for _round in range(RIM_POCKET_ROUNDS):
+        if len(added) >= RIM_POCKET_MAX:
+            break
+        free = disc.difference(unary_union(geoms))
+        # Dice the leftover ring into CELLS. The ring is one connected crescent
+        # whose bounding box is the whole plate, so searching it as a single
+        # region means probing the full diameter to rediscover that the middle is
+        # occupied. A cell bounds each search to a neighbourhood — and because
+        # the free space is recomputed every round, a region wider than one cell
+        # is served repeatedly rather than once, which is what lets a large
+        # pocket take a big stone AND a small one beside it.
+        parts = []
+        n = int(math.ceil(2 * R / RIM_POCKET_CELL))
+        for i in range(n):
+            for j in range(n):
+                cell = shbox(-R + i * RIM_POCKET_CELL, -R + j * RIM_POCKET_CELL,
+                             -R + (i + 1) * RIM_POCKET_CELL,
+                             -R + (j + 1) * RIM_POCKET_CELL)
+                bit = free.intersection(cell)
+                if bit.area >= min_area:
+                    parts.append(bit)
+        if not parts:
+            break
+        seated_this_round = False
+        for part in sorted(parts, key=lambda c: -c.area):
+            if len(added) >= RIM_POCKET_MAX:
+                break
+            px0, py0, px1, py1 = part.bounds
+            pw, ph = px1 - px0, py1 - py0
+            best = None
+            for rg, w, h, is_cut, deg, supply in poses:
+                # A stone may overhang the cell into the neighbouring free space;
+                # the cell bounds the SEARCH, not the stone.
+                if w > pw + RIM_POCKET_CELL or h > ph + RIM_POCKET_CELL:
+                    continue
+                if best is not None and rg.area <= best[0]:
+                    break                  # sorted by area: nothing left can win
+                s = next((c for c in supply if c["stock"] not in used), None)
+                if s is None:
+                    continue               # every stone of this size is spent
+                # CORNERS FIRST — a stone belongs tucked into a corner of the gap.
+                for ax in (px0, px1 - w):
+                    for ay in (py0, py1 - h):
+                        for ddx in _NUDGES:
+                            for ddy in _NUDGES:
+                                g = affinity.translate(rg, ax + ddx, ay + ddy)
+                                if legal(g) and ((not is_cut) or _cut_on_rim(g, R)):
+                                    best = (g.area, s, deg, g)
+                                    break
+                            if best is not None:
+                                break
+                        if best is not None:
+                            break
+                    if best is not None:
+                        break
+                if best is not None:
+                    continue
+                # THEN THE POCKET'S OWN VERTICES. A rim pocket is a crescent, and
+                # its seat is usually against a corner of the crescent itself
+                # rather than of its bounding box — the box corners sit out in
+                # the curve where nothing fits. These are the points where the
+                # rim meets a stone, which is exactly where a small stone tucks
+                # in. Cheap: a few dozen points after rounding, against a grid's
+                # couple of hundred.
+                # A cell can slice the ring into several disjoint pieces, so the
+                # free region here may be a MultiPolygon — walk whatever it is.
+                verts = set() if RIM_VERTEX_PROBE else ()
+                for piece in (getattr(part, "geoms", [part]) if RIM_VERTEX_PROBE else ()):
+                    ext = getattr(piece, "exterior", None)
+                    if ext is None:
+                        continue           # a stray line or point: no seat in it
+                    for ring in [ext] + list(piece.interiors):
+                        for vx, vy in ring.coords:
+                            verts.add((round(vx * 4.0) / 4.0, round(vy * 4.0) / 4.0))
+                for vx, vy in sorted(verts):
+                    for ox, oy in ((0.0, 0.0), (-w, 0.0), (0.0, -h), (-w, -h)):
+                        g = affinity.translate(rg, vx + ox, vy + oy)
+                        if legal(g) and ((not is_cut) or _cut_on_rim(g, R)):
+                            best = (g.area, s, deg, g)
+                            break
+                    if best is not None:
+                        break
+                if best is not None:
+                    continue
+                # FALLBACK: sweep the pocket. Only reached when no corner works,
+                # which is the case a big sliver presents — its one seat is in
+                # the middle. Bounded to RIM_POCKET_PROBES positions per axis so
+                # the cost does not grow with the pocket.
+                sx, sy = max(0.0, pw - w), max(0.0, ph - h)
+                nx = min(RIM_POCKET_PROBES, int(sx / RIM_POCKET_STEP) + 1)
+                ny = min(RIM_POCKET_PROBES, int(sy / RIM_POCKET_STEP) + 1)
+                stx = sx / (nx - 1) if nx > 1 else 0.0
+                sty = sy / (ny - 1) if ny > 1 else 0.0
+                for ix in range(nx):
+                    for iy in range(ny):
+                        g = affinity.translate(rg, px0 + ix * stx, py0 + iy * sty)
+                        if legal(g) and ((not is_cut) or _cut_on_rim(g, R)):
+                            best = (g.area, s, deg, g)
+                            break
+                    if best is not None:
+                        break
+            if best is None:
+                continue
+            _a, s, deg, g = best
+            added.append(g)
+            geoms.append(g)                # later stones may lean on this one
+            tree[0] = STRtree(geoms)       # keep the index in step with them
+            used.add(s["stock"])
+            seated_this_round = True
+            bx0, by0, bx1, by1 = g.bounds
+            rp = g.representative_point()
+            placed.append({
+                "stock": s["stock"], "cts": s.get("cts", 0.0),
+                "L": round(bx1 - bx0, 1), "W": round(by1 - by0, 1),
+                "H": s.get("H", round((P.T_LO + P.T_HI) / 2.0, 3)),
+                "rawL": s.get("L"), "rawW": s.get("W"),
+                "x": bx0, "y": by0, "w": bx1 - bx0, "h": by1 - by0, "angle": deg,
+                "kind": "real",
+                "poly": [(round(px, 3), round(py, 3)) for px, py in g.exterior.coords],
+                "area": g.area,
+                "irregular": bool(s.get("poly")),
+                "lx": rp.x, "ly": rp.y,
+            })
+        if not seated_this_round:
+            break                          # nothing more will fit
+
+    if not added:
+        return placed, fill
+
+    # ---- UPGRADE ------------------------------------------------------------
+    # Revisit the stones THIS PASS placed and see whether a bigger one now fits
+    # where they sit. The fill is greedy: each pocket takes the largest stone
+    # that fitted AT THE TIME, and every later placement changes the free space
+    # around it — so an early choice can end up smaller than the space it now
+    # has. Measured on the reference plate, seed 60 was a 2.08 x 2.56 stone in a
+    # hole that had grown to take a 3.12 x 3.91 one.
+    #
+    # Strictly limited to this pass's OWN seats: `first` is where they begin, and
+    # nothing before it — no row, no row-end seat — is ever touched.
+    first = len(placed) - len(added)
+    for _round in range(RIM_UPGRADE_ROUNDS):
+        improved = False
+        for idx in range(first, len(placed)):
+            cur = placed[idx]
+            cur_area = cur["area"]
+            # The room this seat would have if its stone were lifted out.
+            others = [g for k, g in enumerate(geoms) if k != idx]
+            # LOCAL room only. `disc.difference(others)` is the whole leftover
+            # ring, whose bounding box is the entire plate — filtering candidate
+            # stones against that rejects nothing, so the pass probed every stone
+            # bigger than the current one, everywhere, and cost more than the
+            # rest of the plate put together. A seat can only grow into the space
+            # touching it, so bound the region to its own neighbourhood first.
+            box = shbox(cur["x"] - RIM_UPGRADE_REACH, cur["y"] - RIM_UPGRADE_REACH,
+                        cur["x"] + cur["w"] + RIM_UPGRADE_REACH,
+                        cur["y"] + cur["h"] + RIM_UPGRADE_REACH)
+            room = (disc.difference(unary_union(others)) if others else disc)
+            room = room.union(geoms[idx]).intersection(box)
+            if room.is_empty:
+                continue
+            # Index them ONCE per seat. Without this every probe compared the
+            # candidate against all ~70 stones on the plate, and the pass ran
+            # 14x14 probes per candidate over hundreds of candidates per seat —
+            # the arithmetic works out to millions of polygon intersections and
+            # took longer than the entire rest of the plate.
+            otree = STRtree(others) if others else None
+            spot = None
+            for rg, w, h, is_cut, deg, supply in poses:
+                if rg.area <= cur_area + RIM_UPGRADE_MIN_GAIN:
+                    break                  # sorted by area: no improvement left
+                s = next((c for c in supply
+                          if c["stock"] not in used or c["stock"] == cur["stock"]),
+                         None)
+                if s is None:
+                    continue
+                b = room.bounds
+                if w > b[2] - b[0] + 1e-9 or h > b[3] - b[1] + 1e-9:
+                    continue
+                # Probe around where the current stone already is — the space it
+                # can grow into is adjacent to it, not across the plate.
+                near_box = cur["x"] - w, cur["y"] - h, cur["x"] + cur["w"], cur["y"] + cur["h"]
+                nx = ny = RIM_POCKET_PROBES
+                stx = (near_box[2] - near_box[0]) / max(1, nx - 1)
+                sty = (near_box[3] - near_box[1]) / max(1, ny - 1)
+                for ix in range(nx):
+                    for iy in range(ny):
+                        g = affinity.translate(rg, near_box[0] + ix * stx,
+                                               near_box[1] + iy * sty)
+                        if not _legal_against(g, others, otree, disc, RSQ, clear):
+                            continue
+                        if is_cut and not _cut_on_rim(g, R):
+                            continue
+                        spot = (s, deg, g)
+                        break
+                    if spot is not None:
+                        break
+                if spot is not None:
+                    break
+            if spot is None:
+                continue
+            s, deg, g = spot
+            used.discard(cur["stock"])
+            used.add(s["stock"])
+            bx0, by0, bx1, by1 = g.bounds
+            rp = g.representative_point()
+            placed[idx] = {
+                "stock": s["stock"], "cts": s.get("cts", 0.0),
+                "L": round(bx1 - bx0, 1), "W": round(by1 - by0, 1),
+                "H": s.get("H", round((P.T_LO + P.T_HI) / 2.0, 3)),
+                "rawL": s.get("L"), "rawW": s.get("W"),
+                "x": bx0, "y": by0, "w": bx1 - bx0, "h": by1 - by0, "angle": deg,
+                "kind": "real",
+                "poly": [(round(px, 3), round(py, 3)) for px, py in g.exterior.coords],
+                "area": g.area,
+                "irregular": bool(s.get("poly")),
+                "lx": rp.x, "ly": rp.y,
+            }
+            geoms[idx] = g
+            improved = True
+        if not improved:
+            break
+
+    covered = unary_union([Polygon(p["poly"]).buffer(0) for p in placed]).area
+    return placed, 100.0 * covered / (math.pi * R * R)
+
+
+def _legal_against(g, others, otree, disc, rsq, clear):
+    """Is `g` inside the plate, clear of `others`, and touching at least one?
+
+    Same contract as the fill's own `legal`, but against an explicit list rather
+    than the running index — the upgrade pass asks "would this fit if that stone
+    were not there", which the running index cannot answer. `otree` indexes that
+    list; only the neighbours it returns can possibly be in the way.
+    """
+    from shapely.geometry import box as shbox
+
+    bx0, by0, bx1, by1 = g.bounds
+    if max(bx0 * bx0, bx1 * bx1) + max(by0 * by0, by1 * by1) > rsq:
+        if not disc.contains(g):
+            return False
+    if otree is None:
+        return False                       # nothing to lean on
+    t = clear + RIM_POCKET_TOUCH
+    touching = False
+    for i in otree.query(shbox(bx0 - t, by0 - t, bx1 + t, by1 + t)):
+        o = others[i]
+        if g.intersection(o).area > 1e-9:
+            return False
+        d = g.distance(o)
+        if clear > 0.0 and d < clear - 1e-9:
+            return False
+        if d <= t:
+            touching = True
+    return touching
 
 
 def _interior_waste(placed, disc):
@@ -1031,11 +1928,46 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
         if not census:
             return None
 
+        # CENTRE-TO-OUTER GRADIENT (opt-in, see SIZE_GRADIENT_FRAC). The target
+        # height for this row is interpolated across the heights of the classes
+        # that can actually finish it, so it follows the user's band and the
+        # plate diameter with nothing to tune. Computed once here rather than
+        # inside rank(), which runs per class.
+        _grad = SIZE_GRADIENT_FRAC > 0.0
+        _target = 0.0
+        if _grad:
+            _fit_h = []
+            for _k in census:
+                _h = census[_k][1]
+                _yo = max(abs(y), abs(y + _h))
+                if _yo >= R:
+                    continue
+                if census[_k][0] >= LEVEL_MARGIN * 2.0 * math.sqrt(
+                        R * R - _yo * _yo):
+                    _fit_h.append(_h)
+            if _fit_h:
+                # 1 at the middle of the plate, 0 at the rim. Taken from the row
+                # baseline, which is fixed before a class is chosen — using each
+                # class's own height here would give every class a different
+                # target and there would be nothing to rank against.
+                _near = 1.0 - min(1.0, abs(y) / R)
+                _span = max(_fit_h) - min(_fit_h)
+                _target = min(_fit_h) + _span * _near
+                # The tolerance is a FRACTION of the span the pool actually
+                # offers, never a fixed millimetre count — see SIZE_GRADIENT_FRAC.
+                # Never below one census band, or classes that the census cannot
+                # tell apart would be ranked against each other.
+                _tol = max(LEVEL_BAND, SIZE_GRADIENT_FRAC * _span)
+                if _span <= LEVEL_BAND:
+                    _grad = False        # one height in play; nothing to grade
+            else:
+                _grad = False
+
         def rank(k):
             h = census[k][1]
             yout = max(abs(y), abs(y + h))
             if yout >= R:
-                return (0, 0.0, k)
+                return (0, 0.0, 0.0, k) if _grad else (0, 0.0, k)
             chord2 = 2.0 * math.sqrt(R * R - yout * yout)
             stock = census[k][0]
             # Among classes that can finish the row, the best STOCKED wins, and
@@ -1058,7 +1990,24 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
             # stones each method happens to hold. This ranking is the one whose
             # output was validated on a real plate on 2026-08-15; do not trade it
             # for a more comfortable-looking comparison.
-            return (1 if stock >= LEVEL_MARGIN * chord2 else 0, stock, k)
+            fits = 1 if stock >= LEVEL_MARGIN * chord2 else 0
+            if _grad:
+                # Closeness to the row's target height, quantised so that classes
+                # within _tol of it are EQUAL and fall through to `stock` — the
+                # gradient decides which sizes belong at this radius, stock still
+                # decides which of those to spend.
+                near_t = -int(abs(h - _target) / _tol)
+                return (fits, near_t, stock, k)
+            if CENTRE_SIZE_BIAS <= 0.0:
+                return (fits, stock, k)
+            # CENTRE-TO-OUTER (opt-in, see CENTRE_SIZE_BIAS). `near` is 1 at the
+            # middle of the plate and 0 at the rim, so the term is a BONUS for a
+            # tall class on a middle row and the same size PENALTY for one on a
+            # rim row. `fits` stays the primary key, so a class that cannot cover
+            # this chord still never wins the row however tall it is — that gate
+            # is what stops the tall classes being drained a row at a time.
+            near = 1.0 - min(1.0, abs(y + h / 2.0) / R)
+            return (fits, stock + CENTRE_SIZE_BIAS * h * (2.0 * near - 1.0), k)
 
         return [census[k][1] for k in sorted(census, key=rank, reverse=True)]
 
@@ -1314,7 +2263,7 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
                 notch = 0.0
                 if cut0 is None:
                     cutrim = 0
-                elif _rem <= RIM_FLUSH and out > 0.0 and not _mid:
+                elif _rem <= RIM_FLUSH and out >= CUT_OUTWARD_MIN and not _mid:
                     # WHERE a cut stone may sit is unchanged: the outermost seat
                     # of a row, outside the protected centre band, ground corner
                     # pointing outward. A cross facing a flat neighbour leaves a
@@ -1471,7 +2420,6 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
                 yout = max(abs(y), abs(y + (row_h or 9.0)))
                 if yout >= R:
                     continue
-                chord = math.sqrt(R * R - yout * yout) - RIM_EPS
                 best = scan(y, 0.0, row_h, False, going_left,
                             want_cut=True, rim_seed=True, level=level)
                 if not best:
@@ -1591,7 +2539,6 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
 
             x = -chord
             for t, w in order:
-                g0 = shapes[id(t)]
                 pick = None
                 for deg, rg, ww, hh in poses[id(t)]:
                     # Capped at row_h, NOT row_h + ROW_TOL. ROW_TOL is headroom
@@ -2162,6 +3109,722 @@ def _pack_once(args, y0=None, policy="cut-first", fill="left", seat="compact"):
     covered = unary_union([ShPoly(p["poly"]).buffer(0) for p in placed]).area if placed else 0.0
     return placed, 100 * covered / (math.pi * R * R)
 
+def _fill_remaining_space(real, placed, fill, R):
+    """
+    Residual-space real-seed optimizer.
+
+    This is a FINAL ADDITIVE pass. It does not move, remove, or rebuild any
+    seed selected by the main Max-Coverage optimizer.
+
+    Purpose:
+        Find physically usable areas that remain after the normal row-based
+        Max-Coverage packing and place additional UNUSED REAL seeds there.
+
+    Key difference from the main row optimizer:
+        The main optimizer keeps rows level. This pass does NOT require the
+        additional seed to match an existing row height. A smaller seed is
+        therefore allowed to occupy a physically valid pocket below/above a
+        larger row.
+
+    Rules:
+        - Existing seeds never move.
+        - Only unused real inventory is considered.
+        - Smaller seeds are deliberately considered first.
+        - Every ENHANCED_ANGLES orientation is tested.
+        - Whole rectangular and irregular/cut seed geometry is respected.
+        - CLEARANCE is respected.
+        - Cut/irregular seeds are allowed only when they satisfy _cut_on_rim().
+        - A seed is committed only when it produces additional coverage.
+        - The free area is updated after every accepted placement.
+        - Search is pocket/anchor based rather than a full millimetre grid,
+          so the residual pass remains bounded for large inventories.
+    """
+    if not real:
+        return placed, fill
+
+    if not placed:
+        return placed, fill
+
+    from shapely import affinity
+    from shapely.geometry import Point, Polygon as ShPoly
+    from shapely.ops import unary_union
+
+    # ---------------------------------------------------------------
+    # Plate and clearance
+    # ---------------------------------------------------------------
+    disc = Point(0.0, 0.0).buffer(
+        R,
+        resolution=180,
+    )
+
+    clear = max(
+        0.0,
+        float(
+            getattr(
+                P,
+                "CLEARANCE",
+                0.0,
+            ) or 0.0
+        ),
+    )
+
+    # ---------------------------------------------------------------
+    # Current occupied geometry
+    # ---------------------------------------------------------------
+    occupied_geoms = []
+
+    for p in placed:
+        poly = p.get("poly")
+        if not poly:
+            continue
+
+        try:
+            g = ShPoly(poly).buffer(0)
+        except Exception:
+            continue
+
+        if not g.is_empty:
+            occupied_geoms.append(g)
+
+    if not occupied_geoms:
+        return placed, fill
+
+    occupied = unary_union(
+        occupied_geoms
+    )
+
+    # This is the actual free area available to another seed.
+    #
+    # CLEARANCE is applied around existing seeds so a new seed cannot be
+    # inserted closer than the user's requested distance.
+    blocked = (
+        occupied.buffer(clear)
+        if clear > 0.0
+        else occupied
+    )
+
+    gap_region = disc.difference(blocked)
+
+    if gap_region.is_empty:
+        return placed, fill
+
+    # ---------------------------------------------------------------
+    # Inventory already used on this plate
+    # ---------------------------------------------------------------
+    used_stocks = {
+        str(p.get("stock", "")).strip()
+        for p in placed
+        if p.get("stock") is not None
+    }
+
+    spare = [
+        s
+        for s in real
+        if str(s.get("stock", "")).strip()
+        not in used_stocks
+    ]
+
+    if not spare:
+        return placed, fill
+
+    # ---------------------------------------------------------------
+    # Build all four orientations once.
+    #
+    # We deliberately sort the candidate seeds SMALL-to-LARGE because
+    # this pass exists specifically to exploit small seeds that the row
+    # optimizer could not use.
+    # ---------------------------------------------------------------
+    poses = []
+
+    for s in spare:
+        g0 = _seed_footprint(s)
+
+        if g0 is None or g0.is_empty:
+            continue
+
+        try:
+            base_cut = _cut_direction(g0)
+        except Exception:
+            base_cut = None
+
+        seed_area = float(
+            getattr(g0, "area", 0.0)
+        )
+
+        if seed_area <= 0.0:
+            continue
+
+        for deg in ENHANCED_ANGLES:
+            try:
+                rg = (
+                    affinity.rotate(
+                        g0,
+                        deg,
+                        origin="centroid",
+                    )
+                    if deg
+                    else g0
+                )
+
+                if rg.is_empty:
+                    continue
+
+                bx0, by0, bx1, by1 = rg.bounds
+
+                # Normalize the pose so its bounding-box lower-left is (0,0).
+                rg = affinity.translate(
+                    rg,
+                    -bx0,
+                    -by0,
+                )
+
+                poses.append({
+                    "seed": s,
+                    "stock": str(
+                        s.get("stock", "")
+                    ).strip(),
+                    "angle": int(deg),
+                    "geom": rg,
+                    "w": bx1 - bx0,
+                    "h": by1 - by0,
+                    "area": seed_area,
+                    "cut": base_cut,
+                })
+
+            except Exception:
+                continue
+
+    if not poses:
+        return placed, fill
+
+    # Smallest first is intentional.
+    poses.sort(
+        key=lambda x: (
+            x["area"],
+            max(x["w"], x["h"]),
+            min(x["w"], x["h"]),
+        )
+    )
+
+    # ---------------------------------------------------------------
+    # Candidate-pocket controls
+    #
+    # These prevent an inventory of 1600+ seeds from causing a huge
+    # full-plate x/y grid search.
+    # ---------------------------------------------------------------
+    MAX_POCKETS = 20
+    MAX_VERTICES = 28
+    MAX_ROUNDS = 120
+
+    # A candidate is allowed a tiny numerical tolerance.
+    EPS = 1e-7
+
+    def _polygon_parts(region):
+        if region.is_empty:
+            return []
+
+        if region.geom_type == "Polygon":
+            return [region]
+
+        if hasattr(region, "geoms"):
+            return [
+                g
+                for g in region.geoms
+                if g.geom_type == "Polygon"
+                and not g.is_empty
+            ]
+
+        return []
+
+    def _candidate_anchors(part, w, h):
+        """
+        Generate a bounded set of useful candidate lower-left positions.
+
+        A rectangle/seed that improves a pocket normally comes to rest against
+        one or more pocket edges/corners. We therefore test:
+            - four pocket bounding-box corners
+            - pocket centroid/representative point
+            - simplified polygon vertices
+            - offsets from simplified vertices
+
+        No full plate grid is used.
+        """
+        bx0, by0, bx1, by1 = part.bounds
+
+        anchors = [
+            # Bounding-box corners.
+            (bx0, by0),
+            (bx1 - w, by0),
+            (bx0, by1 - h),
+            (bx1 - w, by1 - h),
+
+            # Bounding-box centre.
+            (
+                (bx0 + bx1 - w) / 2.0,
+                (by0 + by1 - h) / 2.0,
+            ),
+        ]
+
+        # Representative point is often better than centroid for concave
+        # pockets because it is guaranteed to be inside the polygon.
+        try:
+            rp = part.representative_point()
+            anchors.extend([
+                (rp.x, rp.y),
+                (rp.x - w / 2.0, rp.y - h / 2.0),
+            ])
+        except Exception:
+            pass
+
+        # Simplify the pocket before taking vertices. This is the same basic
+        # strategy used by the existing sweep-up implementation.
+        try:
+            simple = part.simplify(
+                0.25,
+                preserve_topology=True,
+            )
+
+            if simple.geom_type == "Polygon":
+                vertices = list(
+                    simple.exterior.coords
+                )[:-1]
+            else:
+                vertices = []
+
+            if vertices:
+                if len(vertices) > MAX_VERTICES:
+                    step = max(
+                        1,
+                        len(vertices) // MAX_VERTICES,
+                    )
+                    vertices = vertices[::step][
+                        :MAX_VERTICES
+                    ]
+
+                for vx, vy in vertices:
+                    anchors.extend([
+                        # Treat the vertex as each possible corner.
+                        (vx, vy),
+                        (vx - w, vy),
+                        (vx, vy - h),
+                        (vx - w, vy - h),
+
+                        # Small inward offsets help when exact vertex
+                        # contact is rejected by numerical geometry.
+                        (
+                            vx + EPS,
+                            vy + EPS,
+                        ),
+                        (
+                            vx - w - EPS,
+                            vy + EPS,
+                        ),
+                        (
+                            vx + EPS,
+                            vy - h - EPS,
+                        ),
+                    ])
+
+        except Exception:
+            pass
+
+        # Remove duplicate anchors.
+        unique = []
+        seen = set()
+
+        for ax, ay in anchors:
+            key = (
+                round(ax, 4),
+                round(ay, 4),
+            )
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+            unique.append(
+                (float(ax), float(ay))
+            )
+
+        return unique
+
+    def _place_pose_in_anchor(pose, ax, ay):
+        """
+        Translate a normalized pose so its bounding-box lower-left is the
+        requested anchor.
+        """
+        try:
+            return affinity.translate(
+                pose["geom"],
+                ax,
+                ay,
+            )
+        except Exception:
+            return None
+
+    def _is_legal(candidate, pose):
+        """
+        Full physical validity check.
+        """
+        if candidate is None or candidate.is_empty:
+            return False
+
+        # Must be fully inside the usable circle.
+        try:
+            if not disc.covers(candidate):
+                return False
+        except Exception:
+            return False
+
+        # No overlap with an already placed seed.
+        try:
+            if clear > 0.0:
+                if candidate.distance(
+                    occupied
+                ) < clear - 1e-9:
+                    return False
+            else:
+                if (
+                    candidate.intersection(
+                        occupied
+                    ).area
+                    > EPS
+                ):
+                    return False
+        except Exception:
+            return False
+
+        # Irregular/cut seed:
+        # preserve the existing rule that the missing corner belongs at
+        # the plate rim, not in the middle of the plate.
+        if pose["cut"] is not None:
+            try:
+                if not _cut_on_rim(
+                    candidate,
+                    R,
+                ):
+                    return False
+            except Exception:
+                return False
+
+        return True
+
+    def _placement_record(pose, candidate):
+        """
+        Convert the Shapely candidate to the same dictionary shape used by
+        the existing Max-Coverage renderer/Excel/database code.
+        """
+        bx0, by0, bx1, by1 = candidate.bounds
+
+        try:
+            rp = candidate.representative_point()
+        except Exception:
+            rp = Point(
+                (bx0 + bx1) / 2.0,
+                (by0 + by1) / 2.0,
+            )
+
+        return {
+            "stock": pose["seed"]["stock"],
+            "cts": pose["seed"].get(
+                "cts",
+                0.0,
+            ),
+
+            # Actual placed bounding dimensions.
+            "L": round(
+                bx1 - bx0,
+                1,
+            ),
+            "W": round(
+                by1 - by0,
+                1,
+            ),
+
+            "H": pose["seed"].get(
+                "H",
+                round(
+                    (
+                        P.T_LO
+                        + P.T_HI
+                    ) / 2.0,
+                    3,
+                ),
+            ),
+
+            # Original imported dimensions.
+            "rawL": pose["seed"].get("L"),
+            "rawW": pose["seed"].get("W"),
+
+            "x": bx0,
+            "y": by0,
+            "w": bx1 - bx0,
+            "h": by1 - by0,
+
+            # IMPORTANT:
+            # This preserves the exact rotation selected by the residual pass.
+            "angle": pose["angle"],
+
+            "kind": "real",
+
+            "poly": [
+                (
+                    round(px, 3),
+                    round(py, 3),
+                )
+                for px, py in candidate.exterior.coords
+            ],
+
+            "area": candidate.area,
+
+            "irregular": bool(
+                pose["seed"].get("poly")
+            ),
+
+            "lx": rp.x,
+            "ly": rp.y,
+        }
+
+    # ---------------------------------------------------------------
+    # Residual optimization loop
+    # ---------------------------------------------------------------
+    placed_now = list(placed)
+    fill_now = float(fill)
+
+    for _round in range(
+        MAX_ROUNDS
+    ):
+        if gap_region.is_empty:
+            break
+
+        pockets = [
+            g
+            for g in _polygon_parts(
+                gap_region
+            )
+            if g.area > 0.01
+        ]
+
+        if not pockets:
+            break
+
+        # Largest pockets first. Within each pocket, SMALL seeds are
+        # considered first.
+        pockets.sort(
+            key=lambda g: -g.area
+        )
+
+        pockets = pockets[
+            :MAX_POCKETS
+        ]
+
+        best = None
+
+        for pocket in pockets:
+            p0, p1, p2, p3 = pocket.bounds
+            pw = p2 - p0
+            ph = p3 - p1
+
+            if pw <= 0.0 or ph <= 0.0:
+                continue
+
+            pocket_area = float(
+                pocket.area
+            )
+
+            # -------------------------------------------------------
+            # Try unused small seeds first.
+            # -------------------------------------------------------
+            for pose in poses:
+                stock = pose["stock"]
+
+                if stock in used_stocks:
+                    continue
+
+                w = pose["w"]
+                h = pose["h"]
+
+                # A bounding-box test is only a cheap filter.
+                # The exact Shapely test follows.
+                if w > pw + 1e-6:
+                    continue
+
+                if h > ph + 1e-6:
+                    continue
+
+                if pose["area"] > pocket_area + 1e-6:
+                    continue
+
+                anchors = _candidate_anchors(
+                    pocket,
+                    w,
+                    h,
+                )
+
+                for ax, ay in anchors:
+                    candidate = _place_pose_in_anchor(
+                        pose,
+                        ax,
+                        ay,
+                    )
+
+                    if not _is_legal(
+                        candidate,
+                        pose,
+                    ):
+                        continue
+
+                    gain = float(
+                        candidate.area
+                    )
+
+                    if gain <= 0.01:
+                        continue
+
+                    # ------------------------------------------------
+                    # Score the candidate.
+                    #
+                    # We want to use the small stones, but we should
+                    # still prefer the candidate that provides the
+                    # best useful coverage when several small seeds
+                    # can fit.
+                    #
+                    # Primary:
+                    #   additional covered area
+                    #
+                    # Secondary:
+                    #   how much of the candidate's bounding box is
+                    #   actually used by the pocket geometry
+                    #
+                    # Tertiary:
+                    #   smaller seed size, so small leftover pockets
+                    #   are actively exploited.
+                    # ------------------------------------------------
+                    try:
+                        pocket_overlap = (
+                            candidate.intersection(
+                                pocket
+                            ).area
+                        )
+                    except Exception:
+                        pocket_overlap = gain
+
+                    if pocket_overlap <= 0.01:
+                        continue
+
+                    # Higher = better.
+                    #
+                    # Area remains dominant. The small-size bonus is
+                    # deliberately tiny so we never sacrifice meaningful
+                    # coverage merely to use a smaller seed.
+                    compactness = (
+                        pocket_overlap
+                        / max(
+                            gain,
+                            1e-9,
+                        )
+                    )
+
+                    small_bonus = 1.0 / max(
+                        pose["area"],
+                        1.0,
+                    )
+
+                    score = (
+                        gain
+                        + 0.01
+                        * compactness
+                        + 0.05
+                        * small_bonus
+                    )
+
+                    candidate_info = {
+                        "score": score,
+                        "gain": gain,
+                        "pose": pose,
+                        "geometry": candidate,
+                    }
+
+                    if (
+                        best is None
+                        or score
+                        > best["score"]
+                    ):
+                        best = candidate_info
+
+        # Nothing in the remaining pockets can be added.
+        if best is None:
+            break
+
+        # -----------------------------------------------------------
+        # Commit the best new real seed.
+        # -----------------------------------------------------------
+        pose = best["pose"]
+        candidate = best["geometry"]
+
+        new_seed = _placement_record(
+            pose,
+            candidate,
+        )
+
+        placed_now.append(
+            new_seed
+        )
+
+        stock = pose["stock"]
+
+        used_stocks.add(
+            stock
+        )
+
+        # Update occupied geometry.
+        if clear > 0.0:
+            block_for_gap = candidate.buffer(
+                clear
+            )
+        else:
+            block_for_gap = candidate
+
+        occupied = unary_union([
+            occupied,
+            block_for_gap,
+        ])
+
+        # Recalculate the available region only from the newly placed
+        # seed. This avoids rebuilding the union of every seed every round.
+        gap_region = gap_region.difference(
+            block_for_gap
+        )
+
+        # Recalculate actual coverage from the placed seed outlines.
+        #
+        # UNION is essential; summing areas could double-count if numerical
+        # geometry ever produced a tiny overlap.
+        try:
+            covered = unary_union([
+                ShPoly(
+                    p["poly"]
+                ).buffer(0)
+                for p in placed_now
+                if p.get("poly")
+            ]).area
+
+            fill_now = (
+                100.0
+                * covered
+                / (
+                    math.pi
+                    * R
+                    * R
+                )
+            )
+        except Exception:
+            # Keep the previous valid coverage if a pathological polygon
+            # prevents the reporting union.
+            pass
+
+    return placed_now, fill_now
+
 
 def enhanced_plate_job(args):
     """MAX COVERAGE — pack the plate at several row phases and keep the best.
@@ -2194,14 +3857,15 @@ def enhanced_plate_job(args):
             "seat": SEAT_SCORES[0], "waste": 0.0, "nwaste": 0}
     tried = set()
 
-    def attempt(ph, policy, direction=None, seat=None):
-        direction = direction or best["dir"]
-        seat = seat or best["seat"]
-        key = (round(ph, 3), policy, direction, seat)
-        if key in tried or ph < 0.0:
-            return
-        tried.add(key)
-        pl, f = _pack_once(args, -R + ph, policy, direction, seat)
+    def consider(ph, policy, direction, seat, result):
+        """Score one finished pack and keep it if it beats the running best.
+
+        Split out of `attempt` so a batch of packs computed in parallel is
+        scored here, in the parent, in exactly the order the sequential sweep
+        would have scored them. `score > best` is strict, so order decides ties
+        and must not change.
+        """
+        pl, f = result
         waste, nw, stuck = _interior_waste(pl, disc)
         # SCORE = area that can actually be BUILT. Coverage on its own prefers
         # the layout that squeezes in more stones by putting crosses against flat
@@ -2221,22 +3885,65 @@ def enhanced_plate_job(args):
     # one's phase found 82.85% with an unbuildable seat when that policy's own
     # best was 83.50% with none. The pruned search returned a plate that was
     # neither policy's best. Coverage is worth more than the seconds saved.
-    for direction in FILL_DIRECTIONS:
-        for seat in SEAT_SCORES:
-            for policy in CUT_POLICIES:
-                for ph in ROW_PHASES:
-                    attempt(ph, policy, direction, seat)
+    #
+    # These combinations share no state, so they are computed ACROSS CORES and
+    # scored here in the parent in the original order. Same packs, same scoring,
+    # same tie-breaking — only the wall-clock changes. Measured on a 202-stone
+    # Ø90 pool: 46.8 s sequential against 13.5 s over 8 cores, with an identical
+    # winning fill of 84.43%. (Threads were tried and are WORSE than sequential,
+    # 68.5 s: two fifths of a pack is shapely's Python-level wrapper code, which
+    # holds the GIL.)
+    combos = [(ph, policy, direction, seat)
+              for direction in FILL_DIRECTIONS
+              for seat in SEAT_SCORES
+              for policy in CUT_POLICIES
+              for ph in ROW_PHASES]
+    for (ph, policy, direction, seat), result in zip(
+            combos, _parallel.run_packs(args, [(-R + ph, pol, d, st)
+                                               for ph, pol, d, st in combos])):
+        key = (round(ph, 3), policy, direction, seat)
+        if key in tried or ph < 0.0:
+            continue
+        tried.add(key)
+        consider(ph, policy, direction, seat, result)
+
     # Refine around the winner — the coarse step is wider than the difference
     # between a good phase and the best one. Only the winning combination is
     # refined; re-sweeping the losers costs a pack each for nothing.
+    #
+    # SEQUENTIAL on purpose, unlike the sweep above: each refine reads
+    # best["phase"], which the previous one may just have moved, so they are a
+    # dependent chain rather than independent work.
     for d in (-ROW_PHASE_REFINE, ROW_PHASE_REFINE, -ROW_PHASE_REFINE / 2,
               ROW_PHASE_REFINE / 2):
-        attempt(best["phase"] + d, best["policy"], best["dir"], best["seat"])
+        ph = best["phase"] + d
+        policy, direction, seat = best["policy"], best["dir"], best["seat"]
+        key = (round(ph, 3), policy, direction, seat)
+        if key in tried or ph < 0.0:
+            continue
+        tried.add(key)
+        consider(ph, policy, direction, seat,
+                 _pack_once(args, -R + ph, policy, direction, seat))
 
     placed, fill = best["placed"] or [], max(0.0, best["fill"])
+
+    # Existing final row-end improvement.
     placed, fill = _fill_row_ends(real, placed, fill, R)
+
+    # Residual pocket search. OFF by default — see RESIDUAL_FILL for the
+    # measurements: it is the largest single cost in a run AND the source of the
+    # scattered rim stones the floor rejected.
+    if RESIDUAL_FILL:
+        placed, fill = _fill_remaining_space(real, placed, fill, R)
+
+    # Rim pockets: the crescent left between the outermost stones and the edge.
+    # Additive, attached-only — see _fill_rim_pockets.
+    placed, fill = _fill_rim_pockets(real, placed, fill, R)
+
     render_enhanced_circle(placed, placed, pi, R, fill, path)
     return (pi, placed, round(fill, 4), round(2 * R, 4), 0.0)
+
+
 
 
 def _fill_row_ends(real, placed, fill, R):
@@ -2269,6 +3976,15 @@ def _fill_row_ends(real, placed, fill, R):
     from shapely.ops import unary_union
 
     disc = Point(0.0, 0.0).buffer(R, resolution=180)
+    # ONE PREPARED UNION, not a per-candidate spatial index.
+    #
+    # Replacing this with an STRtree over the individual stones was tried and is
+    # MEASURABLY WORSE: 844.8 s -> 1433.9 s on the reference plate, for
+    # byte-identical output. GEOS already indexes a MultiPolygon internally, so
+    # `g.intersects(taken)` is one cheap native call, while the index version
+    # pays a Python-level box construction, a query returning a numpy array, and
+    # a Python loop with two shapely calls per neighbour returned. At the handful
+    # of neighbours a seat actually has, that overhead dwarfs what it saves.
     taken = unary_union([Polygon(p["poly"]).buffer(0) for p in placed])
     # "Distance between seeds" from the criteria form applies to THESE seats too.
     # Without it this pass seated stones against their neighbours whatever the
@@ -2279,20 +3995,39 @@ def _fill_row_ends(real, placed, fill, R):
     if not spare:
         return placed, fill
 
-    poses = []
+    # Collapse candidates that are the SAME SIZE. The leftover inventory holds
+    # hundreds of stones, and probing each separately rediscovers the same answer
+    # — every row is re-scanned against every pose on every round, so this loop
+    # is where the pass spends its time.
+    #
+    # Matched EXACTLY, never to a tolerance. Bucketing by ~0.1 mm places the
+    # representative's outline and then labels it with a different stone's
+    # number, so the plate would show a seat the chosen stone does not have.
+    # Cut stones are not collapsed at all: their outlines differ in ways a
+    # bounding box cannot capture.
+    _shapes = {}
     for s in spare:
         g0 = _seed_footprint(s)
         if g0 is None:
             continue
         cut0 = _cut_direction(g0)
+        is_cut = cut0 is not None
         for deg in ENHANCED_ANGLES:
             rg = affinity.rotate(g0, deg, origin="centroid") if deg else g0
             b = rg.bounds
-            poses.append((s, deg, cut0 is not None,
-                          affinity.translate(rg, -b[0], -b[1]),
-                          b[2] - b[0], b[3] - b[1]))
-    if not poses:
+            w, h = b[2] - b[0], b[3] - b[1]
+            key = (s["stock"] if is_cut else (round(w, 6), round(h, 6)), deg, is_cut)
+            entry = _shapes.get(key)
+            if entry is None:
+                _shapes[key] = [deg, is_cut, affinity.translate(rg, -b[0], -b[1]),
+                                w, h, [s]]
+            else:
+                entry[5].append(s)
+    if not _shapes:
         return placed, fill
+    # (supply, deg, is_cut, geom, w, h) — `supply` is every stone that can fill
+    # this shape; the stock number is drawn from it only once a seat is won.
+    poses = [(e[5], e[0], e[1], e[2], e[3], e[4]) for e in _shapes.values()]
     narrow = min(p[4] for p in poses)
 
     rows = {}
@@ -2330,18 +4065,32 @@ def _fill_row_ends(real, placed, fill, R):
                 # left stones 10 and 15 mm out on a Ø100 plate.
                 above = [b for b in rows if b > y + 0.05]
                 head = (min(above) - y) if above else (R - y)
-                live.append((y, min(rh, head)))
+                # Carry the ROW's own height alongside the space actually free
+                # above it: the first bounds how tall a candidate may be, the
+                # second how SHORT it may be and still belong to this row.
+                live.append((y, min(rh, head), rh))
         if not live:
             break
 
         pick = None
-        for y, rh in live:
+        for y, rh, row_h in live:
             # Where the row already reaches, so a seat can be scored on how
             # close to it the stone ends up.
             row_lo = min(p["x"] for p in rows[y])
             row_hi = max(p["x"] + p["w"] for p in rows[y])
-            for s, deg, is_cut, rg, w, h in poses:
-                if s["stock"] in used or h > rh + 1e-9:
+            for supply, deg, is_cut, rg, w, h in poses:
+                if h > rh + 1e-9:
+                    continue
+                s = next((c for c in supply if c["stock"] not in used), None)
+                if s is None:
+                    continue               # every stone of this size is spent
+                # ...and not so much SHORTER than its row that the seat stops
+                # reading as part of the row. This pass legitimately seats a
+                # stone below full row height — that is how it reaches the
+                # trapezoid corner — but a stone under
+                # ROW_END_MIN_HEIGHT_FRAC of the row leaves a step the floor
+                # sees as a gap with a chip in it rather than a filled corner.
+                if h < ROW_END_MIN_HEIGHT_FRAC * row_h:
                     continue
                 # NEAREST THE ROW, not the first position that happens to fit.
                 # The sweep runs from -R upward, so for a seat at the LEFT end of
@@ -2359,45 +4108,92 @@ def _fill_row_ends(real, placed, fill, R):
                 # the seat by hundredths of a millimetre clears the protrusion
                 # and stays well inside ROW_LEVEL_TOL, so the row still reads
                 # level. Without this, two seats worth 219 mm2 were unreachable.
-                for lift in ROW_END_LIFTS:
+                for lift in _row_end_lifts(rh, h):
                     if h + lift > rh + 1e-9:
                         continue
                     yl = y + lift
-                    x = -R
-                    while x + w <= R:
+                    # Bound the sweep ANALYTICALLY instead of walking the whole
+                    # diameter and asking shapely at every step. A stone
+                    # occupying the band [yl, yl+h] can only be inside the disc
+                    # where |x| clears the narrower of the two edge half-chords,
+                    # so everything outside that is a guaranteed reject. The old
+                    # loop ran from -R to R at 0.25 mm — 320 positions, each
+                    # paying a disc.contains() against a 180-gon and an
+                    # intersects() against the union of every placed stone. On a
+                    # 20-round pass over 8 rows and ~1200 poses that is where the
+                    # time went.
+                    _yin = min(abs(yl), abs(yl + h))
+                    _hw = math.sqrt(R * R - _yin * _yin) if _yin < R else 0.0
+                    if 2.0 * _hw < w:
+                        continue                  # band is narrower than the stone
+                    x = -_hw
+                    x_stop = _hw - w
+                    # The seat must sit hard against the row it is filling
+                    # beside. A stone that lands with a channel behind it holds
+                    # the seat open, leaves a gap nothing can fill, and on the
+                    # plate reads as debris against the rim rather than a filled
+                    # corner — which is precisely why the previous wide-band
+                    # plate was rejected.
+                    #
+                    # A CUT stone is pinned to the rim and cannot be slid in
+                    # afterwards, so it has always been held to this. A whole
+                    # stone CAN nest, but only if it started close enough to
+                    # reach; letting it take a distant seat produced the scatter.
+                    _gap_max = ROW_END_CUT_GAP if is_cut else ROW_END_MAX_GAP
+                    while x <= x_stop + 1e-9:
+                        # DISTANCE FIRST. It is pure arithmetic, while everything
+                        # below builds a polygon and asks GEOS about it. Since
+                        # the seat is only acceptable within _gap_max of the row,
+                        # and we only want the CLOSEST one, most x positions can
+                        # be dismissed before any geometry exists at all — which
+                        # is what makes a 20-round pass affordable.
+                        if x + w <= row_lo:
+                            d = row_lo - (x + w)       # sits left of the row
+                        elif x >= row_hi:
+                            d = x - row_hi             # sits right of it
+                        else:
+                            d = 0.0                    # inside the row's span
+                        if d > _gap_max or (near is not None and d >= near[0]):
+                            x += ROW_END_STEP
+                            continue
                         g = affinity.translate(rg, x, yl)
                         if (disc.contains(g) and not g.intersects(taken)
                                 and g.distance(taken) >= clear - 1e-9):
                             ok = True
                             if is_cut:
-                                gap = R - max(math.hypot(px, py)
-                                              for px, py in g.exterior.coords)
-                                ok = (gap <= RIM_FLUSH
-                                      and _wasted_area(g, disc) <= CUT_NOTCH_MAX)
-                            if ok:
-                                if x + w <= row_lo:
-                                    d = row_lo - (x + w)   # sits left of the row
-                                elif x >= row_hi:
-                                    d = x - row_hi         # sits right of it
-                                else:
-                                    d = 0.0                # inside the row's span
-                                # A CUT stone is pinned to the rim and cannot be
-                                # slid in to meet its row, so it is only worth
-                                # taking when it lands beside the row already.
-                                # Otherwise it holds a seat open and leaves a
-                                # channel nothing can fill — on a Ø100 plate that
-                                # cost three gaps and 2.5 points of coverage. A
-                                # whole stone, which CAN nest, gets the seat.
-                                if is_cut and d > ROW_END_CUT_GAP:
-                                    ok = False
+                                # Was an inline copy of the rim + notch tests,
+                                # which drifted from _cut_on_rim the moment that
+                                # gained the outward-direction rule — and this is
+                                # one of the paths that let an inward-facing
+                                # cross onto a finished plate. Call the one test.
+                                ok = _cut_on_rim(g, R)
                             if ok:
                                 if near is None or d < near[0]:
                                     near = (d, g)
                         x += ROW_END_STEP
                     if near is not None and near[0] <= ROW_END_STEP:
                         break      # already tight against the row; no need to lift
-                if near is not None and (pick is None or near[1].area > pick[0]):
-                    pick = (near[1].area, s, deg, near[1], y, is_cut)
+                if near is not None:
+                    # LEVEL WITH ITS ROW FIRST, size second.
+                    #
+                    # This pass exists to reach the trapezoid corner beyond a
+                    # row's end, and a stone SHORTER than the row is how it gets
+                    # there — but only when nothing of the row's own height will
+                    # fit. Ranking on area alone ignored that completely, so a
+                    # 7.94 mm stone could win a seat at the end of a 9.3 mm row
+                    # purely for being wider, leaving a 1.4 mm step along the top
+                    # of an otherwise level row. On the plate that reads as a
+                    # broken row, which is the one thing the row rules exist to
+                    # prevent.
+                    #
+                    # `level` uses the SAME band the row packer holds a row to
+                    # (ROW_LEVEL_TOL), so "matches its row" means here exactly
+                    # what it means there. A level stone now beats any shorter
+                    # one whatever its area; among equals, the bigger still wins.
+                    level = 1 if (row_h - h) <= ROW_LEVEL_TOL else 0
+                    key = (level, near[1].area)
+                    if pick is None or key > pick[0]:
+                        pick = (key, s, deg, near[1], y, is_cut)
         if pick is None:
             break
 
@@ -2526,8 +4322,12 @@ def render_cross_circle(placed, real, pi, R, fill, path):
     DCOL = {"big": "#bcd6f0", "cross": "#f6c177", "tri": "#9ed99b", "irregular": "#c9a0dc", "dummy": "#f4a3a3"}
     DEDGE = {"big": "#1f6fb2", "cross": "#b9770f", "tri": "#2e8b3d", "irregular": "#7d3c98", "dummy": "#c0142c"}
 
-    fig = plt.figure(figsize=(14.5, 9.6))
-    gs = fig.add_gridspec(1, 2, width_ratios=[9.6, 5.0], wspace=0.02)
+    # Widen the panel for the seed list rather than squeezing the list into a
+    # fixed one — see LEGEND_MIN_ROW_IN. The plate panel keeps its 9.6 inches,
+    # so the plate itself renders exactly as before at every diameter.
+    _lw = _legend_panel_in(len(placed), 9.6 * 0.92)
+    fig = plt.figure(figsize=(9.6 + _lw, 9.6))
+    gs = fig.add_gridspec(1, 2, width_ratios=[9.6, _lw], wspace=0.02)
     ax = fig.add_subplot(gs[0, 0])
     axl = fig.add_subplot(gs[0, 1]); axl.axis("off")
 
@@ -2600,8 +4400,12 @@ def render_real_circle(real, pi, R, fill, path):
     cmap = plt.cm.viridis
     faces = [cmap(i / max(1, nr - 1)) for i in range(nr)]
 
-    fig = plt.figure(figsize=(14.5, 9.6))
-    gs = fig.add_gridspec(1, 2, width_ratios=[9.6, 5.0], wspace=0.02)
+    # Widen the panel for the seed list rather than squeezing the list into a
+    # fixed one — see LEGEND_MIN_ROW_IN. The plate panel keeps its 9.6 inches,
+    # so the plate itself renders exactly as before at every diameter.
+    _lw = _legend_panel_in(len(placed), 9.6 * 0.92)
+    fig = plt.figure(figsize=(9.6 + _lw, 9.6))
+    gs = fig.add_gridspec(1, 2, width_ratios=[9.6, _lw], wspace=0.02)
     ax = fig.add_subplot(gs[0, 0])
     axl = fig.add_subplot(gs[0, 1]); axl.axis("off")
 
@@ -2625,8 +4429,10 @@ def render_real_circle(real, pi, R, fill, path):
         # Seamless zero-gap look: each seat's edge painted in its own fill colour.
         ax.add_collection(PatchCollection([Rect((p["x"], p["y"]), p["w"], p["h"]) for p in real],
                           facecolor=faces, edgecolor=faces, linewidth=1.0, zorder=2))
+    _cw = [display_turn(p) for p in real]
     _draw_plate_numbers(ax, [(str(i + 1), p["x"] + p["w"] / 2, p["y"] + p["h"] / 2,
-                              p["w"] * p["h"], "white") for i, p in enumerate(real)])
+                              p["w"] * p["h"], "white") for i, p in enumerate(real)],
+                        angles=_cw)
     lim = PLATE / 2 + 3
     ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim); ax.set_aspect("equal"); ax.axis("off")
     circle_area = math.pi * R * R
@@ -2635,16 +4441,18 @@ def render_real_circle(real, pi, R, fill, path):
         f"Arrange · Plate {pi:02d} · {nr} seeds · {covered:.0f} of {circle_area:.0f} mm² "
         f"covered ({fill:.1f}%)\n"
         f"plate Ø{PLATE:g} · margin {margin:g} mm → usable Ø{2 * R:g} · "
-        f"distance between seeds {seed_gap:g} mm",
+        f"distance between seeds {seed_gap:g} mm\n"
+        f"{band_caption()}",
         fontsize=10.5)
 
     entries = [(faces[i], "#555", f"{i + 1}.",
-                f"{p['stock']}   {p['L']:.1f}×{p['W']:.1f}   H {p['H']:.2f}", "#111")
+                f"{p['stock']}   {p['L']:.1f}×{p['W']:.1f}   H {p['H']:.2f}   ↻{_cw[i]}°", "#111")
                for i, p in enumerate(real)]
     _draw_legend_list(
         axl, f"Seeds on this plate ({nr})",
-        f"real seeds only · {seed_gap:g} mm between seeds"
-        if seed_gap > 0 else "real seeds only · seeds touching",
+        ("real seeds only · "
+         + (f"{seed_gap:g} mm between seeds" if seed_gap > 0 else "seeds touching")
+         + "\n↻ = turn CLOCKWISE from the seed as measured"),
         entries)
 
     fig.savefig(path, dpi=125, bbox_inches="tight")

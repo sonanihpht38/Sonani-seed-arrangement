@@ -221,6 +221,23 @@ REST_FRAMEWORK = {
         "anon": env("THROTTLE_ANON", default="60/hour"),
         # Attach `throttle_scope = "login"` to the token view to brute-force-guard it.
         "login": env("THROTTLE_LOGIN", default="10/min"),
+        # POLLING gets its own budget, and must not draw on "user".
+        #
+        # An arrangement job is asynchronous: the client starts it and then polls
+        # GET /production/jobs/<id> until it finishes. A Max Coverage plate can
+        # take half an hour, so that one screen alone can issue thousands of
+        # requests for a single job — far more than the 1000/hour a person doing
+        # ordinary work needs.
+        #
+        # Sharing the "user" bucket meant the poll exhausted it mid-run, and
+        # THEN EVERY OTHER CALL 429'd: /me and the form catalogue included, so a
+        # user who signed in afterwards was authenticated but could not load the
+        # app at all. One long-running job locked the whole account out for the
+        # rest of the hour.
+        #
+        # The poll is a cache read, so it is cheap; this rate exists to bound a
+        # runaway client, not to ration normal use.
+        "job_poll": env("THROTTLE_JOB_POLL", default="6000/hour"),
     },
     "DEFAULT_RENDERER_CLASSES": (
         "rest_framework.renderers.JSONRenderer",
@@ -263,6 +280,24 @@ CELERY_TASK_ALWAYS_EAGER = env.bool("CELERY_TASK_ALWAYS_EAGER", default=False)
 CELERY_WORKER_PREFETCH_MULTIPLIER = env.int("CELERY_PREFETCH", default=1)
 CELERY_TASK_TIME_LIMIT = env.int("CELERY_TASK_TIME_LIMIT", default=300)
 CELERY_TASK_SOFT_TIME_LIMIT = env.int("CELERY_TASK_SOFT_TIME_LIMIT", default=270)
+
+# The plate-arrangement job overrides the two limits above — see
+# modules/production/tasks.py. 300 s is right for the email/export tasks the
+# global default was written for and far too short for the packer: Max Coverage
+# packs each plate 20 times, and on the live inventory one plate measured 86 s
+# with a Compare run reaching several minutes. Hitting the global limit killed
+# the worker mid-plate, which surfaced as a job stuck at "running" forever.
+# 7200 s, not 3600. Measured end to end on the live inventory: a Ø90 plate at
+# seed width 2-10 takes ~1990 s, and the cost scales with the USABLE AREA, so a
+# Ø158 (usable Ø148, 17203 mm2 against Ø90's 5027) runs several times longer and
+# was being SIGKILLed mid-plate at the old ceiling. A killed task leaves the job
+# row stuck at "running" forever, which reaches the user as a screen that never
+# finishes and never reports an error.
+#
+# This is a CEILING, not a target — it stops a pathological run pinning a worker,
+# and nothing normal comes close to it. The lever that actually shortens a run is
+# the seed-width band on the Criteria form.
+PRODUCTION_JOB_TIME_LIMIT = env.int("PRODUCTION_JOB_TIME_LIMIT", default=7200)
 CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
 
 # Beat schedule. Run the scheduler with `celery -A config beat -l info`

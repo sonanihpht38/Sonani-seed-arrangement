@@ -50,6 +50,9 @@ export interface ArrangementRow {
   plateDiameter: number | null;
   thicknessMin: number | null;
   thicknessMax: number | null;
+  /** Seed-width band the run was generated with; null at either end = unbounded. */
+  widthMin: number | null;
+  widthMax: number | null;
   batches: string[];
   entryDate: string | null;
   /** Real run timestamp (from the plate rows) — the header's EntryDate is date-only. */
@@ -151,6 +154,26 @@ export interface Job {
   enhancedAvg: number;
   arrangeId: string | null;
   seedsMatched: number | null;
+  /** Rows excluded because no orientation of them fits the plate (bad data). */
+  seedsOversize: number;
+  /**
+   * Which filter emptied the pool, when nothing matched — null on any run that
+   * produced seeds. The screen must NOT infer this: it used to blame the
+   * seed-width band on every empty run, and sent a user to widen a band that
+   * was matching all 190 seeds in stock while the thickness range was what had
+   * actually excluded them.
+   */
+  emptyReason: EmptyReason | null;
+}
+
+/** Ranges are [min, max] of what the STOCK holds, not what was asked for. */
+export interface EmptyReason {
+  reason: "thickness" | "width" | "oversize" | "shape" | "incomplete" | "empty";
+  examined: number;
+  removed?: number;
+  counts?: Partial<Record<"thickness" | "width" | "oversize" | "shape" | "incomplete", number>>;
+  thicknessSeen?: [number, number] | null;
+  widthSeen?: [number, number] | null;
 }
 
 export interface CreateJobResult {
@@ -233,9 +256,29 @@ export interface FinalizedPlate {
 export interface Criteria {
   mode: "mixed";
   shape: Shape;
+  /**
+   * Where "square" ends and "rectangle" begins, as a fraction of the longer
+   * side: a seed is square when |L − W| ≤ squareTol × max(L, W).
+   *
+   * ONLY consulted when `shape` is "square" or "rectangle". With "all" both
+   * classes are accepted, so this value cannot change which seeds are arranged.
+   */
   squareTol: number;
   tLo: number;
   tHi: number;
+  /**
+   * Seed-width band in mm, where a seed's width is the SHORTER of its two
+   * measured sides (rotation-invariant — the packer turns seeds freely, so the
+   * stored Length/Width order must not decide whether a seed qualifies).
+   *
+   * REQUIRED: both ends must be set before a job can be started. The band is a
+   * manufacturing constraint — an unbounded pool mixes 2 mm and 14 mm stones and
+   * yields a plate the floor will not build. Typed nullable only so criteria
+   * saved before the field existed still parse; the form refuses to submit
+   * without them.
+   */
+  wLo: number | null;
+  wHi: number | null;
   plateD: number;
   margin: number;
   minSeed: number;
