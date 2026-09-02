@@ -393,17 +393,55 @@ def _draw_plate_numbers(ax, items, angles=None):
 # needs, with the panel widened to hold them. Legibility then does not depend on
 # the plate diameter, the seed count, or the band.
 LEGEND_MIN_ROW_IN = 0.16    # inches — row pitch that keeps ~8 pt text clear
-# Width one column needs. A seed row runs about 40 characters — "DOMI001169
-# 14.35x10.35  H 0.73  turn 0deg" — and DejaVu Sans averages ~0.6 em per
-# character, so at the ~7 pt this pitch yields the text alone wants 2.3 inches,
-# plus the swatch and the number field. 2.8 was measured too tight: the trailing
-# angle of one column printed over the next column's number.
-LEGEND_COL_IN = 3.4
 LEGEND_MIN_PANEL_IN = 5.0   # inches — never narrower than the original panel
+
+# A COLUMN IS AS WIDE AS ITS TEXT, never a fixed number of inches. This shipped
+# as LEGEND_COL_IN = 3.4 and that was a latent bug of the same shape as the
+# millimetre size-gradient tolerance: a constant paired with something that
+# varies. The FONT is sized from the row pitch, so it grows when a column holds
+# fewer rows — and a wider font needs a wider column, which a constant cannot
+# give it. Measured on the shipped build:
+#
+#   seeds  rows/col  font    text     column   result
+#   150    50        7.0 pt  2.20 in  3.40 in  fits
+#    71    36        8.6 pt  2.88 in  3.40 in  needs 3.44 in — OVERFLOWS
+#
+# So FEWER seeds was worse, which is why Ø158 looked right while a Ø110 plate of
+# 71 seeds printed its rotation angle underneath the next column's number. 3.4
+# was calibrated against the 150-seed case at 7 pt and never checked at another
+# size. Sweeping every count from 2 to 400 found 48 of them broken: 56-84,
+# 111-126 and 166-168.
+#
+# Deriving the width from the font instead removes the coupling entirely — there
+# is no value left to re-tune when the font, the row format or the plate changes.
+LEGEND_EM_PER_CHAR = 0.55   # DejaVu Sans average advance, measured from a render
+# A seed row is "<stock>   <L>x<W>   H <t>   turn <a>deg" — about 44 characters.
+# Sized for 48 so a long stock number or a trailing cut note has somewhere to go.
+LEGEND_ENTRY_CHARS = 48
+LEGEND_TEXT_FRAC = 0.835    # share of a column left for text, after swatch+number
+LEGEND_COL_PAD_IN = 0.12    # gutter, so two columns never touch
+
+
+def _legend_font_pt(per_col, panel_h_in):
+    """Text size for a column holding `per_col` rows — driven by the row pitch it
+    actually has, which is what decides whether the rows collide."""
+    rh_in = panel_h_in / max(1, per_col)
+    return min(8.6, max(5.5, rh_in * 72.0 * 0.55))
+
+
+def _legend_col_in(font_pt):
+    """How wide a column must be to hold one seed row at this font size."""
+    text_in = LEGEND_ENTRY_CHARS * font_pt * LEGEND_EM_PER_CHAR / 72.0
+    return (text_in + LEGEND_COL_PAD_IN) / LEGEND_TEXT_FRAC
 
 
 def _legend_shape(n, panel_h_in):
-    """(columns, rows per column) for `n` seed-list rows in a panel that tall."""
+    """(columns, rows per column) for `n` seed-list rows in a panel that tall.
+
+    Height only — how many rows fit is a function of the pitch, and the width
+    that implies is settled afterwards by _legend_col_in. Keeping the two apart
+    is what makes the chain acyclic.
+    """
     n = max(int(n), 1)
     per_col = max(1, int(panel_h_in / LEGEND_MIN_ROW_IN))
     ncols = max(1, int(math.ceil(n / float(per_col))))
@@ -414,8 +452,9 @@ def _legend_shape(n, panel_h_in):
 
 def _legend_panel_in(n, panel_h_in):
     """How wide the seed-list panel has to be to hold `n` rows legibly."""
-    ncols, _ = _legend_shape(n, panel_h_in)
-    return max(LEGEND_MIN_PANEL_IN, ncols * LEGEND_COL_IN)
+    ncols, per_col = _legend_shape(n, panel_h_in)
+    return max(LEGEND_MIN_PANEL_IN,
+               ncols * _legend_col_in(_legend_font_pt(per_col, panel_h_in)))
 
 
 def _draw_legend_list(axl, title, subtitle, entries):
@@ -437,12 +476,13 @@ def _draw_legend_list(axl, title, subtitle, entries):
     n = max(len(entries), 1)
     bot = 0.005
     panel_h = float(axl.figure.get_size_inches()[1])
-    ncols, per_col = _legend_shape(n, panel_h * (top - bot))
+    list_h = panel_h * (top - bot)
+    ncols, per_col = _legend_shape(n, list_h)
     rh = (top - bot) / per_col
-    # Size the text from the pitch it actually has, not from the seed count. The
-    # old `190 / n` bottomed out at its floor on any long list and then said
-    # nothing about whether the rows had room.
-    lfs = min(8.6, max(5.5, rh * panel_h * 72.0 * 0.55))
+    # ONE font formula, shared with the sizing helpers. Computing it separately
+    # here is how the column width and the text drifted apart: the panel was
+    # sized for one size and drawn at another.
+    lfs = _legend_font_pt(per_col, list_h)
     colw = 1.0 / ncols
     for i, (color, edge, num, text, tcolor) in enumerate(entries):
         c, r = divmod(i, per_col)

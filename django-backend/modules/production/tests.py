@@ -2035,11 +2035,37 @@ class SeedListLayoutTests(SimpleTestCase):
         the columns being squeezed into a fixed width and overlapping."""
         from .engine_runner import D
 
-        ncols, _ = D._legend_shape(150, self.PANEL_H)
+        ncols, per_col = D._legend_shape(150, self.PANEL_H)
         self.assertGreater(ncols, 1, "150 seeds must flow into columns")
+        need = ncols * D._legend_col_in(D._legend_font_pt(per_col, self.PANEL_H))
         self.assertGreaterEqual(
-            D._legend_panel_in(150, self.PANEL_H), ncols * D.LEGEND_COL_IN,
+            D._legend_panel_in(150, self.PANEL_H), need,
             "the panel is narrower than the columns it has to hold")
+
+    def test_a_column_is_wide_enough_for_its_own_text_at_every_count(self):
+        """The defect a FIXED column width caused, and the reason the width is
+        now derived from the font.
+
+        The font is sized from the row pitch, so it GROWS when a column holds
+        fewer rows — and a bigger font needs a wider column. At 3.4 inches flat,
+        a 71-seat Ø110 plate drew 8.6 pt text needing 3.44 in and printed its
+        rotation angle underneath the next column's number. Fewer seeds was
+        worse, which is why a 150-seat plate looked fine. Sweeping every count
+        found 48 broken: 56-84, 111-126, 166-168.
+        """
+        from .engine_runner import D
+
+        for n in list(range(2, 200)) + [250, 300, 400]:
+            ncols, per_col = D._legend_shape(n, self.PANEL_H)
+            if ncols < 2:
+                continue                      # one column owns the whole panel
+            colw = D._legend_panel_in(n, self.PANEL_H) / ncols
+            font = D._legend_font_pt(per_col, self.PANEL_H)
+            text = D.LEGEND_ENTRY_CHARS * font * D.LEGEND_EM_PER_CHAR / 72.0
+            self.assertLessEqual(
+                (1.0 - D.LEGEND_TEXT_FRAC) * colw + text, colw,
+                "%d seeds: %.1f pt text needs more than the %.2f in column, so "
+                "one column prints over the next" % (n, font, colw))
 
     def test_columns_are_balanced(self):
         """A stub last column wastes the width it cost — 150 over 3 columns is
