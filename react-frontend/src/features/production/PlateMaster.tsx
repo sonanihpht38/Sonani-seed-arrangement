@@ -52,6 +52,20 @@ export function PlateMaster() {
     onSuccess: (r) => { notify.success(`Plate "${r.plateName}" unassigned`); invalidate(); },
     onError: (e) => notify.error(e instanceof Error ? e.message : "Unassign failed"),
   });
+  // Turn a plate on or off WITHOUT the edit modal, because the modal saves over
+  // PUT and live never receives it: IIS answers PUT and DELETE with 405 before
+  // Django is reached. Finalization can take a plate out of circulation, so
+  // there has to be a way back in, and this is it — the same POST endpoint,
+  // called the other way.
+  const activeMut = useMutation({
+    mutationFn: (v: { id: number; active: boolean }) =>
+      productionApi.setPlateActive(v.id, v.active),
+    onSuccess: (r) => {
+      notify.success(`${r.plateName ?? "Plate"} ${r.active ? "activated" : "deactivated"}`);
+      invalidate();
+    },
+    onError: (e) => notify.error(e instanceof Error ? e.message : "Could not change the plate"),
+  });
 
   function open(p: SeedPlate | "new") {
     setModal(p);
@@ -82,6 +96,19 @@ export function PlateMaster() {
               Unassign
             </ActionButton>
           )}
+          {/* Active on/off in one click. A plate a run is still holding is left
+              alone — it has to be unassigned first, and the backend refuses it
+              anyway rather than hiding committed stock behind a dropdown. */}
+          {canUpdate && !p.data.is_used && (
+            <ActionButton
+              size="small"
+              loading={activeMut.isPending && activeMut.variables?.id === p.data.plate_id}
+              onClick={() => activeMut.mutate({
+                id: p.data.plate_id, active: !p.data.is_active })}
+            >
+              {p.data.is_active ? "Deactivate" : "Activate"}
+            </ActionButton>
+          )}
           {canDelete && (
             <DeleteButton size="small" confirm={`Delete plate "${p.data.plate_name}"?`}
               onConfirm={() => delMut.mutate(p.data.plate_id)} />
@@ -90,7 +117,8 @@ export function PlateMaster() {
       ),
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  ], [canUpdate, canDelete, releaseMut.isPending, releaseMut.variables]);
+  ], [canUpdate, canDelete, releaseMut.isPending, releaseMut.variables,
+      activeMut.isPending, activeMut.variables]);
 
   return (
     <Space direction="vertical" size="large" style={{ display: "flex" }}>

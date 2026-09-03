@@ -36,6 +36,10 @@ _PLATE_PERM = {
     # Unassigning changes the plate's state, not the inventory — same right as
     # an edit, so a user who may correct a plate may also free it.
     "release": "edit",
+    # POST twins of update/destroy, for a server that will not forward PUT or
+    # DELETE. Same rights as the verbs they stand in for — the door changed,
+    # not who may walk through it.
+    "save": "edit", "remove": "delete",
 }
 
 _VALID_ACTIONS = {"arrange", "machinefill", "compare", "enhanced"}
@@ -283,6 +287,35 @@ class PlateMasterViewSet(viewsets.ModelViewSet):
         this screen has neither, so it gets its own door onto the same rule.
         """
         return Response(PlateService.release_plate(pk))
+
+    # ---- POST doors onto PUT and DELETE ------------------------------------
+    # Live serves this app through IIS, whose WebDAV module answers PUT and
+    # DELETE with 405 before Django is reached — so the ViewSet's own update and
+    # destroy are unreachable there while every POST works. These two actions
+    # change nothing about the rules: `save` runs the SAME serializer, and
+    # `remove` runs the SAME perform_destroy guard. They only arrive by a verb
+    # the server will forward.
+
+    @action(detail=True, methods=["post"])
+    def save(self, request, pk=None):
+        """Edit a plate's name or diameter. The POST twin of PUT."""
+        obj = self.get_object()
+        ser = self.get_serializer(obj, data=request.data, partial=True)
+        ser.is_valid(raise_exception=True)
+        ser.save()
+        return Response(ser.data)
+
+    @action(detail=True, methods=["post"])
+    def remove(self, request, pk=None):
+        """Delete a plate. The POST twin of DELETE.
+
+        Routed through perform_destroy so the "assigned to an arrangement"
+        refusal still applies — deleting a plate a run is holding would leave
+        TRN_SeedPlate naming a Plate_ID that no longer exists.
+        """
+        obj = self.get_object()
+        self.perform_destroy(obj)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     def perform_destroy(self, instance):
         """Refuse to delete a plate an arrangement is still using.

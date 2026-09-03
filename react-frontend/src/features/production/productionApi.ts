@@ -65,8 +65,15 @@ export const productionApi = {
   // Plate Master (MST_SeedPlate inventory) — CRUD.
   listPlateMaster: () => api.get<SeedPlate[]>("/production/plate-master/"),
   createPlate: (p: PlateInput) => api.post<SeedPlate>("/production/plate-master/", p),
-  updatePlate: (id: number, p: PlateInput) => api.put<SeedPlate>(`/production/plate-master/${id}/`, p),
-  deletePlate: (id: number) => api.del<void>(`/production/plate-master/${id}/`),
+  // Edit and delete go over POST, not PUT/DELETE. Live serves the app through
+  // IIS, whose WebDAV module answers those two verbs with 405 before Django is
+  // reached, so the ViewSet's own update/destroy are unreachable there. These
+  // hit `save` and `remove`, which run the SAME serializer and the SAME
+  // "assigned to an arrangement" guard — only the verb differs.
+  updatePlate: (id: number, p: PlateInput) =>
+    api.post<SeedPlate>(`/production/plate-master/${id}/save/`, p),
+  deletePlate: (id: number) =>
+    api.post<void>(`/production/plate-master/${id}/remove/`, {}),
   // Unassign from the Plate Master screen. Finalization's releasePlate needs an
   // arrangement; this one works from the plate alone, which is all this screen has.
   releasePlateById: (id: number) =>

@@ -2190,3 +2190,105 @@ class SetPlateActiveTests(TransactionTestCase):
         """The whole point of the endpoint: live's IIS blocks PUT and DELETE."""
         from modules.production.views import SetPlateActiveView
         self.assertEqual(sorted(SetPlateActiveView().allowed_methods), ["OPTIONS", "POST"])
+
+
+class PlateMasterPostVerbTests(TransactionTestCase):
+    """Editing and deleting a plate over POST, because live cannot use PUT/DELETE.
+
+    IIS's WebDAV module answers both verbs with 405 before Django is reached, so
+    the ViewSet's own update and destroy are unreachable on live while every POST
+    works. `save` and `remove` are doors onto the SAME behaviour — these tests
+    pin that they validate and refuse exactly as their PUT/DELETE twins do, so
+    the workaround cannot drift into a second set of rules.
+    """
+
+    available_apps = ["modules.production", "modules.access", "modules.accounts",
+                      "django.contrib.auth", "django.contrib.contenttypes"]
+
+    @classmethod
+    def _unmanaged(cls):
+        from django.apps import apps
+        return [m for m in apps.get_app_config("production").get_models()
+                if not m._meta.managed]
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        from django.db import connection
+        with connection.schema_editor() as se:
+            for m in cls._unmanaged():
+                se.create_model(m)
+
+    @classmethod
+    def tearDownClass(cls):
+        from django.db import connection
+        with connection.schema_editor() as se:
+            for m in cls._unmanaged():
+                se.delete_model(m)
+        super().tearDownClass()
+
+    def setUp(self):
+        import uuid as _uuid
+
+        from django.contrib.auth import get_user_model
+        from rest_framework.test import APIClient
+
+        from .models import SeedArrangePlate, SeedPlate
+        SeedPlate.objects.all().delete()
+        SeedArrangePlate.objects.all().delete()
+        self.SeedPlate, self.SeedArrangePlate = SeedPlate, SeedArrangePlate
+        self.arrange_id = _uuid.uuid4()
+        self.user = get_user_model().objects.create_superuser("pv", "pv@x.y", "pw12345!")
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+    def test_save_edits_the_name_and_diameter(self):
+        p = self.SeedPlate.objects.create(plate_name="OLD", diameter=90, is_active=True)
+        r = self.client.post("/api/production/plate-master/%d/save/" % p.plate_id,
+                             {"plate_name": "NEW", "diameter": 158}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        p.refresh_from_db()
+        self.assertEqual(p.plate_name, "NEW")
+        self.assertEqual(int(p.diameter), 158)
+
+    def test_save_still_validates(self):
+        """The POST door runs the serializer, so a bad payload is still a 400 —
+        it is not a way round the rules."""
+        p = self.SeedPlate.objects.create(plate_name="V", diameter=90, is_active=True)
+        r = self.client.post("/api/production/plate-master/%d/save/" % p.plate_id,
+                             {"plate_name": "x" * 200}, format="json")
+        self.assertEqual(r.status_code, 400, r.content)
+
+    def test_remove_deletes_a_free_plate(self):
+        p = self.SeedPlate.objects.create(plate_name="GONE", diameter=90, is_active=True)
+        r = self.client.post("/api/production/plate-master/%d/remove/" % p.plate_id,
+                             {}, format="json")
+        self.assertEqual(r.status_code, 204, r.content)
+        self.assertFalse(self.SeedPlate.objects.filter(pk=p.plate_id).exists())
+
+    def test_remove_refuses_a_plate_an_arrangement_is_holding(self):
+        """The guard that matters. Deleting a plate a run still names would leave
+        TRN_SeedPlate pointing at a Plate_ID that no longer exists, and the same
+        physical plate could then be handed to a second arrangement."""
+        p = self.SeedPlate.objects.create(plate_name="BUSY", diameter=90,
+                                          is_active=True, is_used=True, is_released=False)
+        self.SeedArrangePlate.objects.create(arrange_id=self.arrange_id, plate_no=1,
+                                             plate_id=p.plate_id, plate_name="BUSY")
+        r = self.client.post("/api/production/plate-master/%d/remove/" % p.plate_id,
+                             {}, format="json")
+        self.assertEqual(r.status_code, 409, r.content)
+        self.assertTrue(self.SeedPlate.objects.filter(pk=p.plate_id).exists())
+
+    def test_both_doors_reach_the_same_place(self):
+        """PUT and the POST twin must produce the same row, or live and local
+        would quietly diverge."""
+        a = self.SeedPlate.objects.create(plate_name="A", diameter=70, is_active=True)
+        b = self.SeedPlate.objects.create(plate_name="B", diameter=70, is_active=True)
+        self.client.put("/api/production/plate-master/%d/" % a.plate_id,
+                        {"plate_name": "A2", "diameter": 110, "is_active": False},
+                        format="json")
+        self.client.post("/api/production/plate-master/%d/save/" % b.plate_id,
+                         {"plate_name": "B2", "diameter": 110, "is_active": False},
+                         format="json")
+        a.refresh_from_db(); b.refresh_from_db()
+        self.assertEqual((int(a.diameter), a.is_active), (int(b.diameter), b.is_active))
