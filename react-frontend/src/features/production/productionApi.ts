@@ -72,6 +72,18 @@ export const productionApi = {
   releasePlateById: (id: number) =>
     api.post<{ released: boolean; plateName: string | null; clearedFrom: number }>(
       `/production/plate-master/${id}/release/`, {}),
+  // Take a plate out of the Finalization dropdown, or put it back. This is the
+  // app's SOFT DELETE: MST_SeedPlate carries no foreign keys, so removing a row
+  // would silently orphan the arrangements naming it, and `is_active` already
+  // decides which plates Finalization offers.
+  //
+  // POST in BOTH directions, deliberately. Live runs under IIS, whose WebDAV
+  // module answers PUT and DELETE with 405 before Django sees them — the reason
+  // updatePlate and deletePlate above do not work there. A one-way endpoint
+  // would let a plate be deactivated on live with no way to restore it.
+  setPlateActive: (plateId: number, active: boolean) =>
+    api.post<{ plateId: number; plateName: string | null; active: boolean }>(
+      "/production/plates/set-active", { plateId, active }),
 
   // Plate names available to assign in Finalization (from the master pool).
   availablePlates: () => api.get<AvailablePlate[]>("/production/plates"),

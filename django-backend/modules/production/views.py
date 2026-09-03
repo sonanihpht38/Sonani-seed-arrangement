@@ -217,6 +217,31 @@ class ReleasePlateView(APIView):
             getattr(request.user, "id", None)))
 
 
+class SetPlateActiveView(APIView):
+    """Take a plate out of the Finalization dropdown, or put it back.
+
+    Body {plateId, active}. POST both ways on purpose: it is the SAME operation
+    in either direction, and live cannot use PUT or DELETE — IIS's WebDAV module
+    answers those with 405 before Django sees them, which is why Plate Master's
+    edit and delete do not work there. A one-way endpoint would let a user
+    deactivate a plate on live and then have no way to restore it.
+
+    Permission follows the master it edits, not the screen it is pressed from:
+    this writes MST_SeedPlate, so it asks for plate_master/save exactly as the
+    Plate Master screen does.
+    """
+
+    permission_classes = [HasFormPermission.require("plate_master", "save")]
+
+    def post(self, request):
+        try:
+            return Response(PlateService.set_active(
+                request.data.get("plateId"), request.data.get("active", False),
+                getattr(request.user, "id", None)))
+        except DomainError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
 class FinalizeArrangementView(APIView):
     """Inventory state of one arrangement.
 

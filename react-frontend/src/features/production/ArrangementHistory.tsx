@@ -8,7 +8,7 @@
 
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Card, Space, Typography, Alert, Drawer, Tag, Button, Spin, Empty, Descriptions, Row, Col, Image } from "antd";
+import { Card, Space, Typography, Alert, Drawer, Tag, Button, Spin, Empty, Descriptions, Row, Col, Image, Select } from "antd";
 import type { ColDef } from "ag-grid-community";
 import { useAuth } from "../auth/useAuth";
 import { productionApi } from "./productionApi";
@@ -16,7 +16,7 @@ import { notify } from "../../lib/notify";
 import { mediaUrl } from "../../lib/media";
 import type { ArrangementRow, ArrangementSeed } from "./types";
 import { DataGrid } from "../../components/DataGrid";
-import { FiInfo, FiEye, FiDownload, FiRefreshCw } from "../../components/icons";
+import { FiInfo, FiEye, FiDownload, FiRefreshCw, FiCheck } from "../../components/icons";
 import { colors, alpha } from "../../theme";
 
 const { Text } = Typography;
@@ -81,26 +81,48 @@ const SEED_COLS_CUT: ColDef<ArrangementSeed>[] = [
 export function ArrangementHistory() {
   const [openId, setOpenId] = useState<string | null>(null);
   const { can } = useAuth();
-  const canRelease = can("finalization", "save");
+  // Naming a plate consumes inventory, so it needs the same permission the
+  // Finalization screen asks for.
+  const canAssign = can("finalization", "save");
   const qc = useQueryClient();
 
   const listQ = useQuery({ queryKey: ["arrangements"], queryFn: productionApi.listArrangements });
-  // Hand a run's seeds back to the available pool. The per-plate route is
-  // Finalization's Release; this frees everything the run holds at once, which
-  // is the only way back when its job no longer exists.
-  const releaseMut = useMutation({
-    mutationFn: (arrangeId: string) => productionApi.unfinalizeArrangement(arrangeId),
-    onSuccess: (r) => {
-      notify.success(`${r.returned} seeds returned to the available list.`);
-      qc.invalidateQueries({ queryKey: ["arrangements"] });
-    },
-    onError: (e) => notify.error(e instanceof Error ? e.message : "Return failed"),
-  });
   const detailQ = useQuery({
     queryKey: ["arrangement", openId],
     queryFn: () => productionApi.getArrangement(openId!),
     enabled: !!openId,
   });
+
+  // ---- Assign a plate name from HERE -------------------------------------
+  // The normal route is Result -> Finalize, and a user who skipped it had no way
+  // back once the job had expired: this screen reads TRN_SeedPlate, so it is the
+  // one place a past run is still reachable. Assigning only — RELEASING stays in
+  // Finalization, which is where the per-plate inventory view lives.
+  const availQ = useQuery({
+    queryKey: ["available-plates"],
+    queryFn: productionApi.availablePlates,
+    enabled: !!openId,
+  });
+  const [pick, setPick] = useState<Record<number, string | undefined>>({});
+  const assignMut = useMutation({
+    mutationFn: (v: { plateNo: number; plateName: string }) =>
+      productionApi.assignPlate(openId!, v.plateNo, v.plateName),
+    onSuccess: (r) => {
+      notify.success(
+        `Named "${r.plateName}" — ${r.seedsConsumed} seeds removed from the available list.`);
+      detailQ.refetch();
+      availQ.refetch();
+      qc.invalidateQueries({ queryKey: ["arrangements"] });
+      qc.invalidateQueries({ queryKey: ["finalized-plates"] });
+    },
+    onError: (e) => notify.error(e instanceof Error ? e.message : "Assign failed"),
+  });
+  const nameOptions = useMemo(
+    () => (availQ.data ?? [])
+      .filter((p) => !p.isUsed)
+      .map((p) => ({ value: p.plateName, label: p.plateName }))
+      .sort((a, b) => a.label.localeCompare(b.label)),
+    [availQ.data]);
 
   const rows = listQ.data ?? [];
   const detail = detailQ.data;
@@ -132,30 +154,23 @@ export function ArrangementHistory() {
       },
       { headerName: "Plates", field: "plateCount", minWidth: 90 },
       {
-        // Inventory this run is holding. Releasing lives here because this
-        // screen always works — Finalization needs a live job, which is gone
-        // once the backend restarts, taking its release button with it.
+        // How much inventory this run is holding — REPORTED here, never changed.
+        //
+        // A "Return" button lived in this cell and has been removed. It called
+        // DELETE on the unfinalize route, and live serves the app through IIS,
+        // whose WebDAV module answers DELETE with 405 before Django is reached —
+        // so it could never work there. It also offered a second way to hand
+        // stock back that disagreed with the first: this one freed a whole run
+        // at once, while Finalization frees one plate at a time. Releasing is
+        // now a single action in a single place: Finalization, per plate, POST.
         headerName: "Seeds held",
         field: "seedsHeld",
-        minWidth: 150,
+        minWidth: 130,
         cellRenderer: (p: { data?: ArrangementRow }) => {
           const n = p.data?.seedsHeld ?? 0;
           if (!p.data) return null;
           if (!n) return <Text type="secondary">—</Text>;
-          return (
-            <Space size={6}>
-              <Tag color="green" style={{ margin: 0 }}>{n}</Tag>
-              {canRelease && (
-                <Button
-                  size="small"
-                  loading={releaseMut.isPending && releaseMut.variables === p.data.arrangeId}
-                  onClick={() => releaseMut.mutate(p.data!.arrangeId)}
-                >
-                  Return
-                </Button>
-              )}
-            </Space>
-          );
+          return <Tag color="green" style={{ margin: 0 }}>{n}</Tag>;
         },
       },
       {
@@ -207,7 +222,7 @@ export function ArrangementHistory() {
       },
     ],
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [canRelease, releaseMut.isPending, releaseMut.variables],
+    [canAssign],
   );
 
   return (
@@ -297,11 +312,40 @@ export function ArrangementHistory() {
                   <div key={p.plateNo} style={{ border: `1px solid ${colors.border}`, borderRadius: 8, padding: 12 }}>
                     <Space wrap style={{ marginBottom: 10 }}>
                       <Text strong>Plate {p.plateNo}</Text>
-                      {p.plateName && (
+                      {p.plateName ? (
                         <Tag style={{ margin: 0, color: colors.primary, borderColor: alpha(colors.primary, 0.35), background: alpha(colors.primary, 0.08) }}>
                           {p.plateName}
                         </Tag>
-                      )}
+                      ) : canAssign ? (
+                        // The second chance at naming a plate. Assign only: this
+                        // consumes the seeds, and handing them back stays in
+                        // Finalization where the inventory view is.
+                        <>
+                          <Select
+                            showSearch
+                            allowClear
+                            size="small"
+                            style={{ width: 200 }}
+                            placeholder="Assign a plate name…"
+                            value={pick[p.plateNo]}
+                            onChange={(v) => setPick((s) => ({ ...s, [p.plateNo]: v }))}
+                            options={nameOptions}
+                            loading={availQ.isLoading}
+                            notFoundContent={<Text type="secondary">No free plates in the master.</Text>}
+                          />
+                          <Button
+                            size="small"
+                            type="primary"
+                            icon={<FiCheck />}
+                            loading={assignMut.isPending && assignMut.variables?.plateNo === p.plateNo}
+                            disabled={!pick[p.plateNo]}
+                            onClick={() => assignMut.mutate({
+                              plateNo: p.plateNo, plateName: pick[p.plateNo]! })}
+                          >
+                            Assign
+                          </Button>
+                        </>
+                      ) : null}
                       <Text type="secondary">
                         {p.realSeedCount ?? 0} seed{p.realSeedCount === 1 ? "" : "s"}
                         {p.dummyCount ? ` · ${p.dummyCount} dummy` : ""}

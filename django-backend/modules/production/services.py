@@ -626,6 +626,53 @@ class PlateService:
         return {"released": True, "plateName": master.plate_name, "clearedFrom": cleared}
 
     @staticmethod
+    @transaction.atomic
+    def set_active(plate_id, active, user_id=None):
+        """Take a plate out of circulation, or put it back. Touches ISActive ONLY.
+
+        `is_active` is not a display flag: the plate names Finalization offers are
+        `SeedPlate.objects.filter(is_active=True)`, so clearing it is what removes
+        a plate from the dropdown. That makes it the SOFT DELETE this app wants —
+        the row stays, the arrangements that named it keep their history, and the
+        same call puts it back.
+
+        WHY THIS IS A POST AND NOT A DELETE OR PUT. Live runs under IIS, whose
+        WebDAV module answers DELETE and PUT with 405 before the request reaches
+        Python — the same reason Plate Master's edit and delete and Finalization's
+        "Return all" do not work there while every POST does. A hard delete would
+        also be the wrong shape regardless: MST_SeedPlate carries no foreign keys
+        (see sql/create_arrange_tables.sql), so removing a row would silently
+        orphan every arrangement still pointing at it instead of being refused.
+
+        Deliberately NOT touched: is_used, is_released, the arrangement link, and
+        any seed. Releasing inventory is InventoryService.release's job and stays
+        exactly as it was — a plate can be deactivated while free, and taking it
+        out of the dropdown must never move stock on its own.
+        """
+        from .models import SeedPlate
+
+        try:
+            pid = int(plate_id)
+        except (TypeError, ValueError):
+            raise DomainError("A valid plateId is required.")
+        master = SeedPlate.objects.filter(plate_id=pid).first()
+        if master is None:
+            raise DomainError("Plate not found.")
+        # A plate a run is still holding must not vanish from the dropdown while
+        # its stones are committed — release it first, which is the action that
+        # hands the inventory back.
+        if not active and master.is_used:
+            raise DomainError(
+                "This plate is still assigned to an arrangement. Release it "
+                "first, then deactivate it.")
+        master.is_active = bool(active)
+        master.update_date = datetime.now(timezone.utc)
+        master.update_by = user_id
+        master.save(update_fields=["is_active", "update_date", "update_by"])
+        return {"plateId": pid, "plateName": master.plate_name,
+                "active": bool(master.is_active)}
+
+    @staticmethod
     def finalized_list():
         """Every plate that carries an assigned name — i.e. every finalized plate.
 

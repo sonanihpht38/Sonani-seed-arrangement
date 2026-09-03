@@ -7,6 +7,7 @@ from .views import (
     ArrangementDetailView, ArrangementListView, AssignPlateView, AvailablePlatesView, BatchListView,
     DownloadPlatesView, FinalizeArrangementView, FinalizedPlatesView, GenerateFinalView,
     JobDetailView, JobsView, PlateMasterViewSet, PlateNamesView, ReleasePlateView, SeedImportView,
+    SetPlateActiveView,
 )
 
 router = DefaultRouter()
@@ -22,6 +23,9 @@ urlpatterns = [
     path("production/plates/finalized", FinalizedPlatesView.as_view(), name="finalized-plates"),
     path("production/plates/assign", AssignPlateView.as_view(), name="assign-plate"),
     path("production/plates/release", ReleasePlateView.as_view(), name="release-plate"),
+    # POST both ways: live cannot use PUT/DELETE (IIS WebDAV answers 405), so
+    # taking a plate out of circulation and restoring it share one endpoint.
+    path("production/plates/set-active", SetPlateActiveView.as_view(), name="set-plate-active"),
     path("production/arrangements/", ArrangementListView.as_view(), name="arrangements"),
     path("production/arrangements/<str:arrange_id>/plate-names", PlateNamesView.as_view(), name="plate-names"),
     # Must be declared BEFORE <arrange_id> alone, or the detail route swallows it.

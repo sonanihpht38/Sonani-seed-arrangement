@@ -8,13 +8,13 @@
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { Card, Space, Typography, Alert, Button, Row, Col, Pagination, Image, Tag, Select, Spin, Empty } from "antd";
+import { Card, Space, Typography, Alert, Button, Row, Col, Pagination, Image, Tag, Select, Spin, Empty, Popconfirm } from "antd";
 import type { ColDef } from "ag-grid-community";
 import { useAuth } from "../auth/useAuth";
 import { productionApi } from "./productionApi";
 import type { DimRow, FinalizeContext, FinalizedPlate, Job } from "./types";
 import { DataGrid } from "../../components/DataGrid";
-import { FiCheck, FiDownload, FiX } from "../../components/icons";
+import { FiCheck, FiDownload, FiEye, FiX } from "../../components/icons";
 import { notify } from "../../lib/notify";
 import { mediaUrl } from "../../lib/media";
 import { colors, alpha } from "../../theme";
@@ -73,6 +73,10 @@ export function Finalization() {
 
   const [page, setPage] = useState(1);
   const [pick, setPick] = useState<string | undefined>();
+  // The plate image the register's View button is showing, if any. Held here
+  // rather than per row so one hidden <Image> can serve the whole grid — AG Grid
+  // recycles its cells, so a preview mounted inside one would close on scroll.
+  const [preview, setPreview] = useState<{ url: string; name: string } | null>(null);
 
   const jobQ = useQuery({
     queryKey: ["finalize-job", ctx?.jobId],
@@ -135,14 +139,6 @@ export function Finalization() {
     },
     onError: (e) => notify.error(e instanceof Error ? e.message : "Assign failed"),
   });
-  const unfinalizeMut = useMutation({
-    mutationFn: () => productionApi.unfinalizeArrangement(ctx!.arrangeId),
-    onSuccess: (r) => {
-      notify.success(`Arrangement reopened — ${r.returned} seeds back in the available list.`);
-      finalQ.refetch();
-    },
-    onError: (e) => notify.error(e instanceof Error ? e.message : "Reopen failed"),
-  });
 
   // ---- The finalized-plate register --------------------------------------
   // Read straight from TRN_SeedPlate, so it is here whether or not a run is
@@ -188,32 +184,51 @@ export function Finalization() {
       valueFormatter: (p) => (p.value == null ? "—" : `${p.value}%`),
     },
     {
-      headerName: "Ø",
+      headerName: "Plate Diameter",
       field: "plateDiameter",
-      minWidth: 80,
+      minWidth: 140,
       valueFormatter: (p) => (p.value == null ? "—" : `${p.value}mm`),
     },
     {
       headerName: "",
-      minWidth: 120,
-      maxWidth: 130,
+      minWidth: 190,
+      maxWidth: 210,
       sortable: false,
       filter: false,
-      cellRenderer: (p: { data?: FinalizedPlate }) =>
-        p.data && p.data.arrangeId && p.data.plateNo != null && canFinalize ? (
-          <Button
-            size="small"
-            icon={<FiX />}
-            loading={releaseRowMut.isPending
-              && releaseRowMut.variables?.arrangeId === p.data.arrangeId
-              && releaseRowMut.variables?.plateNo === p.data.plateNo}
-            onClick={() => releaseRowMut.mutate({
-              arrangeId: p.data!.arrangeId!, plateNo: p.data!.plateNo!,
-            })}
-          >
-            Release
-          </Button>
-        ) : null,
+      cellRenderer: (p: { data?: FinalizedPlate }) => {
+        if (!p.data) return null;
+        const canRelease = !!p.data.arrangeId && p.data.plateNo != null && canFinalize;
+        return (
+          <Space size={6}>
+            {/* The plate as it was built. This register outlives the job that
+                produced it, so its image is the only record left of what the
+                plate actually looks like. */}
+            <Button
+              size="small"
+              icon={<FiEye />}
+              disabled={!p.data.imageUrl}
+              onClick={() => setPreview({
+                url: mediaUrl(p.data!.imageUrl!), name: p.data!.plateName })}
+            >
+              View
+            </Button>
+            {canRelease && (
+              <Button
+                size="small"
+                icon={<FiX />}
+                loading={releaseRowMut.isPending
+                  && releaseRowMut.variables?.arrangeId === p.data.arrangeId
+                  && releaseRowMut.variables?.plateNo === p.data.plateNo}
+                onClick={() => releaseRowMut.mutate({
+                  arrangeId: p.data!.arrangeId!, plateNo: p.data!.plateNo!,
+                })}
+              >
+                Release
+              </Button>
+            )}
+          </Space>
+        );
+      },
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
   ], [canFinalize, releaseRowMut.isPending, releaseRowMut.variables]);
@@ -239,6 +254,20 @@ export function Finalization() {
           <div style={{ marginTop: 12 }}>
             <DataGrid rowData={finalizedQ.data ?? []} columnDefs={finalizedCols} />
           </div>
+          {/* One preview for the whole grid, opened by any row's View button.
+              Rendered hidden and driven by state so AG Grid recycling a cell
+              cannot tear the open lightbox down mid-view. */}
+          {preview && (
+            <Image
+              style={{ display: "none" }}
+              src={preview.url}
+              alt={preview.name}
+              preview={{
+                visible: true,
+                onVisibleChange: (v) => { if (!v) setPreview(null); },
+              }}
+            />
+          )}
         </>
       )}
     </Card>
@@ -257,6 +286,25 @@ export function Finalization() {
     },
     onError: (e) => notify.error(e instanceof Error ? e.message : "Release failed"),
   });
+
+  // Retire a plate the master no longer needs, from the screen it is used on.
+  // Release hands the STOCK back; this takes the plate NAME out of circulation,
+  // and it is deliberately a separate click — a released plate stays reusable
+  // until someone says otherwise. Reversible from Plate Master.
+  const deactivateMut = useMutation({
+    mutationFn: (plateId: number) => productionApi.setPlateActive(plateId, false),
+    onSuccess: (r) => {
+      notify.success(`${r.plateName ?? "Plate"} deactivated — no longer offered here.`);
+      setPick(undefined);
+      namesQ.refetch();
+      availQ.refetch();
+    },
+    onError: (e) => notify.error(e instanceof Error ? e.message : "Deactivate failed"),
+  });
+  // The picker holds a NAME; the endpoint needs the id. Only a free plate may be
+  // retired — one still holding stones must be released first, and the backend
+  // refuses it regardless of what this button allows.
+  const picked = (availQ.data ?? []).find((p) => p.plateName === pick);
 
   // No run open — but the register of already-finalized plates still belongs
   // here, and is the only way to review or release them once a job is gone.
@@ -301,16 +349,11 @@ export function Finalization() {
                 {finalQ.data.seedsAvailable} still available ·{" "}
                 {finalQ.data.seedsUsedTotal} used
               </Text>
-              {finalQ.data.seedsConsumedByThisRun > 0 && (
-                <Button
-                  icon={<FiX />}
-                  loading={unfinalizeMut.isPending}
-                  disabled={!canFinalize}
-                  onClick={() => unfinalizeMut.mutate()}
-                >
-                  Return all ({finalQ.data.seedsConsumedByThisRun} seeds)
-                </Button>
-              )}
+              {/* "Return all" stood here and has been removed. It called DELETE
+                  on the unfinalize route, which live never reaches: IIS answers
+                  DELETE with 405 before Django sees it, so the button failed
+                  every time while Release beside it worked. Releasing is now one
+                  action — per plate, over POST, in the register below. */}
             </Space>
             {/* Per plate, because each plate is committed on its own. */}
             <div style={{ marginTop: 8 }}>
@@ -376,6 +419,25 @@ export function Finalization() {
             >
               Release
             </Button>
+            {/* Retire the plate NAME. Separate from Release on purpose: Release
+                returns the stones and leaves the plate reusable, this takes it
+                out of the list. Only offered for a plate that is free. */}
+            <Popconfirm
+              title={`Deactivate ${picked?.plateName ?? "this plate"}?`}
+              description="It stops being offered here. You can switch it back on in Plate Master."
+              okText="Deactivate"
+              cancelText="Cancel"
+              disabled={!picked || picked.isUsed || !canFinalize}
+              onConfirm={() => picked && deactivateMut.mutate(picked.plateId)}
+            >
+              <Button
+                danger
+                loading={deactivateMut.isPending}
+                disabled={!picked || picked.isUsed || !canFinalize}
+              >
+                Deactivate
+              </Button>
+            </Popconfirm>
             {currentName && (
               <Tag style={{ margin: 0, color: colors.primary, borderColor: alpha(colors.primary, 0.35), background: alpha(colors.primary, 0.08) }}>
                 assigned: {currentName}

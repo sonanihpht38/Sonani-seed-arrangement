@@ -2079,3 +2079,114 @@ class SeedListLayoutTests(SimpleTestCase):
             per_col - last, per_col * 0.5,
             "columns are lopsided: %d x %d with %d in the last"
             % (ncols, per_col, last))
+
+
+class SetPlateActiveTests(TransactionTestCase):
+    """Retiring a plate name — the app's soft delete, and the only one live can use.
+
+    Live runs under IIS, whose WebDAV module answers PUT and DELETE with 405
+    before Django sees them, so Plate Master's edit and delete and Finalization's
+    "Return all" are all unreachable there while every POST works. This endpoint
+    is POST in BOTH directions for that reason: a one-way call would let a plate
+    be deactivated on live with no way to restore it.
+
+    A hard delete would be wrong regardless of the verb. MST_SeedPlate carries no
+    foreign keys, so removing a row would silently orphan every arrangement still
+    naming it rather than being refused.
+    """
+
+    available_apps = ["modules.production", "modules.access", "modules.accounts",
+                      "django.contrib.auth", "django.contrib.contenttypes"]
+
+    @classmethod
+    def _unmanaged(cls):
+        from django.apps import apps
+        return [m for m in apps.get_app_config("production").get_models()
+                if not m._meta.managed]
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        from django.db import connection
+        with connection.schema_editor() as se:
+            for m in cls._unmanaged():
+                se.create_model(m)
+
+    @classmethod
+    def tearDownClass(cls):
+        from django.db import connection
+        with connection.schema_editor() as se:
+            for m in cls._unmanaged():
+                se.delete_model(m)
+        super().tearDownClass()
+
+    def setUp(self):
+        from django.contrib.auth import get_user_model
+        from rest_framework.test import APIClient
+
+        from .models import SeedPlate
+        SeedPlate.objects.all().delete()
+        self.SeedPlate = SeedPlate
+        self.user = get_user_model().objects.create_superuser("sa", "sa@x.y", "pw12345!")
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+    def _post(self, plate_id, active):
+        return self.client.post("/api/production/plates/set-active",
+                                {"plateId": plate_id, "active": active}, format="json")
+
+    def test_deactivating_takes_the_plate_out_of_the_dropdown(self):
+        """`is_active` is not decoration — it is the filter behind the plate names
+        Finalization offers, which is what makes this a delete from that screen."""
+        p = self.SeedPlate.objects.create(plate_name="P-A", diameter=90, is_active=True)
+        self.assertEqual(self._post(p.plate_id, False).status_code, 200)
+        p.refresh_from_db()
+        self.assertFalse(p.is_active)
+        names = [q["plateName"] for q in self.client.get("/api/production/plates").json()]
+        self.assertNotIn("P-A", names, "a deactivated plate must not be offered")
+
+    def test_it_is_reversible(self):
+        """The reason this is POST both ways: on live there is no PUT to turn a
+        plate back on with."""
+        p = self.SeedPlate.objects.create(plate_name="P-B", diameter=90, is_active=False)
+        self.assertEqual(self._post(p.plate_id, True).status_code, 200)
+        p.refresh_from_db()
+        self.assertTrue(p.is_active)
+
+    def test_the_row_survives_so_history_is_intact(self):
+        """Soft, not hard: MST_SeedPlate has no foreign keys, so a real delete
+        would orphan the arrangements naming this plate instead of failing."""
+        p = self.SeedPlate.objects.create(plate_name="P-C", diameter=90, is_active=True)
+        self._post(p.plate_id, False)
+        self.assertTrue(self.SeedPlate.objects.filter(pk=p.plate_id).exists())
+
+    def test_a_plate_still_holding_stock_is_refused(self):
+        """Deactivating must never move inventory. A plate an arrangement is
+        still using has to be RELEASED first — that is the action that hands the
+        seeds back, and it stays exactly as it was."""
+        p = self.SeedPlate.objects.create(plate_name="P-D", diameter=90,
+                                          is_active=True, is_used=True)
+        r = self._post(p.plate_id, False)
+        self.assertEqual(r.status_code, 400, r.content)
+        self.assertIn("Release it first", r.content.decode())
+        p.refresh_from_db()
+        self.assertTrue(p.is_active, "a refused call must not have changed anything")
+
+    def test_it_leaves_the_inventory_flags_alone(self):
+        """Only ISActive moves. is_used/is_released belong to assign and release."""
+        p = self.SeedPlate.objects.create(plate_name="P-E", diameter=90, is_active=True,
+                                          is_used=False, is_released=True)
+        self._post(p.plate_id, False)
+        p.refresh_from_db()
+        self.assertFalse(p.is_active)
+        self.assertFalse(p.is_used)
+        self.assertTrue(p.is_released, "release state must be untouched")
+
+    def test_an_unknown_plate_is_a_clean_400(self):
+        r = self._post(999999, False)
+        self.assertEqual(r.status_code, 400, r.content)
+
+    def test_only_post_is_accepted(self):
+        """The whole point of the endpoint: live's IIS blocks PUT and DELETE."""
+        from modules.production.views import SetPlateActiveView
+        self.assertEqual(sorted(SetPlateActiveView().allowed_methods), ["OPTIONS", "POST"])
