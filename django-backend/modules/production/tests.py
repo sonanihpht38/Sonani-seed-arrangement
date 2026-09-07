@@ -2290,7 +2290,8 @@ class PlateMasterPostVerbTests(TransactionTestCase):
         self.client.post("/api/production/plate-master/%d/save/" % b.plate_id,
                          {"plate_name": "B2", "diameter": 110, "is_active": False},
                          format="json")
-        a.refresh_from_db(); b.refresh_from_db()
+        a.refresh_from_db()
+        b.refresh_from_db()
         self.assertEqual((int(a.diameter), a.is_active), (int(b.diameter), b.is_active))
 
 

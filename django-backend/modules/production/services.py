@@ -955,12 +955,6 @@ def _header_cell(ws, idx):
     return hdr[idx] if idx < len(hdr) else None
 
 
-def _is_thickness(h):
-    """Does this normalised header name a thickness column? Tolerates the
-    'HEIGTH' misspelling that the measuring machine emits."""
-    return h.startswith("height") or h.startswith("heigth") or h.startswith("thick")
-
-
 class SeedImportService:
     @staticmethod
     def read_rows(file_obj):

@@ -45,8 +45,6 @@ export const ICONS: Record<string, IconCmp> = {
   check: FiCheck,
 };
 
-export const ICON_NAMES = Object.keys(ICONS);
-
 /** Render a registry icon by name; falls back to a neutral box for unknowns. */
 export function AppIcon({ name, size = 16 }: { name?: string | null; size?: number }) {
   const Cmp = (name && ICONS[name]) || FiBox;
