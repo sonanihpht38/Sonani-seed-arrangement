@@ -19,12 +19,29 @@ class BatchRepository:
 
     @staticmethod
     def list_with_counts():
-        """Every batch plus how many seeds reference it (TRN_SeedData.Batch_ID).
-        Batch_ID is a plain GUID column (no Django FK), so counts are grouped
-        separately and joined in Python."""
+        """Every batch plus how many AVAILABLE seeds reference it
+        (TRN_SeedData.Batch_ID). Batch_ID is a plain GUID column (no Django FK),
+        so counts are grouped separately and joined in Python.
+
+        Available, not total. This count is what Batch Selection shows on each
+        card, what it sums into "N seeds selected", and what it greys a batch out
+        on — so it is the user's picture of the pool they are about to pack from.
+        Counting every row made it disagree with the packer, which excludes seeds
+        already on an assigned plate: a batch of 3 consumed stones still read
+        "3 seeds", inviting the user to select stock that could not be placed.
+        The packer was never at risk of double-allocating them — it filters the
+        same way and consume_plate refuses a stone another run holds — but the
+        screen said otherwise, which is its own kind of wrong.
+
+        `exclude(is_used=True)`, NOT `filter(is_used=False)`: ISUsed is NULL for
+        a seed nobody has consumed, and filtering on False would drop every one
+        of those, i.e. the entire available pool. Same reason engine_runner
+        writes it this way; the two must agree or this bug simply changes sides.
+        """
         counts = {
             row["batch_id"]: row["n"]
             for row in SeedData.objects.exclude(batch_id__isnull=True)
+            .exclude(is_used=True)
             .values("batch_id").annotate(n=Count("seed_id"))
         }
         return [

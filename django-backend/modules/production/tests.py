@@ -2429,3 +2429,74 @@ class UnassignReturnsSeedsTests(TransactionTestCase):
         self.M["seed"].objects.filter(used_id=self.arrange_id).update(is_used=False)
         rows = {r["arrangeId"]: r for r in ArrangementService.list()}
         self.assertEqual(rows[str(self.arrange_id)]["seedsHeld"], 0)
+
+    # ---- Batch Selection must show the pool the packer will actually see ----
+
+    def _batch_counts(self):
+        from .services import BatchService
+        return {b["batch_no"]: b["seed_count"] for b in BatchService.list_with_counts()}
+
+    def _put_seeds_in_a_batch(self, batch_no="B1"):
+        """Give this run's 5 stones a batch, so Batch Selection has something to
+        count. Returns the Batch row."""
+        import uuid as _uuid
+
+        from .models import Batch
+        b = Batch.objects.create(batch_id=_uuid.uuid4(), batch_no=batch_no, is_active=True)
+        self.M["seed"].objects.filter(
+            seed_id__in=[s.seed_id for s in self.seeds]).update(batch_id=b.batch_id)
+        return b
+
+    def test_batch_count_excludes_seeds_on_an_assigned_plate(self):
+        """The bug: a batch whose stones were consumed still advertised them.
+        The card badge, the greyed-out state and the "N seeds selected" total all
+        read this one number, so it has to mean available, not total."""
+        self._put_seeds_in_a_batch()
+        self.assertEqual(self._batch_counts()["B1"], 5, "all free before assigning")
+        self._assign()
+        self.assertEqual(self._batch_counts()["B1"], 0,
+                         "consumed stones were still offered for selection")
+
+    def test_releasing_puts_them_back_in_the_count(self):
+        """Symmetry with the rest of the workflow — release returns the stones,
+        so the screen must show them again without anything else being run."""
+        self._put_seeds_in_a_batch()
+        self._assign()
+        _inv, plate = self._svc()
+        plate.release(self.arrange_id, 1)
+        self.assertEqual(self._batch_counts()["B1"], 5)
+
+    def test_a_seed_nobody_consumed_still_counts(self):
+        """The trap in this fix: ISUsed is NULL until someone finalizes a run, so
+        `filter(is_used=False)` would count NOTHING and every batch would read 0.
+        It has to be exclude(is_used=True) — same as the packer's own filter."""
+        self._put_seeds_in_a_batch()
+        self.M["seed"].objects.all().update(is_used=None)
+        self.assertEqual(self._batch_counts()["B1"], 5,
+                         "NULL ISUsed means available, not used")
+
+    def test_the_count_agrees_with_the_packer(self):
+        """The two numbers must be derived the same way. If they ever disagree
+        the screen is lying about what can be packed, whichever way it leans."""
+        self._put_seeds_in_a_batch()
+        self._assign()
+        pool = self.M["seed"].objects.exclude(is_used=True).count()
+        self.assertEqual(sum(self._batch_counts().values()), pool)
+
+    def test_a_partly_consumed_batch_shows_only_what_is_left(self):
+        """Not just all-or-nothing: the reported case was 3 stones of a larger
+        batch going onto one plate."""
+        self._put_seeds_in_a_batch()
+        self.M["seed"].objects.filter(
+            seed_id__in=[s.seed_id for s in self.seeds[:3]]).update(
+            is_used=True, used_id=self.arrange_id)
+        self.assertEqual(self._batch_counts()["B1"], 2)
+
+    def test_an_empty_batch_is_unaffected(self):
+        """Batches with no seeds at all still report 0 — the screen greys those
+        out, and that behaviour must not change."""
+        import uuid as _uuid
+
+        from .models import Batch
+        Batch.objects.create(batch_id=_uuid.uuid4(), batch_no="EMPTY", is_active=True)
+        self.assertEqual(self._batch_counts()["EMPTY"], 0)
