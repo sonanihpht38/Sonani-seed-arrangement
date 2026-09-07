@@ -52,11 +52,6 @@ export const productionApi = {
   // later runs until the arrangement is unfinalized.
   finalizeStatus: (arrangeId: string) =>
     api.get<FinalizeStatus>(`/production/arrangements/${arrangeId}/finalize`),
-  // Recovery only: hands back every seed the run is holding, whichever plate
-  // took it. Normal flow is per plate, via assign / release.
-  unfinalizeArrangement: (arrangeId: string) =>
-    api.del<{ finalized: boolean; returned: number }>(
-      `/production/arrangements/${arrangeId}/finalize`),
 
   // Download (Form 7): zip of the selected plates' data (Excel) and/or images.
   downloadPlates: (jobId: string, plateNos: number[], include: "data" | "images" | "both") =>

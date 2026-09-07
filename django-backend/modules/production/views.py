@@ -247,26 +247,28 @@ class SetPlateActiveView(APIView):
 
 
 class FinalizeArrangementView(APIView):
-    """Inventory state of one arrangement.
+    """Inventory state of one arrangement — read only.
 
     Seeds are consumed per PLATE, when that plate is assigned a name — see
     PlateService.assign — so there is no "finalize the run" action here.
 
-    GET    → status: which plates are committed, how much inventory is left.
-    DELETE → recovery: return EVERY seed this run is holding, whichever plate
-             took it. The way back from a bulk consume.
+    A DELETE handler stood beside this GET and returned every seed the run held
+    at once. It has been removed with the two buttons that called it: the app is
+    served through IIS, whose WebDAV module answers DELETE with 405 before
+    Django is reached, so it never worked in production, and it offered a second
+    way to hand stock back that disagreed with the first. Releasing is now one
+    action in one place — Finalization, per plate, over POST.
+
+    InventoryService.unfinalize is deliberately KEPT. It is the only way back
+    from a bulk consume, including one done by an earlier version of this
+    feature, and it stays reachable from a management shell for that recovery.
+    What is gone is the unreachable HTTP door onto it, not the capability.
     """
 
-    def get_permissions(self):
-        act = "view" if self.request.method == "GET" else "save"
-        return [HasFormPermission.require("finalization", act)()]
+    permission_classes = [HasFormPermission.require("finalization", "view")]
 
     def get(self, request, arrange_id):
         return Response(InventoryService.status(arrange_id))
-
-    def delete(self, request, arrange_id):
-        return Response(InventoryService.unfinalize(
-            arrange_id, getattr(request.user, "id", None)))
 
 
 class PlateMasterViewSet(viewsets.ModelViewSet):

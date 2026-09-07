@@ -78,10 +78,18 @@ export function Finalization() {
   // recycles its cells, so a preview mounted inside one would close on scroll.
   const [preview, setPreview] = useState<{ url: string; name: string } | null>(null);
 
+  // `quiet`: an expired job is an expected state here, not a fault. The job id
+  // comes from sessionStorage and a job lives 24 hours, so coming back to this
+  // screen the next day asks for one that is gone. The API answers 404, the
+  // screen below shows "Nothing to finalize" — and a red "job not found" toast
+  // used to land on top of it, reporting a failure where there was none. The
+  // register of finalized plates further down does not need the job at all and
+  // keeps working either way.
   const jobQ = useQuery({
     queryKey: ["finalize-job", ctx?.jobId],
     queryFn: () => productionApi.getJob(ctx!.jobId),
     enabled: !!ctx?.jobId,
+    meta: { quiet: true },
   });
   const availQ = useQuery({ queryKey: ["available-plates"], queryFn: productionApi.availablePlates });
   const namesQ = useQuery({

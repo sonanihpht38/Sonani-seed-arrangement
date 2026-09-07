@@ -18,8 +18,27 @@ function toast(error: unknown) {
   notify.error(error instanceof Error ? error.message : "Something went wrong");
 }
 
+/**
+ * The same toast, unless the query asked to be left alone with `meta.quiet`.
+ *
+ * Some failures are an expected state rather than a fault, and the screen
+ * already renders them. Finalization is the case that prompted this: it opens
+ * with a job id kept in sessionStorage from the Result screen, and a job only
+ * lives 24 hours, so returning to the screen the next day asks for one that is
+ * gone. The API correctly answers 404, the screen correctly shows "Nothing to
+ * finalize" — and a red "job not found" toast appeared over the top of it,
+ * telling the user something had broken when nothing had.
+ *
+ * Only for a query that HANDLES the error itself. A screen that shows nothing
+ * must not be quiet, or a real fault would vanish silently.
+ */
+function toastUnlessQuiet(error: unknown, query: { meta?: Record<string, unknown> }) {
+  if (query?.meta?.quiet) return;
+  toast(error);
+}
+
 export const queryClient = new QueryClient({
-  queryCache: new QueryCache({ onError: toast }),
+  queryCache: new QueryCache({ onError: toastUnlessQuiet }),
   mutationCache: new MutationCache({ onError: toast }),
   defaultOptions: {
     queries: {

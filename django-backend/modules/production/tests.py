@@ -2292,3 +2292,140 @@ class PlateMasterPostVerbTests(TransactionTestCase):
                          format="json")
         a.refresh_from_db(); b.refresh_from_db()
         self.assertEqual((int(a.diameter), a.is_active), (int(b.diameter), b.is_active))
+
+
+class UnassignReturnsSeedsTests(TransactionTestCase):
+    """Plate Master's Unassign must hand the SEEDS back, not just the plate.
+
+    The bug this pins: release_plate cleared the arrangement's plate_name and
+    plate_id and left the stones carrying ISUsed and Used_ID. They stayed out of
+    the pool with nothing naming them — and it was a trap door, because
+    release() begins
+
+        if not row or not row.plate_name: return released=False
+
+    so once the name was gone the only route that returns seeds refused to run.
+    A live run was found holding 36 seeds this way: invisible to the packer and
+    unreachable from every screen.
+    """
+
+    available_apps = ["modules.production", "modules.access", "modules.accounts",
+                      "django.contrib.auth", "django.contrib.contenttypes"]
+
+    @classmethod
+    def _unmanaged(cls):
+        from django.apps import apps
+        return [m for m in apps.get_app_config("production").get_models()
+                if not m._meta.managed]
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        from django.db import connection
+        with connection.schema_editor() as se:
+            for m in cls._unmanaged():
+                se.create_model(m)
+
+    @classmethod
+    def tearDownClass(cls):
+        from django.db import connection
+        with connection.schema_editor() as se:
+            for m in cls._unmanaged():
+                se.delete_model(m)
+        super().tearDownClass()
+
+    def setUp(self):
+        import uuid as _uuid
+
+        from .models import (SeedArrange, SeedArrangeDetail, SeedArrangePlate,
+                             SeedData, SeedPlate)
+        for m in (SeedPlate, SeedData, SeedArrangePlate, SeedArrangeDetail, SeedArrange):
+            m.objects.all().delete()
+        self.M = dict(plate=SeedPlate, seed=SeedData, ap=SeedArrangePlate,
+                      det=SeedArrangeDetail, hdr=SeedArrange)
+        self.arrange_id = _uuid.uuid4()
+        SeedArrange.objects.create(arrange_id=self.arrange_id, is_active=True, plate_no=1)
+        SeedArrangePlate.objects.create(arrange_id=self.arrange_id, plate_no=1)
+        self.seeds = []
+        for i in range(5):
+            s = SeedData.objects.create(seed_id=_uuid.uuid4(), stock_no=f"S{i}",
+                                        length=10, width=8, height=0.5, cts=1)
+            self.seeds.append(s)
+            SeedArrangeDetail.objects.create(
+                detail_id=_uuid.uuid4(), arrange_id=self.arrange_id, seed_id=s.seed_id,
+                plate_id=1, seed_type=False, method="enhanced")
+
+    def _svc(self):
+        from .services import InventoryService, PlateService
+        return InventoryService, PlateService
+
+    def _assign(self, name="P-1"):
+        _inv, plate = self._svc()
+        return plate.assign(self.arrange_id, 1, name)
+
+    def _held(self):
+        return self.M["seed"].objects.filter(used_id=self.arrange_id, is_used=True).count()
+
+    def test_unassign_returns_the_seeds(self):
+        """The fix. Freeing the plate from Plate Master must free its stones."""
+        self._assign()
+        self.assertEqual(self._held(), 5, "assign should have consumed them")
+        _inv, plate = self._svc()
+        pid = self.M["plate"].objects.get(plate_name="P-1").plate_id
+        r = plate.release_plate(pid)
+        self.assertEqual(self._held(), 0, "unassigning left the seeds held")
+        self.assertEqual(r.get("seedsReturned"), 5, r)
+
+    def test_the_seeds_go_back_to_the_available_pool(self):
+        """Held is not a display flag — the packer's pool is exclude(is_used=True),
+        so a stranded seed is one the software can never place again."""
+        self._assign()
+        _inv, plate = self._svc()
+        plate.release_plate(self.M["plate"].objects.get(plate_name="P-1").plate_id)
+        self.assertEqual(self.M["seed"].objects.exclude(is_used=True).count(), 5)
+
+    def test_it_still_frees_the_plate_and_clears_the_arrangement(self):
+        """Existing behaviour must be untouched — this adds the missing half,
+        it does not replace the half that worked."""
+        self._assign()
+        _inv, plate = self._svc()
+        pid = self.M["plate"].objects.get(plate_name="P-1").plate_id
+        plate.release_plate(pid)
+        m = self.M["plate"].objects.get(pk=pid)
+        self.assertFalse(m.is_used)
+        self.assertTrue(m.is_released)
+        row = self.M["ap"].objects.get(arrange_id=self.arrange_id, plate_no=1)
+        self.assertIsNone(row.plate_name)
+
+    def test_a_stone_another_run_holds_is_not_freed(self):
+        """return_plate matches on Used_ID, so unassigning one plate must never
+        hand back a seed a different arrangement is holding."""
+        import uuid as _uuid
+        other = _uuid.uuid4()
+        self._assign()
+        mine = list(self.M["seed"].objects.filter(used_id=self.arrange_id))
+        self.M["seed"].objects.filter(pk=mine[0].pk).update(used_id=other)
+        _inv, plate = self._svc()
+        plate.release_plate(self.M["plate"].objects.get(plate_name="P-1").plate_id)
+        self.assertEqual(
+            self.M["seed"].objects.filter(used_id=other, is_used=True).count(), 1,
+            "the other run's stone was freed")
+
+    def test_unassigning_a_plate_nobody_used_is_harmless(self):
+        p = self.M["plate"].objects.create(plate_name="FREE", diameter=90, is_active=True)
+        _inv, plate = self._svc()
+        r = plate.release_plate(p.plate_id)
+        self.assertEqual(r.get("seedsReturned"), 0)
+        self.assertEqual(self.M["seed"].objects.filter(is_used=True).count(), 0)
+
+    def test_history_counts_a_seed_as_held_only_when_it_really_is(self):
+        """Seeds held is read from BOTH flags. Used_ID alone would report a seed
+        the packer is free to place."""
+        from .services import ArrangementService
+        self._assign()
+        rows = {r["arrangeId"]: r for r in ArrangementService.list()}
+        self.assertEqual(rows[str(self.arrange_id)]["seedsHeld"], 5)
+        # a row left with an owner but not marked used is NOT held
+        self.M["seed"].objects.filter(used_id=self.arrange_id).update(is_used=False)
+        rows = {r["arrangeId"]: r for r in ArrangementService.list()}
+        self.assertEqual(rows[str(self.arrange_id)]["seedsHeld"], 0)

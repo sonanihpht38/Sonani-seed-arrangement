@@ -159,9 +159,15 @@ class ArrangementService:
         # works — Finalization needs a live in-memory job, which is gone after a
         # backend restart, and the release action went with it.
         from .models import SeedData
+        # BOTH flags, not Used_ID alone. A seed is held only when it is actually
+        # out of the pool, and the pool is `exclude(is_used=True)` — see
+        # engine_runner.load_blocks_from_db. Counting Used_ID by itself would
+        # report a seed as held that the packer is free to place, so the two
+        # numbers could disagree about the same stone.
         held = {
             r["used_id"]: r["n"]
-            for r in chunked_in(ids, lambda c: SeedData.objects.filter(used_id__in=c)
+            for r in chunked_in(ids, lambda c: SeedData.objects
+                                .filter(used_id__in=c, is_used=True)
                                 .values("used_id").annotate(n=Count("seed_id")))
         }
         return [
@@ -618,12 +624,39 @@ class PlateService:
         used_by = SeedArrangePlate.objects.filter(
             Q(plate_id=pid) | Q(plate_name=master.plate_name)
         ) if master.plate_name else SeedArrangePlate.objects.filter(plate_id=pid)
+        # WHICH PLATES THIS FREES — read BEFORE the update, because clearing the
+        # rows is what makes them unfindable afterwards.
+        freed = [(r.arrange_id, r.plate_no) for r in used_by]
         cleared = used_by.update(plate_name=None, plate_id=None, update_date=now)
         master.is_used = False
         master.is_released = True
         master.update_date = now
         master.save(update_fields=["is_used", "is_released", "update_date"])
-        return {"released": True, "plateName": master.plate_name, "clearedFrom": cleared}
+        # HAND THE SEEDS BACK TOO. This used to free the plate and forget the
+        # stones: the arrangement's plate_name was cleared while its seeds kept
+        # ISUsed and Used_ID, so they stayed out of the pool with nothing naming
+        # them. Worse, it was a trap door — release() begins
+        #
+        #     if not row or not row.plate_name: return released=False
+        #
+        # so once the name was gone the ONLY route that returns seeds refused to
+        # run, and no screen could recover them. A live run was found holding 36
+        # seeds this way, invisible to the packer and unreachable from the UI.
+        #
+        # Unassigning is the same operation as Finalization's Release, reached
+        # from the plate instead of the arrangement, so it must do the same two
+        # things. return_plate is the existing one — matched on Used_ID, so a
+        # stone another run holds is never freed by this — called here rather
+        # than reimplemented, and after the clear because it reads the DETAIL
+        # rows, which the clear does not touch.
+        returned = 0
+        for aid, pno in freed:
+            if aid is None or pno is None:
+                continue
+            returned += InventoryService.return_plate(aid, pno, None)["returned"]
+            InventoryService.sync_header(aid, None)
+        return {"released": True, "plateName": master.plate_name,
+                "clearedFrom": cleared, "seedsReturned": returned}
 
     @staticmethod
     @transaction.atomic

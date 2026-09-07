@@ -122,15 +122,21 @@ async function requestBlob(path: string, body: unknown, allowRetry = true): Prom
   return res.blob();
 }
 
+// GET and POST only, and that is not an oversight.
+//
+// The server this app is deployed on runs IIS, whose WebDAV module answers PUT,
+// PATCH and DELETE with 405 before the request reaches Django — so a helper for
+// any of them is a helper for a call that cannot succeed in production. All
+// three had callers once: Plate Master's edit and delete, and Finalization's
+// "Return all". Each now goes to a POST route that runs the very same serializer
+// and guards, so nothing was given up but the verb.
+//
+// If a real DELETE is ever needed, the fix is the server's WebDAV handler, not
+// putting the helper back.
 export const api = {
   get: <T>(p: string) => request<T>(p),
   post: <T>(p: string, body: unknown) =>
     request<T>(p, { method: "POST", body: JSON.stringify(body) }),
   postForm: <T>(p: string, form: FormData) => requestForm<T>(p, form),
   postBlob: (p: string, body: unknown) => requestBlob(p, body),
-  put: <T>(p: string, body: unknown) =>
-    request<T>(p, { method: "PUT", body: JSON.stringify(body) }),
-  patch: <T>(p: string, body: unknown) =>
-    request<T>(p, { method: "PATCH", body: JSON.stringify(body) }),
-  del: <T>(p: string) => request<T>(p, { method: "DELETE" }),
 };
