@@ -15,6 +15,34 @@ class SeedPlateSerializer(serializers.ModelSerializer):
         fields = ["plate_id", "plate_name", "diameter", "is_active", "is_used", "is_released"]
         read_only_fields = ["plate_id", "is_used", "is_released"]
 
+    def validate_plate_name(self, value):
+        """A plate name must be unique, because the name IS the identifier.
+
+        MST_SeedPlate carries no unique constraint on PlateName — it is an
+        unmanaged table whose DDL we do not own — and PlateService.assign
+        resolves a name with `get_or_create(plate_name=...)`. Two rows sharing a
+        name therefore make that call raise MultipleObjectsReturned: a 500 on
+        the one action that commits inventory. It also makes "which physical
+        plate is this?" unanswerable, which is the question the master exists to
+        answer.
+
+        Nothing enforced this before because plates were only ever added from
+        Plate Master, one screen, deliberately. Now that a plate can also be
+        created mid-assign from Arrangement History, two people naming a plate
+        for the same job is an ordinary Tuesday — so the guard has to be here,
+        on the serializer both doors already go through, rather than in either
+        screen.
+        """
+        name = (value or "").strip()
+        if not name:
+            raise serializers.ValidationError("A plate name is required.")
+        clash = SeedPlate.objects.filter(plate_name__iexact=name)
+        if self.instance is not None:  # an edit may keep its own name
+            clash = clash.exclude(pk=self.instance.pk)
+        if clash.exists():
+            raise serializers.ValidationError(f'A plate named "{name}" already exists.')
+        return name
+
 
 class BatchSerializer(serializers.Serializer):
     """A batch with its seed count — for the Batch Selection screen."""

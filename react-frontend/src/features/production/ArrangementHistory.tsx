@@ -8,7 +8,7 @@
 
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Card, Space, Typography, Alert, Drawer, Tag, Button, Spin, Empty, Descriptions, Row, Col, Image, Select } from "antd";
+import { Card, Space, Typography, Alert, Drawer, Tag, Button, Spin, Empty, Descriptions, Row, Col, Image, Select, Modal, Form, Input, InputNumber, Switch } from "antd";
 import type { ColDef } from "ag-grid-community";
 import { useAuth } from "../auth/useAuth";
 import { productionApi } from "./productionApi";
@@ -16,7 +16,7 @@ import { notify } from "../../lib/notify";
 import { mediaUrl } from "../../lib/media";
 import type { ArrangementRow, ArrangementSeed } from "./types";
 import { DataGrid } from "../../components/DataGrid";
-import { FiInfo, FiEye, FiDownload, FiRefreshCw, FiCheck } from "../../components/icons";
+import { FiInfo, FiEye, FiDownload, FiRefreshCw, FiCheck, FiPlus } from "../../components/icons";
 import { colors, alpha } from "../../theme";
 
 const { Text } = Typography;
@@ -123,6 +123,49 @@ export function ArrangementHistory() {
       .map((p) => ({ value: p.plateName, label: p.plateName }))
       .sort((a, b) => a.label.localeCompare(b.label)),
     [availQ.data]);
+
+  // ---- Add a plate the master doesn't have yet ----------------------------
+  // The picker above can only offer plates that already exist, so a run that
+  // needs a plate nobody has entered was a dead end: leave the drawer, go to
+  // Plate Master, add it, come back, find the run again. This is the same
+  // create, reached from the place the need is discovered.
+  //
+  // It posts to the Plate Master endpoint — NOT a new one — so the row is built
+  // by the same serializer, the same validation and the same permission as the
+  // Plate Master screen's own "New plate". Nothing about assigning, consuming or
+  // releasing changes: this only puts a name in the pool, and the existing
+  // Assign button then does exactly what it did before.
+  const canCreatePlate = can("plate_master", "save");
+  const [newFor, setNewFor] = useState<number | null>(null);
+  const [plateForm] = Form.useForm();
+  const createMut = useMutation({
+    mutationFn: (v: { plate_name: string; diameter?: number | null; is_active: boolean }) =>
+      productionApi.createPlate(v),
+    onSuccess: (created) => {
+      notify.success(`Plate "${created.plate_name}" added to Plate Master.`);
+      // Drop it straight into this plate's picker so the user just clicks
+      // Assign — the reason they opened the dialog in the first place.
+      if (newFor !== null) setPick((s) => ({ ...s, [newFor]: created.plate_name }));
+      setNewFor(null);
+      plateForm.resetFields();
+      availQ.refetch();
+      qc.invalidateQueries({ queryKey: ["plate-master"] });
+    },
+    onError: (e) => notify.error(e instanceof Error ? e.message : "Could not add the plate"),
+  });
+
+  /** Open the dialog for one plate of this run, sized to match the run. */
+  function openNewPlate(plateNo: number) {
+    setNewFor(plateNo);
+    // The run knows the diameter it was packed for, so offer it rather than
+    // making the user re-type a number the screen already shows. Editable —
+    // it is a default, not a rule.
+    plateForm.setFieldsValue({
+      plate_name: "",
+      diameter: detailQ.data?.plateDiameter ?? null,
+      is_active: true,
+    });
+  }
 
   const rows = listQ.data ?? [];
   const detail = detailQ.data;
@@ -331,8 +374,19 @@ export function ArrangementHistory() {
                             onChange={(v) => setPick((s) => ({ ...s, [p.plateNo]: v }))}
                             options={nameOptions}
                             loading={availQ.isLoading}
-                            notFoundContent={<Text type="secondary">No free plates in the master.</Text>}
+                            notFoundContent={
+                              <Text type="secondary">
+                                {canCreatePlate
+                                  ? "No free plates in the master — use New plate."
+                                  : "No free plates in the master."}
+                              </Text>
+                            }
                           />
+                          {canCreatePlate && (
+                            <Button size="small" icon={<FiPlus />} onClick={() => openNewPlate(p.plateNo)}>
+                              New plate
+                            </Button>
+                          )}
                           <Button
                             size="small"
                             type="primary"
@@ -421,6 +475,40 @@ export function ArrangementHistory() {
           </Space>
         )}
       </Drawer>
+
+      {/* Same fields, same rules and same endpoint as Plate Master's own "New
+          plate" dialog — deliberately, so a plate created here is in every way
+          an ordinary plate afterwards: it lists, edits, deactivates, assigns
+          and releases exactly like one entered on that screen. */}
+      <Modal
+        title="New plate"
+        open={newFor !== null}
+        onCancel={() => { setNewFor(null); plateForm.resetFields(); }}
+        onOk={() => plateForm.submit()}
+        confirmLoading={createMut.isPending}
+        okText="Add plate"
+      >
+        <Form
+          form={plateForm}
+          layout="vertical"
+          requiredMark={false}
+          onFinish={(v) => createMut.mutate(v)}
+        >
+          <Form.Item name="plate_name" label="Plate name" rules={[{ required: true, message: "Required" }]}>
+            <Input placeholder="e.g. P2-90" maxLength={50} />
+          </Form.Item>
+          <Form.Item
+            name="diameter"
+            label="Diameter (mm)"
+            extra="Pre-filled from this run — change it if the physical plate differs."
+          >
+            <InputNumber min={0} step={1} style={{ width: "100%" }} placeholder="e.g. 90" />
+          </Form.Item>
+          <Form.Item name="is_active" label="Active" valuePropName="checked">
+            <Switch />
+          </Form.Item>
+        </Form>
+      </Modal>
     </Space>
   );
 }

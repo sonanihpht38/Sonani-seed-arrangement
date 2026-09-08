@@ -2294,6 +2294,79 @@ class PlateMasterPostVerbTests(TransactionTestCase):
         b.refresh_from_db()
         self.assertEqual((int(a.diameter), a.is_active), (int(b.diameter), b.is_active))
 
+    # ---- Adding a plate from Arrangement History ---------------------------
+    # The screen posts to THIS endpoint rather than one of its own, so the tests
+    # for it belong here: whatever is true of Plate Master's create is true of
+    # the drawer's "New plate", by construction.
+
+    def test_a_new_plate_joins_the_pool_and_can_be_assigned(self):
+        """The whole point: a run needing a plate nobody entered is no longer a
+        dead end. Create it, and it is an ordinary plate from that moment on."""
+        r = self.client.post("/api/production/plate-master/",
+                             {"plate_name": "P2-90", "diameter": 90, "is_active": True},
+                             format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        # It shows up in the picker Finalization and the drawer both read.
+        avail = self.client.get("/api/production/plates")
+        self.assertIn("P2-90", [p["plateName"] for p in avail.json()])
+        # ...and assigning it works through the untouched normal route.
+        self.SeedArrangePlate.objects.create(arrange_id=self.arrange_id, plate_no=1)
+        a = self.client.post("/api/production/plates/assign",
+                             {"arrangeId": str(self.arrange_id), "plateNo": 1,
+                              "plateName": "P2-90"}, format="json")
+        self.assertEqual(a.status_code, 200, a.content)
+        self.assertTrue(self.SeedPlate.objects.get(plate_name="P2-90").is_used)
+
+    def test_a_duplicate_name_is_refused(self):
+        """The guard this feature needs. PlateService.assign resolves a name with
+        get_or_create, and MST_SeedPlate has no unique index on PlateName — so a
+        second row sharing a name turns the one inventory-committing action into
+        a MultipleObjectsReturned 500."""
+        self.SeedPlate.objects.create(plate_name="90mm", diameter=90, is_active=True)
+        r = self.client.post("/api/production/plate-master/",
+                             {"plate_name": "90mm", "diameter": 90, "is_active": True},
+                             format="json")
+        self.assertEqual(r.status_code, 400, r.content)
+        self.assertEqual(self.SeedPlate.objects.filter(plate_name="90mm").count(), 1)
+
+    def test_the_duplicate_check_ignores_case_and_padding(self):
+        """"90mm" and " 90MM " name one physical plate. Letting both in would
+        defeat the guard while looking like it held."""
+        self.SeedPlate.objects.create(plate_name="90mm", diameter=90, is_active=True)
+        r = self.client.post("/api/production/plate-master/",
+                             {"plate_name": "  90MM  ", "diameter": 90}, format="json")
+        self.assertEqual(r.status_code, 400, r.content)
+
+    def test_a_name_is_stored_trimmed(self):
+        p = self.client.post("/api/production/plate-master/",
+                             {"plate_name": "  P3-158  ", "diameter": 158}, format="json")
+        self.assertEqual(p.status_code, 201, p.content)
+        self.assertTrue(self.SeedPlate.objects.filter(plate_name="P3-158").exists())
+
+    def test_an_edit_may_keep_its_own_name(self):
+        """The uniqueness check must exclude the row being edited, or changing a
+        plate's diameter would fail because its name already exists — itself."""
+        p = self.SeedPlate.objects.create(plate_name="KEEP", diameter=90, is_active=True)
+        r = self.client.post("/api/production/plate-master/%d/save/" % p.plate_id,
+                             {"plate_name": "KEEP", "diameter": 110}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        p.refresh_from_db()
+        self.assertEqual(int(p.diameter), 110)
+
+    def test_an_edit_may_not_take_another_plates_name(self):
+        a = self.SeedPlate.objects.create(plate_name="ONE", diameter=90, is_active=True)
+        self.SeedPlate.objects.create(plate_name="TWO", diameter=90, is_active=True)
+        r = self.client.post("/api/production/plate-master/%d/save/" % a.plate_id,
+                             {"plate_name": "TWO", "diameter": 90}, format="json")
+        self.assertEqual(r.status_code, 400, r.content)
+        a.refresh_from_db()
+        self.assertEqual(a.plate_name, "ONE")
+
+    def test_an_empty_name_is_refused(self):
+        r = self.client.post("/api/production/plate-master/",
+                             {"plate_name": "   ", "diameter": 90}, format="json")
+        self.assertEqual(r.status_code, 400, r.content)
+
 
 class UnassignReturnsSeedsTests(TransactionTestCase):
     """Plate Master's Unassign must hand the SEEDS back, not just the plate.
