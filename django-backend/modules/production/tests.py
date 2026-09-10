@@ -1981,104 +1981,281 @@ class EmptyResultDiagnosisTests(SimpleTestCase):
 
 
 class SeedListLayoutTests(SimpleTestCase):
-    """The seed list must stay readable however many seeds are on the plate.
+    """The plate image must print on ONE A4 sheet, with a readable seed list.
 
-    It used to be one column whatever its length, and a column cannot grow past
-    the page: a Ø158 plate carries 150 seeds into a 9.6 inch panel, which is a
-    0.06 inch row pitch under a 5.5 pt font, so the rows printed over each other.
-    Nothing about that is specific to Ø158 — it is the seed COUNT, so any
-    diameter hits it once enough seeds fit.
+    The list sits UNDER the plate on a fixed A4 canvas. Two earlier versions put
+    it BESIDE the plate, and both broke the same way — one quantity computed in
+    two places, which drifted:
+
+      * v1 fixed the column width at 3.4 in while the font scaled with the row
+        count. 48 counts printed one column over the next.
+      * v2 derived the width from the font, but the caller sized the panel
+        against a 8.832 in list height while the drawing laid it out against its
+        own 8.621 in. At 54 seeds the sizer asked for one column and the drawing
+        used two, in a panel wide enough for one. Counts 54-55, 107-110, 160-165
+        overprinted — including the 54-seed plate that was reported.
+
+    _legend_layout is now the single decision point: the figure, the plate
+    panel, the columns, the pitch and the font all come out of one call, so
+    there is nothing left for the sizer and the drawing to disagree about.
     """
 
-    PANEL_H = 9.6 * 0.92          # the list area, less title and subtitle
+    COUNTS = list(range(1, 401)) + [500, 1000]
 
-    def test_every_row_has_room_for_its_text(self):
-        """The invariant: pitch never falls below the readable minimum, at any
-        seed count. This is what the single-column layout could not hold."""
+    def test_one_call_decides_the_whole_page(self):
+        """The bug all three versions shared, stated directly: if the layout can
+        be asked for a dimension, two callers can pass different ones."""
+        import inspect
+
         from .engine_runner import D
 
-        for n in (1, 18, 36, 80, 150, 400, 1000):
-            _ncols, per_col = D._legend_shape(n, self.PANEL_H)
-            pitch = self.PANEL_H / per_col
-            self.assertGreaterEqual(
-                pitch, D.LEGEND_MIN_ROW_IN * 0.999,
-                "%d seeds gives a %.3f in row pitch, under the %.3f in minimum "
-                "— the list will print on top of itself"
-                % (n, pitch, D.LEGEND_MIN_ROW_IN))
-
-    def test_every_seed_gets_a_row(self):
-        """Columns x rows must cover the list — no seed may be dropped off the
-        end of a column."""
-        from .engine_runner import D
-
-        for n in (1, 17, 50, 150, 397):
-            ncols, per_col = D._legend_shape(n, self.PANEL_H)
-            self.assertGreaterEqual(
-                ncols * per_col, n,
-                "%d seeds only get %d x %d = %d slots"
-                % (n, ncols, per_col, ncols * per_col))
-
-    def test_a_short_list_stays_one_column(self):
-        """Small plates must render exactly as they did — the fix is for lists
-        that overflow, and it must not reformat the ones that never did."""
-        from .engine_runner import D
-
-        for n in (1, 18, 36, 50):
-            ncols, _ = D._legend_shape(n, self.PANEL_H)
-            self.assertEqual(ncols, 1, "%d seeds should not need columns" % n)
-            self.assertEqual(D._legend_panel_in(n, self.PANEL_H),
-                             D.LEGEND_MIN_PANEL_IN,
-                             "%d seeds should not widen the panel" % n)
-
-    def test_a_long_list_widens_the_panel_to_hold_its_columns(self):
-        """Columns need somewhere to go: the panel grows with them, rather than
-        the columns being squeezed into a fixed width and overlapping."""
-        from .engine_runner import D
-
-        ncols, per_col = D._legend_shape(150, self.PANEL_H)
-        self.assertGreater(ncols, 1, "150 seeds must flow into columns")
-        need = ncols * D._legend_col_in(D._legend_font_pt(per_col, self.PANEL_H))
-        self.assertGreaterEqual(
-            D._legend_panel_in(150, self.PANEL_H), need,
-            "the panel is narrower than the columns it has to hold")
+        params = list(inspect.signature(D._legend_layout).parameters)
+        self.assertEqual(
+            params[0], "n",
+            "_legend_layout must be driven by the seed count first")
+        self.assertLessEqual(
+            len(params), 2,
+            "_legend_layout takes %r — every extra input is another chance for "
+            "the sizer and the drawing to disagree" % (params,))
 
     def test_a_column_is_wide_enough_for_its_own_text_at_every_count(self):
-        """The defect a FIXED column width caused, and the reason the width is
-        now derived from the font.
+        """The no-overlap proof. ncols is floor(width / column width), so a
+        column can never be narrower than the row it must hold."""
+        from .engine_runner import D
 
-        The font is sized from the row pitch, so it GROWS when a column holds
-        fewer rows — and a bigger font needs a wider column. At 3.4 inches flat,
-        a 71-seat Ø110 plate drew 8.6 pt text needing 3.44 in and printed its
-        rotation angle underneath the next column's number. Fewer seeds was
-        worse, which is why a 150-seat plate looked fine. Sweeping every count
-        found 48 broken: 56-84, 111-126, 166-168.
+        for n in self.COUNTS:
+            fp, ncols, _per, _lh, _ph = D._legend_layout(n)
+            need = D._legend_col_in(fp) * D.LEGEND_TEXT_FRAC
+            has = (D.LEGEND_WIDTH_IN / ncols) * D.LEGEND_TEXT_FRAC
+            self.assertGreaterEqual(
+                has + 1e-9, need,
+                "%d seeds: a row needs %.3f in of text but its column gives "
+                "%.3f in, so one column prints over the next" % (n, need, has))
+
+    def test_every_seed_gets_a_row(self):
+        """Columns x rows must cover the list — no seed may fall off the end."""
+        from .engine_runner import D
+
+        for n in self.COUNTS:
+            _fp, ncols, per_col, _lh, _ph = D._legend_layout(n)
+            self.assertGreaterEqual(
+                ncols * per_col, n,
+                "%d seeds only get %d x %d = %d slots" % (n, ncols, per_col, ncols * per_col))
+
+    def test_the_content_always_fits_one_A4_page(self):
+        """The rule the whole layout exists to serve. The plate panel and the
+        list must exactly fill the printable height — never more, or the sheet
+        is cut off, and never less by accident."""
+        from .engine_runner import D
+
+        for n in self.COUNTS:
+            _fp, _nc, _pc, list_h, plate_h = D._legend_layout(n)
+            self.assertAlmostEqual(
+                plate_h + list_h, D.LEGEND_HEIGHT_IN, places=6,
+                msg="%d seeds: %.3f in of content in %.3f in of page"
+                    % (n, plate_h + list_h, D.LEGEND_HEIGHT_IN))
+            self.assertGreaterEqual(plate_h, D.PLATE_MIN_IN - 1e-9,
+                                    "%d seeds squeezed the plate to %.2f in" % (n, plate_h))
+
+    def test_the_printable_area_leaves_room_for_the_title_and_margins(self):
+        """The plate's caption is drawn ABOVE its axes by set_title, so it is in
+        neither panel. It only survived before because bbox_inches='tight' grew
+        the image around it — which a fixed page cannot do."""
+        from .engine_runner import D
+
+        self.assertAlmostEqual(
+            D.LEGEND_HEIGHT_IN,
+            D.A4_H_IN - 2 * D.PAGE_MARGIN_IN - D.PLATE_TITLE_IN, places=6)
+        self.assertGreater(D.PLATE_TITLE_IN, 0.5, "a three-line caption needs the room")
+
+    def test_a_bigger_list_never_gets_bigger_text(self):
+        """The font ladder takes the largest size that fits, so adding seeds can
+        only ever hold or reduce it. A jump back up would mean the ladder is
+        being read inconsistently."""
+        from .engine_runner import D
+
+        prev = D.LEGEND_FONT_LADDER[0]
+        for n in range(1, 401):
+            fp = D._legend_layout(n)[0]
+            self.assertLessEqual(
+                fp, prev + 1e-9,
+                "%d seeds got %.1f pt after %.1f pt at %d" % (n, fp, prev, n - 1))
+            prev = fp
+
+    def test_a_short_list_gets_the_largest_font(self):
+        """Most plates are short. They must not pay for the long ones."""
+        from .engine_runner import D
+
+        for n in (1, 20, 46, 54):
+            self.assertEqual(D._legend_layout(n)[0], D.LEGEND_FONT_LADDER[0],
+                             "%d seeds should print at full size" % n)
+
+    def test_columns_are_balanced(self):
+        """A stub last column wastes the width it cost — 54 over 2 columns is 27
+        each, not 53 and 1."""
+        from .engine_runner import D
+
+        for n in (54, 150, 399):
+            _fp, ncols, per_col, _lh, _ph = D._legend_layout(n)
+            last = n - per_col * (ncols - 1)
+            self.assertGreater(last, 0, "%d seeds: the last column is empty" % n)
+            self.assertLessEqual(
+                per_col - last, per_col * 0.5,
+                "%d seeds are lopsided: %d x %d with %d in the last"
+                % (n, ncols, per_col, last))
+
+    def test_every_renderer_sizes_its_panel_from_its_own_seed_list(self):
+        """A live NameError, caught by nothing. The panel-sizing line was copied
+        into all three renderers and render_real_circle kept the other two's
+        variable name — it has no `placed`, only `real` — so it read an undefined
+        global and EVERY Arrange render died with NameError. No test rendered a
+        plate, so the suite stayed green while the feature was broken.
         """
         from .engine_runner import D
 
-        for n in list(range(2, 200)) + [250, 300, 400]:
-            ncols, per_col = D._legend_shape(n, self.PANEL_H)
-            if ncols < 2:
-                continue                      # one column owns the whole panel
-            colw = D._legend_panel_in(n, self.PANEL_H) / ncols
-            font = D._legend_font_pt(per_col, self.PANEL_H)
-            text = D.LEGEND_ENTRY_CHARS * font * D.LEGEND_EM_PER_CHAR / 72.0
-            self.assertLessEqual(
-                (1.0 - D.LEGEND_TEXT_FRAC) * colw + text, colw,
-                "%d seeds: %.1f pt text needs more than the %.2f in column, so "
-                "one column prints over the next" % (n, font, colw))
+        for name in ("render_enhanced_circle", "render_cross_circle", "render_real_circle"):
+            fn = getattr(D, name)
+            code = fn.__code__
+            args = set(code.co_varnames[:code.co_argcount])
+            for ref in ("placed", "real"):
+                if ref in code.co_names:          # read as a GLOBAL
+                    self.assertIn(
+                        ref, args,
+                        "%s reads %r as a global but does not take it as a "
+                        "parameter — it will raise NameError when called"
+                        % (name, ref))
 
-    def test_columns_are_balanced(self):
-        """A stub last column wastes the width it cost — 150 over 3 columns is
-        50 each, not 55/55/40."""
+
+class SeedListRenderTests(SimpleTestCase):
+    """Actually render a plate. The layout tests check the arithmetic; only a
+    real render catches a renderer that cannot run at all — which is exactly
+    what shipped."""
+
+    @staticmethod
+    def _seeds(n):
+        out, w, h = [], 9.0, 7.5
+        for i in range(n):
+            r, c = divmod(i, 6)
+            x, y = -27.0 + c * w, -30.0 + r * h
+            out.append({
+                "x": x, "y": y, "w": w, "h": h,
+                "poly": [(x, y), (x + w, y), (x + w, y + h), (x, y + h)],
+                "lx": x + w / 2, "ly": y + h / 2, "area": w * h,
+                "stock": "S26SF%05d" % i, "L": w, "W": h, "H": 0.5,
+                "rawL": w, "rawW": h, "cts": 0.6, "kind": "real",
+            })
+        return out
+
+    def _render(self, name, n):
+        import os
+        import tempfile
+
+        from .engine_runner import D, P
+
+        P.PLATE_D, P.USABLE_D, P.R, P.CLEARANCE = 90.0, 80.0, 40.0, 0.0
+        seeds = self._seeds(n)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "p.png")
+            fn = getattr(D, name)
+            # render_real_circle takes (real, ...); the other two (placed, real, ...)
+            args = (seeds,) if name == "render_real_circle" else (seeds, seeds)
+            fn(*args, 1, P.R, 84.0, path)
+            self.assertTrue(os.path.exists(path), "%s wrote no image" % name)
+            self.assertGreater(os.path.getsize(path), 5000,
+                               "%s wrote a suspiciously small image" % name)
+            return path
+
+    def _label_texts(self, sizes, angles):
+        """Run the seat labeller over `sizes` and return what it drew."""
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
         from .engine_runner import D
 
-        ncols, per_col = D._legend_shape(150, self.PANEL_H)
-        last = 150 - per_col * (ncols - 1)
-        self.assertGreater(last, 0, "the last column is empty")
-        self.assertLessEqual(
-            per_col - last, per_col * 0.5,
-            "columns are lopsided: %d x %d with %d in the last"
-            % (ncols, per_col, last))
+        items = [(str(k + 1), 0.0, k * 20.0, w * h, "white")
+                 for k, (w, h) in enumerate(sizes)]
+        fig, ax = plt.subplots()
+        try:
+            D._draw_plate_numbers(ax, items, angles=angles)
+            return [t.get_text() for t in ax.texts]
+        finally:
+            plt.close(fig)
+
+    def test_every_seat_with_an_angle_gets_a_turn_label(self):
+        """The reported inconsistency. Five small stones on a Ø90 plate — a
+        7.89x5 sliver and four ~6x6 corners — printed a number and NO turn,
+        because a flat 45 mm2 cutoff dropped the label rather than scaling it.
+        On a plate where every neighbour states its turn, a blank reads as
+        "this one does not turn", which is a different claim entirely.
+        """
+        sizes = [(6.10, 5.93), (7.89, 5.00), (6.87, 6.00),   # under the old cutoff
+                 (7.66, 6.40), (9.00, 7.50), (13.70, 9.00)]  # over it
+        angles = [0, 90, 0, 90, 0, 180]
+        texts = self._label_texts(sizes, angles)
+        turns = [t for t in texts if t.startswith("↻")]
+        self.assertEqual(
+            len(turns), len(sizes),
+            "%d of %d seats got a turn label — the small stones were skipped: %r"
+            % (len(turns), len(sizes), texts))
+        # ...and every seat still gets its number.
+        self.assertEqual(len([t for t in texts if not t.startswith("↻")]), len(sizes))
+
+    def test_a_tiny_seat_still_states_its_turn(self):
+        """The size the scaling has to survive. A stone at the bottom of the
+        allowed seed-width band is still a stone the floor has to orient."""
+        texts = self._label_texts([(5.0, 5.0)], [270])
+        self.assertIn("↻270°", texts)
+
+    def test_a_seat_with_no_angle_gets_a_number_only(self):
+        """Machine-Cut fillers pass no angles. Having no orientation to state is
+        a different thing from having one and hiding it, so they must not
+        suddenly grow a label."""
+        texts = self._label_texts([(6.0, 6.0), (2.0, 2.0)], None)
+        self.assertEqual([t for t in texts if t.startswith("↻")], [])
+        self.assertEqual(sorted(texts), ["1", "2"])
+
+    def test_max_coverage_renders(self):
+        self._render("render_enhanced_circle", 24)
+
+    def test_arrange_renders(self):
+        """The regression test for the NameError that broke every Arrange run."""
+        self._render("render_real_circle", 24)
+
+    def test_the_reported_count_renders(self):
+        """54 seeds — the count whose list overprinted in the shipped build."""
+        self._render("render_enhanced_circle", 54)
+
+    def test_the_saved_image_is_A4_at_every_seed_count(self):
+        """Printing on ONE sheet is the requirement, so the saved PIXELS must
+        carry A4 proportions whatever the seed count — no crop, no growth.
+
+        This is what bbox_inches="tight" quietly broke: it trims the canvas to
+        its content, so the image stopped being A4 the moment the list changed
+        length. Read straight from the PNG header rather than trusting the
+        figure, because the crop happens at save time.
+        """
+        import os
+        import struct
+        import tempfile
+
+        from .engine_runner import D, P
+
+        want = D.A4_W_IN / D.A4_H_IN
+        for n in (12, 54, 150):
+            P.PLATE_D, P.USABLE_D, P.R, P.CLEARANCE = 90.0, 80.0, 40.0, 0.0
+            seeds = self._seeds(n)
+            with tempfile.TemporaryDirectory() as d:
+                path = os.path.join(d, "p.png")
+                D.render_enhanced_circle(seeds, seeds, 1, P.R, 84.0, path)
+                with open(path, "rb") as fh:
+                    head = fh.read(24)
+                w, h = struct.unpack(">II", head[16:24])
+            self.assertAlmostEqual(
+                w / float(h), want, places=2,
+                msg="%d seeds saved a %dx%d image (ratio %.4f), A4 is %.4f — "
+                    "it will not print on one sheet" % (n, w, h, w / float(h), want))
 
 
 class SetPlateActiveTests(TransactionTestCase):

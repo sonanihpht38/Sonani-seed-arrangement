@@ -287,6 +287,25 @@ def _write_table(ws, r0, c0, title, rows):
                 cell.font = Font(bold=True)
 
 
+def _fit_xl_image(im, box_w, box_h):
+    """Scale an embedded image to fit INSIDE box_w x box_h, keeping its shape.
+
+    A box, not a width. These sheets used to set the width alone and let the
+    height follow the aspect, which was safe only while the plate image happened
+    to be wider than it was tall. It is now A4 PORTRAIT — the plate above its
+    seed list — so a fixed 720 px width would come out over 1000 px tall and
+    float straight over the seed table that starts at row 20. Fitting to a box
+    keeps every sheet's layout exactly where it was, whatever shape the render
+    is, and never enlarges a small image.
+    """
+    if not im.width or not im.height:
+        return im
+    scale = min(box_w / float(im.width), box_h / float(im.height))
+    im.width = max(1, int(round(im.width * scale)))
+    im.height = max(1, int(round(im.height * scale)))
+    return im
+
+
 def _write_single_xlsx(path, plate_no, heading, table_title, img_path, rows):
     """Per-plate workbook for a SINGLE-stage result (Arrange / Machine-Cut / Enhanced):
     the plate image + one seed detail table (same columns as the on-screen table)."""
@@ -295,12 +314,9 @@ def _write_single_xlsx(path, plate_no, heading, table_title, img_path, rows):
     ws.title = f"Plate_{plate_no:02d}"
     ws.cell(1, 1, heading).font = Font(bold=True, size=13, color="1F4E78")
     if img_path and os.path.exists(img_path):
-        im = XLImage(img_path)
-        # Keep the image's real proportions (the enhanced plate is wide: plate + seed list).
-        ratio = (im.height / im.width) if im.width else 1.0
-        im.width = 720
-        im.height = int(round(720 * ratio))
-        ws.add_image(im, "A3")
+        # Fit the same on-sheet footprint the wide render used, so the seed
+        # table at row 20 stays clear whatever shape the image is.
+        ws.add_image(_fit_xl_image(XLImage(img_path), 720, 470), "A3")
     _write_table(ws, 20, 1, f"{table_title} — {len(rows)} seeds", rows)
     for col in "ABCDEFGH":
         ws.column_dimensions[col].width = 14
@@ -318,11 +334,8 @@ def _write_compare_xlsx(path, plate_no, panels):
     for label, img_path, rows in panels:
         ws.cell(2, col, label).font = Font(bold=True, size=11, color="1F4E78")
         if img_path and os.path.exists(img_path):
-            im = XLImage(img_path)
-            ratio = (im.height / im.width) if im.width else 1.0
-            im.width = 430
-            im.height = int(round(430 * ratio))
-            ws.add_image(im, ws.cell(3, col).coordinate)
+            ws.add_image(_fit_xl_image(XLImage(img_path), 430, 470),
+                         ws.cell(3, col).coordinate)
         _write_table(ws, 20, col, f"{label} — {len(rows or [])} seeds", rows or [])
         for j in range(8):
             ws.column_dimensions[get_column_letter(col + j)].width = 13
@@ -1371,9 +1384,10 @@ def _add_final_to_excel(xlsx_path, final_png, final_rows=None):
                 ws._images.remove(existing)
         except Exception:
             pass
-    img = XLImage(final_png)
-    img.width = img.height = 300
-    ws.add_image(img, "Q3")
+    # A BOX, not a forced square: `width = height = 300` squashed whatever it was
+    # given, which was tolerable while the render was nearly square and is not
+    # now that it is A4 portrait.
+    ws.add_image(_fit_xl_image(XLImage(final_png), 300, 300), "Q3")
 
     # FINALIZED detail table at Q20 (cols Q..W = 17..23), same format as the other two.
     if final_rows is not None:

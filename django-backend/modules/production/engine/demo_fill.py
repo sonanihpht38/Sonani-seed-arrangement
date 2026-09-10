@@ -350,11 +350,19 @@ def band_caption():
             f"  ·  seed width {width}")
 
 
-# Smallest seat, in mm2, that a rotation label is drawn inside. Below this the
-# text is wider than the stone and overlaps its neighbours, which makes the plate
-# harder to read rather than easier — those seeds carry their angle in the seed
-# list beside the plate instead, where every seed appears whatever its size.
-ANGLE_LABEL_MIN_MM2 = 45.0
+# Seat size, as a square-equivalent SIDE in mm, at which the number + turn pair
+# is drawn at full size. A smaller stone gets the same pair scaled down to fit
+# inside it — it does NOT lose its angle.
+#
+# This replaced a hard 45 mm2 cutoff below which the turn was simply not drawn.
+# The intent was sound (at full size the text is wider than a small stone and
+# spills over its neighbours) but the remedy was wrong: it made the plate
+# inconsistent, and inconsistency is worse than small text. On a Ø90 plate the
+# five stones under 45 mm2 — a 7.89x5 sliver and four ~6x6 corners — showed a
+# number with no turn while every neighbour showed both, which reads as "this
+# one does not turn" rather than "this one is small". Scaling keeps the promise
+# the plate makes: every seat states its orientation.
+ANGLE_LABEL_FULL_MM = 7.0
 
 
 def _draw_plate_numbers(ax, items, angles=None):
@@ -362,139 +370,202 @@ def _draw_plate_numbers(ax, items, angles=None):
     readable in any seat size / fill colour. items = list of
     (label, lx, ly, area, color).
 
-    `angles`, when given, is a parallel list of CLOCKWISE degrees; a seat big
-    enough to hold it also gets its turn printed under the number, so the floor
-    can read the intended orientation straight off the plate.
+    `angles`, when given, is a parallel list of CLOCKWISE degrees. EVERY seat
+    with a known angle gets its turn printed under the number, so the floor can
+    read the intended orientation straight off the plate without cross-checking
+    the list. A small stone gets the pair scaled down, never dropped — see
+    ANGLE_LABEL_FULL_MM.
+
+    A seat with no angle (the Machine-Cut fillers, which pass no `angles`) still
+    gets its number alone: there is no orientation to state, which is a
+    different thing from having one and hiding it.
     """
     halo = [pe.withStroke(linewidth=2.6, foreground="#0d0d0dee")]
     for i, (label, lx, ly, area, color) in enumerate(items):
         fs = min(14.0, max(8.0, math.sqrt(max(area, 1.0)) * 0.7))
         cw = angles[i] if angles is not None and i < len(angles) else None
-        if cw is None or area < ANGLE_LABEL_MIN_MM2:
+        if cw is None:
             ax.text(lx, ly, label, ha="center", va="center", fontsize=fs,
                     color=color, fontweight="bold", zorder=3, path_effects=halo)
             continue
+        # A tight seat has to carry TWO lines, so shrink them together until the
+        # pair fits the stone. Scaling on the square-equivalent side keeps a
+        # 6x6 corner stone legible instead of letting a floor'd 8 pt number
+        # crowd the turn out from under it.
+        side = math.sqrt(max(area, 1.0))
+        if side < ANGLE_LABEL_FULL_MM:
+            fs = max(5.0, fs * side / ANGLE_LABEL_FULL_MM)
         # Number above, turn below, so neither has to shrink to fit the other.
         ax.text(lx, ly + fs * 0.030, label, ha="center", va="bottom", fontsize=fs,
                 color=color, fontweight="bold", zorder=3, path_effects=halo)
         ax.text(lx, ly - fs * 0.030, f"↻{cw}°", ha="center", va="top",
-                fontsize=max(5.0, fs * 0.62), color=color, fontweight="bold",
+                fontsize=max(4.0, fs * 0.62), color=color, fontweight="bold",
                 zorder=3, path_effects=halo)
 
 
-# SEED LIST GEOMETRY. The list used to be one column however long it was, and a
-# column cannot grow past the height of the page: a Ø158 plate carries 138 seeds
-# into a 9.6 inch panel, which is a 0.07 inch row pitch under a 5.5 pt font, so
-# the rows printed on top of each other and the list was unreadable. Nothing
-# about that is specific to Ø158 — it is purely the seed COUNT, so any plate
-# reaches it once enough seeds fit, and a bigger plate reaches it sooner.
+# SEED LIST GEOMETRY — the list sits UNDER the plate, across the full width.
 #
-# The row pitch is therefore fixed and the list flows into as many columns as it
-# needs, with the panel widened to hold them. Legibility then does not depend on
-# the plate diameter, the seed count, or the band.
-LEGEND_MIN_ROW_IN = 0.16    # inches — row pitch that keeps ~8 pt text clear
-LEGEND_MIN_PANEL_IN = 5.0   # inches — never narrower than the original panel
+# It used to sit BESIDE the plate, and everything wrong with it followed from
+# that one choice. Beside the plate the list's height is fixed at the height of
+# the plate, so the only way to fit more seeds is to shrink the pitch, then the
+# font, then flow into columns and widen the whole figure. Three coupled
+# quantities, re-derived in two places, and they drifted apart twice:
+#
+#   * v1 fixed the column width at 3.4 in while the font scaled with the row
+#     count, so 48 seed counts printed their rotation angle under the next
+#     column's number.
+#   * v2 derived the width from the font and fixed that — but the panel was
+#     SIZED against a 8.832 in list height (9.6 x 0.92) while _draw_legend_list
+#     LAID IT OUT against its own 8.621 in (the leftover after the title and a
+#     two-line subtitle). At 54 seeds the sizer sees 55 rows per column and asks
+#     for one column; the drawer sees 53 and lays out two, in a panel only wide
+#     enough for one. Counts 54-55, 107-110 and 160-165 overprinted.
+#
+# Both were the same bug: one quantity computed in two places. Moving the list
+# below the plate removes the cause rather than re-tuning the symptom. Height is
+# then FREE — the figure simply grows downward — so:
+#
+#   * the FONT is a constant. It never shrinks to fit a plate, at any seed count.
+#   * the COLUMN COUNT is floor(width / column width), so a column is never
+#     narrower than the text it must hold. That is arithmetic, not a tuning.
+#   * the SHAPE depends on the seed count ALONE. There is no height left for a
+#     caller and the drawing to disagree about, which is what broke it twice.
+#
+# The plate also stops shrinking as seeds are added: the figure width is now
+# constant, so a 150-seed plate renders exactly as large as a 20-seed one.
+# THE PAGE IS A4. The image has to print on ONE sheet, so the figure is a fixed
+# A4 canvas and the content is fitted INTO it — the page never grows to fit the
+# list. That is the constraint everything below serves.
+A4_W_IN, A4_H_IN = 8.268, 11.693        # 210 x 297 mm
+PAGE_MARGIN_IN = 0.18                   # keeps ink off the unprintable edge
+PLATE_MIN_IN = 4.60                     # the plate never shrinks below this
+# The plate's three-line caption is drawn ABOVE its axes by set_title, so it is
+# not inside either panel and has to be reserved separately. It used to survive
+# only because bbox_inches="tight" grew the image around it — which is exactly
+# what a fixed page cannot do, so the room is booked here instead.
+PLATE_TITLE_IN = 0.78
 
-# A COLUMN IS AS WIDE AS ITS TEXT, never a fixed number of inches. This shipped
-# as LEGEND_COL_IN = 3.4 and that was a latent bug of the same shape as the
-# millimetre size-gradient tolerance: a constant paired with something that
-# varies. The FONT is sized from the row pitch, so it grows when a column holds
-# fewer rows — and a wider font needs a wider column, which a constant cannot
-# give it. Measured on the shipped build:
-#
-#   seeds  rows/col  font    text     column   result
-#   150    50        7.0 pt  2.20 in  3.40 in  fits
-#    71    36        8.6 pt  2.88 in  3.40 in  needs 3.44 in — OVERFLOWS
-#
-# So FEWER seeds was worse, which is why Ø158 looked right while a Ø110 plate of
-# 71 seeds printed its rotation angle underneath the next column's number. 3.4
-# was calibrated against the 150-seed case at 7 pt and never checked at another
-# size. Sweeping every count from 2 to 400 found 48 of them broken: 56-84,
-# 111-126 and 166-168.
-#
-# Deriving the width from the font instead removes the coupling entirely — there
-# is no value left to re-tune when the font, the row format or the plate changes.
+# Font ladder, largest first: the layout takes the LARGEST size whose list still
+# fits the page. Small plates therefore print large, readable text, and only a
+# very long list has to step down. Nothing is tuned per plate size or count.
+LEGEND_FONT_LADDER = (8.5, 8.0, 7.5, 7.0, 6.5, 6.0, 5.5, 5.0, 4.5, 4.0)
+LEGEND_ROW_FACTOR = 1.55                # row pitch = font_pt * this / 72
+LEGEND_HEAD_IN = 0.52                   # title + two-line subtitle
+LEGEND_PAD_IN = 0.12                    # breathing room under the last row
+
+# The figure margins are PINNED so the drawn axes is exactly the size the figure
+# was built for. Matplotlib's defaults inset an axes to ~0.775 of its cell, and
+# leaving that implicit is how the first attempt at this layout still managed to
+# lay out one column in a block sized for two: the caller measured the FIGURE
+# and the drawing measured the AXES. Pinning them makes those the same number.
+LEGEND_LEFT = PAGE_MARGIN_IN / A4_W_IN
+LEGEND_RIGHT = 1.0 - LEGEND_LEFT
+LEGEND_TOP = 1.0 - (PAGE_MARGIN_IN + PLATE_TITLE_IN) / A4_H_IN
+LEGEND_BOTTOM = PAGE_MARGIN_IN / A4_H_IN
+LEGEND_WIDTH_IN = A4_W_IN - 2 * PAGE_MARGIN_IN
+LEGEND_HEIGHT_IN = A4_H_IN - 2 * PAGE_MARGIN_IN - PLATE_TITLE_IN
+
 LEGEND_EM_PER_CHAR = 0.55   # DejaVu Sans average advance, measured from a render
-# A seed row is "<stock>   <L>x<W>   H <t>   turn <a>deg" — about 44 characters.
-# Sized for 48 so a long stock number or a trailing cut note has somewhere to go.
-LEGEND_ENTRY_CHARS = 48
+# A seed row is "<stock>   <L>x<W>   H <t>   turn <a>deg" — 39 characters for a
+# ten-character stock code. Sized at 42 for a little slack. This used to be 48,
+# which on a page that can grow was harmless slack; on a fixed A4 sheet it is
+# width thrown away, and those six characters are the difference between two
+# columns and three — which is in turn the difference between 6 pt text and 8 pt.
+LEGEND_ENTRY_CHARS = 42
 LEGEND_TEXT_FRAC = 0.835    # share of a column left for text, after swatch+number
 LEGEND_COL_PAD_IN = 0.12    # gutter, so two columns never touch
 
 
-def _legend_font_pt(per_col, panel_h_in):
-    """Text size for a column holding `per_col` rows — driven by the row pitch it
-    actually has, which is what decides whether the rows collide."""
-    rh_in = panel_h_in / max(1, per_col)
-    return min(8.6, max(5.5, rh_in * 72.0 * 0.55))
-
-
-def _legend_col_in(font_pt):
+def _legend_col_in(font_pt, chars=LEGEND_ENTRY_CHARS):
     """How wide a column must be to hold one seed row at this font size."""
-    text_in = LEGEND_ENTRY_CHARS * font_pt * LEGEND_EM_PER_CHAR / 72.0
+    text_in = max(1, int(chars)) * font_pt * LEGEND_EM_PER_CHAR / 72.0
     return (text_in + LEGEND_COL_PAD_IN) / LEGEND_TEXT_FRAC
 
 
-def _legend_shape(n, panel_h_in):
-    """(columns, rows per column) for `n` seed-list rows in a panel that tall.
+def _legend_layout(n, chars=LEGEND_ENTRY_CHARS):
+    """The ONE function that decides the whole page.
 
-    Height only — how many rows fit is a function of the pitch, and the width
-    that implies is settled afterwards by _legend_col_in. Keeping the two apart
-    is what makes the chain acyclic.
+    Returns (font_pt, ncols, per_col, list_h_in, plate_h_in) for `n` seed rows
+    whose longest is `chars` characters.
+
+    Everything — the figure, the plate panel, the columns, the row pitch and the
+    text size — comes out of this single call, so the code that SIZES the figure
+    and the code that DRAWS into it cannot disagree. That disagreement is the bug
+    this layout has now had three times: a fixed column width beside a scaling
+    font, then a panel sized against one list height and drawn against another.
+
+    The page is fixed at A4, so a longer list cannot buy more paper — it buys
+    smaller text, by stepping down the font ladder until it fits, and (only once
+    the list has taken its half of the page) a smaller plate.
     """
     n = max(int(n), 1)
-    per_col = max(1, int(panel_h_in / LEGEND_MIN_ROW_IN))
-    ncols = max(1, int(math.ceil(n / float(per_col))))
-    # Re-balance so the last column is not a stub — 138 over 2 columns is 69
-    # each, not 71 and 67.
-    return ncols, int(math.ceil(n / float(ncols)))
-
-
-def _legend_panel_in(n, panel_h_in):
-    """How wide the seed-list panel has to be to hold `n` rows legibly."""
-    ncols, per_col = _legend_shape(n, panel_h_in)
-    return max(LEGEND_MIN_PANEL_IN,
-               ncols * _legend_col_in(_legend_font_pt(per_col, panel_h_in)))
+    fp = LEGEND_FONT_LADDER[-1]
+    ncols, per_col, need = 1, n, LEGEND_HEIGHT_IN
+    budget = LEGEND_HEIGHT_IN - PLATE_MIN_IN
+    for fp in LEGEND_FONT_LADDER:
+        ncols = max(1, int(LEGEND_WIDTH_IN / _legend_col_in(fp, chars)))
+        # Re-balance so the last column is not a stub — 54 over 2 columns is 27
+        # each, not 53 and 1.
+        per_col = int(math.ceil(n / float(ncols)))
+        need = LEGEND_HEAD_IN + per_col * fp * LEGEND_ROW_FACTOR / 72.0 + LEGEND_PAD_IN
+        if need <= budget:
+            break
+    # A list longer than the smallest font can hold still gets the page rather
+    # than running off it: the rows tighten to the space left. Nothing is lost,
+    # it is simply dense — and it still prints on one sheet, which is the rule.
+    list_h = min(need, budget)
+    # The plate takes what the list did not, but never more than a square panel:
+    # it draws a circle to equal aspect, so height beyond its own width is
+    # whitespace either side and buys nothing.
+    plate_h = min(LEGEND_HEIGHT_IN - list_h, LEGEND_WIDTH_IN)
+    plate_h = max(plate_h, PLATE_MIN_IN)
+    return fp, ncols, per_col, LEGEND_HEIGHT_IN - plate_h, plate_h
 
 
 def _draw_legend_list(axl, title, subtitle, entries):
-    """Draw the seed list beside the plate. entries = list of
+    """Draw the seed list UNDER the plate. entries = list of
     (swatch_color, swatch_edge, number_text, description_text, text_color).
 
-    Flows into columns rather than growing one column past the page — see
-    LEGEND_MIN_ROW_IN. The caller sizes the panel with _legend_panel_in() so the
-    columns have somewhere to go.
+    The axes is as wide as the figure and as tall as _legend_block_in() asked
+    for, so everything here is laid out in inches converted to axes fractions —
+    no quantity is re-derived from the leftover space, which is how the two
+    earlier versions drifted. See the LEGEND_* block above.
     """
     axl.axis("off"); axl.set_xlim(0, 1); axl.set_ylim(0, 1)
-    axl.text(0.0, 0.995, title, fontsize=12, fontweight="bold", va="top")
-    top = 0.955
-    if subtitle:
-        axl.text(0.0, 0.965, subtitle, fontsize=8.5, va="top", color="#7a3d00")
-        # Give the list back one line's worth of room per EXTRA subtitle line,
-        # or a two-line subtitle prints straight over the first few seeds.
-        top = 0.925 - 0.022 * subtitle.count("\n")
+
+    # Real height of this axes, so an inch means an inch. The margins are pinned,
+    # so this equals the height the figure was built for.
+    fig_h_in = float(axl.figure.get_size_inches()[1])
+    h_in = max(axl.get_position().height * fig_h_in, 1e-6)
+
     n = max(len(entries), 1)
-    bot = 0.005
-    panel_h = float(axl.figure.get_size_inches()[1])
-    list_h = panel_h * (top - bot)
-    ncols, per_col = _legend_shape(n, list_h)
-    rh = (top - bot) / per_col
-    # ONE font formula, shared with the sizing helpers. Computing it separately
-    # here is how the column width and the text drifted apart: the panel was
-    # sized for one size and drawn at another.
-    lfs = _legend_font_pt(per_col, list_h)
+    # SAME call the figure was sized with, on the SAME inputs.
+    fp, ncols, per_col, _list_h, _plate_h = _legend_layout(n)
+
+    axl.text(0.0, 1.0, title, fontsize=min(12.0, fp + 3.0), fontweight="bold", va="top")
+    if subtitle:
+        axl.text(0.0, 1.0 - 0.21 / h_in, subtitle, fontsize=min(8.5, fp), va="top",
+                 color="#7a3d00")
+
+    top = 1.0 - LEGEND_HEAD_IN / h_in
+    # The row pitch the font wants, capped by the space the page actually gave
+    # the list — so a list that had to be squeezed fills the block evenly rather
+    # than running off the bottom edge.
+    want = (fp * LEGEND_ROW_FACTOR / 72.0) / h_in
+    room = (top - LEGEND_PAD_IN / h_in) / max(per_col, 1)
+    rh = min(want, room)
     colw = 1.0 / ncols
     for i, (color, edge, num, text, tcolor) in enumerate(entries):
         c, r = divmod(i, per_col)
         x0 = c * colw
         y = top - (r + 0.5) * rh
-        axl.add_patch(Rect((x0 + 0.005 * colw / 1.0, y - rh * 0.34), 0.045 * colw,
-                      rh * 0.68, facecolor=color, edgecolor=edge, lw=1.0,
+        axl.add_patch(Rect((x0 + 0.005 * colw, y - rh * 0.34), 0.040 * colw,
+                      rh * 0.68, facecolor=color, edgecolor=edge, lw=0.8,
                       transform=axl.transAxes, clip_on=False))
         # The number field has to clear a THREE digit seat number: a Ø158 plate
         # numbers past 100, and at 0.135 "150." ran into the stock code.
-        axl.text(x0 + 0.060 * colw, y, num, fontsize=lfs, va="center", fontweight="bold")
-        axl.text(x0 + 0.165 * colw, y, text, fontsize=lfs, va="center", color=tcolor)
+        axl.text(x0 + 0.055 * colw, y, num, fontsize=fp, va="center", fontweight="bold")
+        axl.text(x0 + 0.165 * colw, y, text, fontsize=fp, va="center", color=tcolor)
 
 
 def render_enhanced_circle(placed, real, pi, R, fill, path):
@@ -516,14 +587,16 @@ def render_enhanced_circle(placed, real, pi, R, fill, path):
     # Two panels: the plate (each seed labelled with a NUMBER only, so it stays readable in
     # any seat) and, beside it, a full seed LIST — a colour swatch matching the seat plus the
     # stock, size, thickness, and (for trimmed seeds) how much was cut off.
-    # Widen the panel for the seed list rather than squeezing the list into a
-    # fixed one — see LEGEND_MIN_ROW_IN. The plate panel keeps its 9.6 inches,
-    # so the plate itself renders exactly as before at every diameter.
-    _lw = _legend_panel_in(len(placed), 9.6 * 0.92)
-    fig = plt.figure(figsize=(9.6 + _lw, 9.6))
-    gs = fig.add_gridspec(1, 2, width_ratios=[9.6, _lw], wspace=0.02)
+    # Plate on top, seed list underneath — see the LEGEND_* block. The figure is
+    # a FIXED width at every seed count, so the plate is always drawn the same
+    # size; only the list's height varies.
+    _, _, _, _lh, _ph = _legend_layout(len(placed))
+    fig = plt.figure(figsize=(A4_W_IN, A4_H_IN))
+    gs = fig.add_gridspec(2, 1, height_ratios=[_ph, _lh], hspace=0.0,
+                          left=LEGEND_LEFT, right=LEGEND_RIGHT,
+                          top=LEGEND_TOP, bottom=LEGEND_BOTTOM)
     ax = fig.add_subplot(gs[0, 0])
-    axl = fig.add_subplot(gs[0, 1]); axl.axis("off")
+    axl = fig.add_subplot(gs[1, 0]); axl.axis("off")
 
     ax.add_patch(Circle((0, 0), PLATE / 2, fc="#e9e9ec", ec="#888", lw=1.5, zorder=0))
     # Shade the MARGIN ring itself, so the clear band reads as a deliberate
@@ -612,7 +685,10 @@ def render_enhanced_circle(placed, real, pi, R, fill, path):
          + "\n↻ = turn CLOCKWISE from the seed as measured"),
         entries)
 
-    fig.savefig(path, dpi=125, bbox_inches="tight")
+    # NO bbox_inches="tight": it crops the figure to its content, and the
+    # saved image then stops being A4 — the one thing this layout has to
+    # guarantee. The margins are pinned instead, so there is nothing to trim.
+    fig.savefig(path, dpi=200)
     plt.close(fig)
 
 
@@ -4362,14 +4438,14 @@ def render_cross_circle(placed, real, pi, R, fill, path):
     DCOL = {"big": "#bcd6f0", "cross": "#f6c177", "tri": "#9ed99b", "irregular": "#c9a0dc", "dummy": "#f4a3a3"}
     DEDGE = {"big": "#1f6fb2", "cross": "#b9770f", "tri": "#2e8b3d", "irregular": "#7d3c98", "dummy": "#c0142c"}
 
-    # Widen the panel for the seed list rather than squeezing the list into a
-    # fixed one — see LEGEND_MIN_ROW_IN. The plate panel keeps its 9.6 inches,
-    # so the plate itself renders exactly as before at every diameter.
-    _lw = _legend_panel_in(len(placed), 9.6 * 0.92)
-    fig = plt.figure(figsize=(9.6 + _lw, 9.6))
-    gs = fig.add_gridspec(1, 2, width_ratios=[9.6, _lw], wspace=0.02)
+    # Plate on top, seed list underneath — see the LEGEND_* block.
+    _, _, _, _lh, _ph = _legend_layout(len(placed))
+    fig = plt.figure(figsize=(A4_W_IN, A4_H_IN))
+    gs = fig.add_gridspec(2, 1, height_ratios=[_ph, _lh], hspace=0.0,
+                          left=LEGEND_LEFT, right=LEGEND_RIGHT,
+                          top=LEGEND_TOP, bottom=LEGEND_BOTTOM)
     ax = fig.add_subplot(gs[0, 0])
-    axl = fig.add_subplot(gs[0, 1]); axl.axis("off")
+    axl = fig.add_subplot(gs[1, 0]); axl.axis("off")
 
     ax.add_patch(Circle((0, 0), PLATE / 2, fc="#e9e9ec", ec="#888", lw=1.5, zorder=0))
     ax.add_patch(Circle((0, 0), R, fc="none", ec="#c0392b", lw=1.2, ls="--", zorder=1))
@@ -4420,7 +4496,10 @@ def render_cross_circle(placed, real, pi, R, fill, path):
     _draw_legend_list(axl, f"Seeds on this plate ({nr})",
                       f"D = dummy filler ({len(dummies)})", entries)
 
-    fig.savefig(path, dpi=125, bbox_inches="tight")
+    # NO bbox_inches="tight": it crops the figure to its content, and the
+    # saved image then stops being A4 — the one thing this layout has to
+    # guarantee. The margins are pinned instead, so there is nothing to trim.
+    fig.savefig(path, dpi=200)
     plt.close(fig)
 
 
@@ -4440,14 +4519,19 @@ def render_real_circle(real, pi, R, fill, path):
     cmap = plt.cm.viridis
     faces = [cmap(i / max(1, nr - 1)) for i in range(nr)]
 
-    # Widen the panel for the seed list rather than squeezing the list into a
-    # fixed one — see LEGEND_MIN_ROW_IN. The plate panel keeps its 9.6 inches,
-    # so the plate itself renders exactly as before at every diameter.
-    _lw = _legend_panel_in(len(placed), 9.6 * 0.92)
-    fig = plt.figure(figsize=(9.6 + _lw, 9.6))
-    gs = fig.add_gridspec(1, 2, width_ratios=[9.6, _lw], wspace=0.02)
+    # Plate on top, seed list underneath — see the LEGEND_* block.
+    #
+    # `len(real)`, not `len(placed)`: this renderer's parameter is `real` and it
+    # has no `placed`. The beside-the-plate sizing line was copied into all three
+    # renderers and this one kept the other two's variable name, so it read an
+    # undefined global and raised NameError — every Arrange render died here.
+    _, _, _, _lh, _ph = _legend_layout(len(real))
+    fig = plt.figure(figsize=(A4_W_IN, A4_H_IN))
+    gs = fig.add_gridspec(2, 1, height_ratios=[_ph, _lh], hspace=0.0,
+                          left=LEGEND_LEFT, right=LEGEND_RIGHT,
+                          top=LEGEND_TOP, bottom=LEGEND_BOTTOM)
     ax = fig.add_subplot(gs[0, 0])
-    axl = fig.add_subplot(gs[0, 1]); axl.axis("off")
+    axl = fig.add_subplot(gs[1, 0]); axl.axis("off")
 
     ax.add_patch(Circle((0, 0), PLATE / 2, fc="#e9e9ec", ec="#888", lw=1.5, zorder=0))
     # Shade the MARGIN ring so the clear band reads as a deliberate setting rather
@@ -4495,7 +4579,10 @@ def render_real_circle(real, pi, R, fill, path):
          + "\n↻ = turn CLOCKWISE from the seed as measured"),
         entries)
 
-    fig.savefig(path, dpi=125, bbox_inches="tight")
+    # NO bbox_inches="tight": it crops the figure to its content, and the
+    # saved image then stops being A4 — the one thing this layout has to
+    # guarantee. The margins are pinned instead, so there is nothing to trim.
+    fig.savefig(path, dpi=200)
     plt.close(fig)
 
 

@@ -49,7 +49,13 @@ function readJson<T>(key: string, fallback: T): T {
 const ALL_OPTIONS: { value: Action; title: string; desc: string; Icon: typeof FiGrid }[] = [
   { value: "arrange", title: "Arrange", desc: "Place the real seeds onto plates.", Icon: FiGrid },
   { value: "machinefill", title: "Machine-Cut Fill", desc: "Arrange real seeds, then fill the gaps with dummy fillers.", Icon: FiPackage },
-  { value: "enhanced", title: "Max Coverage", desc: "Grow the arranged seeds to the plate edge and trim any overhanging seeds with a straight cut — highest coverage, all real seeds.", Icon: FiZap },
+  // Says "placed whole" deliberately. This used to read "trim any overhanging
+  // seeds with a straight cut", describing behaviour the engine removed: it
+  // never cuts a stone (see demo_fill.render_enhanced_circle — the `clipped`
+  // flag is read in three places and set in none, and the plate image prints
+  // "all placed whole (nothing cut)"). An operator reading the old wording would
+  // reasonably conclude the software modifies their inventory.
+  { value: "enhanced", title: "Max Coverage", desc: "Pack the real seeds as tightly as the plate allows, rotating each to fit — highest coverage, every seed placed whole.", Icon: FiZap },
   { value: "compare", title: "Compare", desc: "Run the methods and view them side by side to compare coverage.", Icon: FiCopy },
 ];
 const OPTIONS = ALL_OPTIONS.filter((o) => !HIDDEN.has(o.value));
