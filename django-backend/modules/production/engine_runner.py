@@ -287,6 +287,27 @@ def _write_table(ws, r0, c0, title, rows):
                 cell.font = Font(bold=True)
 
 
+_XL_ROW_PX = 20.0        # Excel's default row height (15 pt) at 96 dpi
+_XL_IMG_ROW = 3          # the row the plate image is anchored at
+_XL_GAP_ROWS = 2         # blank rows left between the image and the table
+
+
+def _xl_table_row(img_h_px, anchor=_XL_IMG_ROW, gap=_XL_GAP_ROWS):
+    """First row of the seed table, clear of the image floating above it.
+
+    An embedded picture in Excel floats OVER the cells — it does not push them
+    down — so a table placed at a fixed row simply ends up underneath. The
+    per-plate sheet put its table at row 20 while the image reached row 27, and
+    the header plus the first seven seeds were hidden behind the plate.
+
+    Derived from the image's actual height rather than set to a new fixed row,
+    so it cannot drift out of step the way the fixed 20 did. For the sheets
+    whose image is shorter (Compare at 283 px, Finalized at 300 px) this returns
+    20 — exactly where their tables already sit, so nothing moves for them.
+    """
+    return anchor + int(math.ceil(img_h_px / _XL_ROW_PX)) + gap
+
+
 def _XL_BOX_H(box_w):
     """The height each sheet's plate image used to occupy, for a given width.
 
@@ -326,13 +347,18 @@ def _write_single_xlsx(path, plate_no, heading, table_title, img_path, rows):
     ws = wb.active
     ws.title = f"Plate_{plate_no:02d}"
     ws.cell(1, 1, heading).font = Font(bold=True, size=13, color="1F4E78")
+    table_row = 20                                   # where it sits with no image
     if img_path and os.path.exists(img_path):
         # Box height = the footprint this sheet ALREADY had. The old rule set the
         # width and let the height follow the (landscape) image, which on this
         # sheet came to 720 x 474. Matching that keeps the sheet exactly as it
         # was now the image is portrait — see _XL_BOX_H.
-        ws.add_image(_fit_xl_image(XLImage(img_path), 720, _XL_BOX_H(720)), "A3")
-    _write_table(ws, 20, 1, f"{table_title} — {len(rows)} seeds", rows)
+        im = _fit_xl_image(XLImage(img_path), 720, _XL_BOX_H(720))
+        ws.add_image(im, "A3")
+        # ...and start the table BELOW it. This is the only sheet whose image is
+        # tall enough to reach row 20; the other two already clear it.
+        table_row = _xl_table_row(im.height)
+    _write_table(ws, table_row, 1, f"{table_title} — {len(rows)} seeds", rows)
     for col in "ABCDEFGH":
         ws.column_dimensions[col].width = 14
     wb.save(path)

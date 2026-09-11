@@ -2322,6 +2322,38 @@ class ExcelImageFitTests(SimpleTestCase):
         im = _fit_xl_image(self._Img(0, 0), 720, 470)
         self.assertEqual((im.width, im.height), (0, 0))
 
+    # ---- the table must not sit underneath the image -----------------------
+
+    def test_the_table_starts_below_the_plate_image(self):
+        """An embedded picture floats OVER the cells, it does not push them down.
+        The per-plate sheet had its table at a fixed row 20 while the image
+        reached row 27, so the header and the first seven seeds were hidden
+        behind the plate."""
+        from .engine_runner import _XL_BOX_H, _fit_xl_image, _xl_table_row
+
+        im = _fit_xl_image(self._Img(1653, 2338), 720, _XL_BOX_H(720))
+        last_img_row = 3 + im.height / self.ROW_PX
+        self.assertGreater(
+            _xl_table_row(im.height), last_img_row,
+            "the table would start at row %d while the image reaches row %.0f"
+            % (_xl_table_row(im.height), last_img_row))
+
+    def test_the_shorter_sheets_do_not_move(self):
+        """Compare (283 px) and Finalized (300 px) already cleared row 20. The
+        rule must leave them exactly where they are — a fix for one sheet must
+        not shuffle the other two."""
+        from .engine_runner import _xl_table_row
+
+        for px in (283, 300):
+            self.assertEqual(_xl_table_row(px), 20)
+
+    def test_the_row_is_derived_not_hardcoded(self):
+        """A taller image must push the table further down by itself."""
+        from .engine_runner import _xl_table_row
+
+        self.assertLess(_xl_table_row(300), _xl_table_row(600))
+        self.assertLess(_xl_table_row(600), _xl_table_row(900))
+
 
 class SetPlateActiveTests(TransactionTestCase):
     """Retiring a plate name — the app's soft delete, and the only one live can use.
