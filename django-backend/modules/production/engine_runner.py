@@ -287,6 +287,19 @@ def _write_table(ws, r0, c0, title, rows):
                 cell.font = Font(bold=True)
 
 
+def _XL_BOX_H(box_w):
+    """The height each sheet's plate image used to occupy, for a given width.
+
+    Before the plate image went A4 portrait it was about 14.6 x 9.6 inches, and
+    these sheets set the WIDTH and let the height follow — so every sheet's
+    footprint was width x 0.658. Reproducing that exactly is what keeps each
+    workbook laid out as it was: a single box height for all of them looked
+    right on the A3-anchored sheet and made the Compare sheet's image 66%
+    taller, which dropped it over the seed table at row 20.
+    """
+    return box_w * (9.6 / 14.6)
+
+
 def _fit_xl_image(im, box_w, box_h):
     """Scale an embedded image to fit INSIDE box_w x box_h, keeping its shape.
 
@@ -314,9 +327,11 @@ def _write_single_xlsx(path, plate_no, heading, table_title, img_path, rows):
     ws.title = f"Plate_{plate_no:02d}"
     ws.cell(1, 1, heading).font = Font(bold=True, size=13, color="1F4E78")
     if img_path and os.path.exists(img_path):
-        # Fit the same on-sheet footprint the wide render used, so the seed
-        # table at row 20 stays clear whatever shape the image is.
-        ws.add_image(_fit_xl_image(XLImage(img_path), 720, 470), "A3")
+        # Box height = the footprint this sheet ALREADY had. The old rule set the
+        # width and let the height follow the (landscape) image, which on this
+        # sheet came to 720 x 474. Matching that keeps the sheet exactly as it
+        # was now the image is portrait — see _XL_BOX_H.
+        ws.add_image(_fit_xl_image(XLImage(img_path), 720, _XL_BOX_H(720)), "A3")
     _write_table(ws, 20, 1, f"{table_title} — {len(rows)} seeds", rows)
     for col in "ABCDEFGH":
         ws.column_dimensions[col].width = 14
@@ -334,7 +349,7 @@ def _write_compare_xlsx(path, plate_no, panels):
     for label, img_path, rows in panels:
         ws.cell(2, col, label).font = Font(bold=True, size=11, color="1F4E78")
         if img_path and os.path.exists(img_path):
-            ws.add_image(_fit_xl_image(XLImage(img_path), 430, 470),
+            ws.add_image(_fit_xl_image(XLImage(img_path), 430, _XL_BOX_H(430)),
                          ws.cell(3, col).coordinate)
         _write_table(ws, 20, col, f"{label} — {len(rows or [])} seeds", rows or [])
         for j in range(8):

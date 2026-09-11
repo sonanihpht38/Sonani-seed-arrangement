@@ -2258,6 +2258,71 @@ class SeedListRenderTests(SimpleTestCase):
                     "it will not print on one sheet" % (n, w, h, w / float(h), want))
 
 
+class ExcelImageFitTests(SimpleTestCase):
+    """The plate image embedded in the Excel exports must keep its old footprint.
+
+    The image went A4 PORTRAIT. These sheets used to set the image WIDTH and let
+    the height follow a LANDSCAPE picture, so each sheet's footprint was
+    width x 0.658. Setting the width alone on a portrait image makes it over
+    1000 px tall — it floats straight over the seed table at row 20.
+
+    Fitting a BOX fixes that, but the box has to be per-sheet: one flat height
+    for all of them looked right on the A3-anchored sheet and made the Compare
+    sheet's image 66% taller than before, which is the same defect in a
+    different place. A pre-deploy dry run caught exactly that.
+    """
+
+    OLD_ASPECT = 9.6 / 14.6          # the pre-A4 plate image
+    ROW_PX = 20.0                    # default Excel row height
+    TABLE_ROW = 20                   # where _write_table puts the seed table
+
+    class _Img:
+        """Stands in for openpyxl's Image — only width/height are used."""
+        def __init__(self, w, h):
+            self.width, self.height = w, h
+
+    def test_the_box_height_reproduces_the_old_footprint(self):
+        from .engine_runner import _XL_BOX_H
+
+        for box_w in (720, 430, 300):
+            self.assertAlmostEqual(_XL_BOX_H(box_w), box_w * self.OLD_ASPECT, places=6)
+
+    def test_a_portrait_image_keeps_each_sheet_as_it_was(self):
+        """Every sheet's image must be no taller than it used to be, or it
+        covers rows that used to be visible."""
+        from .engine_runner import _XL_BOX_H, _fit_xl_image
+
+        portrait = (1653, 2338)                      # an A4 plate render
+        for label, box_w in (("single", 720), ("compare", 430)):
+            was = box_w * self.OLD_ASPECT
+            im = _fit_xl_image(self._Img(*portrait), box_w, _XL_BOX_H(box_w))
+            self.assertLessEqual(
+                im.height, was + 1.0,
+                "%s sheet: image is %.0f px tall, was %.0f px — it now covers "
+                "more of the sheet" % (label, im.height, was))
+
+    def test_the_aspect_is_never_squashed(self):
+        from .engine_runner import _fit_xl_image
+
+        im = _fit_xl_image(self._Img(1653, 2338), 300, 300)
+        self.assertAlmostEqual(im.height / im.width, 2338 / 1653, places=2)
+        self.assertLessEqual(max(im.width, im.height), 301)
+
+    def test_a_small_image_is_not_enlarged(self):
+        """Fitting a box must never blow a small picture up."""
+        from .engine_runner import _fit_xl_image
+
+        im = _fit_xl_image(self._Img(120, 80), 720, 470)
+        self.assertLessEqual(im.width, 720)
+        self.assertLessEqual(im.height, 470)
+
+    def test_a_degenerate_image_does_not_divide_by_zero(self):
+        from .engine_runner import _fit_xl_image
+
+        im = _fit_xl_image(self._Img(0, 0), 720, 470)
+        self.assertEqual((im.width, im.height), (0, 0))
+
+
 class SetPlateActiveTests(TransactionTestCase):
     """Retiring a plate name — the app's soft delete, and the only one live can use.
 
