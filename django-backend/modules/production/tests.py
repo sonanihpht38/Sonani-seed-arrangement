@@ -3060,15 +3060,15 @@ class GapSheetTests(SimpleTestCase):
 
 
 class GapStoneCountTests(SimpleTestCase):
-    """How many stones a pocket takes.
+    """Every reported pocket is exactly ONE legal stone.
 
-    This has been wrong in both directions and both were caught by the user, so
-    both directions are pinned here. A fixed 13 mm cap split a 13.8 mm pocket
-    into two stones one stone covers; removing the cap reported a 58.5 mm pocket
-    as a single stone on a plate whose longest seed was 18.4 mm.
+    The seed-width range binds both sides, so a pocket can never be longer than
+    a single stone: a long empty band is split into separate pockets instead.
 
-    The rule: a length the plate demonstrably contains is a length that can be
-    sourced, so the divisor is the longest seed ON THAT PLATE.
+    This took three attempts and all three are pinned here. A fixed 13 mm cap
+    split a 13.8 mm pocket into two stones one covers; removing the cap reported
+    a 58.5 mm pocket as one stone on a plate whose longest seed was 18.4 mm; the
+    explicit 12-18 rule then made the cap the rule itself.
     """
 
     def _long_plate(self, seed_len):
@@ -3080,41 +3080,38 @@ class GapStoneCountTests(SimpleTestCase):
             x += seed_len
         return out
 
-    def test_a_pocket_shorter_than_the_longest_seed_is_one_stone(self):
+    def test_every_pocket_is_exactly_one_stone(self):
         from .gaps import gap_report
 
-        placed = self._long_plate(18.0)
-        for p in gap_report(placed, 40.0, min_width=4.0):
-            if p["length"] <= 18.0:
-                self.assertEqual(
-                    p["stones"], 1,
-                    "a %.2f mm pocket fits one 18 mm stone" % p["length"])
+        for seed in (6.0, 12.0, 18.0):
+            for p in gap_report(self._long_plate(seed), 40.0):
+                self.assertEqual(p["stones"], 1)
+                self.assertAlmostEqual(p["stoneLength"], p["length"], places=6)
 
-    def test_stone_count_covers_the_pocket_length(self):
-        from .gaps import gap_report
+    def test_no_pocket_is_longer_than_the_maximum(self):
+        """The length cap is what makes one-stone-per-pocket true. A long empty
+        band must arrive as SEVERAL pockets, never one oversized row."""
+        from .gaps import MAX_SEED_WIDTH, gap_report
 
-        placed = self._long_plate(12.0)
-        longest = 12.0
-        for p in gap_report(placed, 40.0, min_width=4.0):
-            self.assertGreaterEqual(p["stones"], 1)
-            # enough stones to span it...
-            self.assertGreaterEqual(p["stones"] * p["stoneLength"] + 1e-6,
-                                    p["length"])
-            # ...and none of them longer than the plate proves sourceable
-            self.assertLessEqual(p["stoneLength"], longest + 1e-6)
-            # ...and never one more than needed
-            if p["stones"] > 1:
-                self.assertGreater(p["length"], (p["stones"] - 1) * longest)
+        for radius in (20.0, 40.0, 74.0):
+            for seed in (6.0, 12.0, 18.0):
+                for p in gap_report(self._long_plate(seed), radius):
+                    self.assertLessEqual(
+                        p["length"], MAX_SEED_WIDTH + 1e-6,
+                        "%.2f mm pocket on r=%s" % (p["length"], radius))
 
-    def test_a_shorter_longest_seed_means_more_stones(self):
-        """The divisor really is read off the plate, not hardcoded."""
-        from .gaps import gap_report
+    def test_a_long_empty_band_tiles_into_several_stones(self):
+        """The clamp must consume only what it reports, or the remainder of a
+        big empty region is silently thrown away."""
+        from .gaps import MAX_SEED_WIDTH, gap_report
 
-        big = gap_report(self._long_plate(18.0), 40.0, min_width=4.0)
-        small = gap_report(self._long_plate(6.0), 40.0, min_width=4.0)
-        self.assertTrue(big and small)
-        self.assertLess(sum(p["stones"] for p in big),
-                        sum(p["stones"] for p in small))
+        # a single narrow seed down the middle leaves two large empty regions
+        placed = [{"x": -5.0, "y": -40.0, "w": 10.0, "h": 80.0}]
+        rep = gap_report(placed, 40.0)
+        self.assertGreater(len(rep), 3,
+                           "a mostly-empty plate should tile into many stones")
+        for p in rep:
+            self.assertLessEqual(p["length"], MAX_SEED_WIDTH + 1e-6)
 
     def test_a_chamfer_below_the_threshold_is_reported_plain(self):
         """A 0.1 mm corner is measurement tolerance, not a grinding operation.
@@ -3473,11 +3470,12 @@ class BatchNameDisplayTests(SimpleTestCase):
 
 
 class GapMinimumWidthTests(SimpleTestCase):
-    """The shop floor's minimum dummy-seed width.
+    """The shop floor's dummy-seed width RANGE, and it is hard at both ends.
 
-    No reference stone narrower than gaps.MIN_SEED_WIDTH may ever be reported,
-    on any plate, in the image or the Excel. A narrower one is not a shopping
-    tip — it is a pocket that cannot be filled, dressed up as one that can.
+    No reference stone outside [MIN_SEED_WIDTH, MAX_SEED_WIDTH] may ever be
+    reported, on any plate, in the image or the Excel. A pocket the range cannot
+    serve is left empty and unlisted: a gap existing is not a reason to suggest
+    a stone the shop will not cut.
     """
 
     def _plate(self, seed=12.0):
@@ -3488,20 +3486,46 @@ class GapMinimumWidthTests(SimpleTestCase):
             x += seed
         return out
 
-    def test_the_floor_is_at_least_seven_millimetres(self):
-        from .gaps import MIN_SEED_WIDTH
+    def test_the_configured_range_is_twelve_to_eighteen(self):
+        """Stated once, so changing the shop's rule has to be deliberate."""
+        from .gaps import MAX_SEED_WIDTH, MIN_SEED_WIDTH
 
-        self.assertGreaterEqual(MIN_SEED_WIDTH, 7.0)
+        self.assertEqual(MIN_SEED_WIDTH, 12.0)
+        self.assertEqual(MAX_SEED_WIDTH, 18.0)
 
-    def test_no_reported_stone_is_narrower_than_the_floor(self):
-        from .gaps import MIN_SEED_WIDTH, gap_report
+    def test_no_reported_stone_falls_outside_the_range(self):
+        from .gaps import MAX_SEED_WIDTH, MIN_SEED_WIDTH, gap_report
 
         for radius in (20.0, 40.0, 74.0):
-            for p in gap_report(self._plate(), radius):
-                self.assertGreaterEqual(
-                    p["width"], MIN_SEED_WIDTH - 1e-6,
-                    "reported a %.2f mm stone on a r=%s plate" % (p["width"], radius))
-                self.assertGreaterEqual(p["length"], MIN_SEED_WIDTH - 1e-6)
+            for seed in (10.0, 12.0, 18.0, 25.0):
+                for p in gap_report(self._plate(seed), radius):
+                    msg = "%.2f mm stone, r=%s seed=%s" % (p["width"], radius, seed)
+                    self.assertGreaterEqual(p["width"], MIN_SEED_WIDTH - 1e-6, msg)
+                    self.assertLessEqual(p["width"], MAX_SEED_WIDTH + 1e-6, msg)
+
+    def test_a_pocket_narrower_than_the_minimum_is_not_reported(self):
+        """A gap no stone in the range can serve stays empty and unlisted."""
+        from .gaps import gap_report
+
+        # one seed leaving only a thin rim strip, well under 12 mm
+        placed = [{"x": -19.0, "y": -19.0, "w": 38.0, "h": 38.0}]
+        self.assertEqual(gap_report(placed, 22.0), [])
+
+    def test_a_pocket_wider_than_the_maximum_yields_a_max_width_stone(self):
+        """A mostly-empty plate must not report one enormous stone: it reports
+        the widest the rule allows and leaves the remainder empty."""
+        from .gaps import MAX_SEED_WIDTH, gap_report
+
+        placed = [{"x": -5.0, "y": -40.0, "w": 10.0, "h": 80.0}]
+        rep = gap_report(placed, 40.0)
+        self.assertTrue(rep, "a mostly-empty plate should still report stones")
+        for p in rep:
+            self.assertLessEqual(p["width"], MAX_SEED_WIDTH + 1e-6)
+
+    def test_an_inverted_range_reports_nothing_rather_than_raising(self):
+        from .gaps import gap_report
+
+        self.assertEqual(gap_report(self._plate(), 40.0, 18.0, 12.0), [])
 
     def test_the_default_is_the_floor_not_a_separate_number(self):
         """engine_runner used to keep its own copy of this; two constants is one

@@ -48,7 +48,8 @@ def _gap_finder(placed, radius):
     untouched.
     """
     try:
-        return gaps.gap_report(placed, radius, gaps.MIN_SEED_WIDTH)
+        return gaps.gap_report(placed, radius, gaps.MIN_SEED_WIDTH,
+                               gaps.MAX_SEED_WIDTH)
     except Exception:
         _log.exception("gap report failed during render")
         return []
@@ -395,7 +396,8 @@ _GAP_COLS = ("#", "Where on the plate", "Pocket length mm", "Seed width mm",
              "Stones", "Each stone mm", "45° chamfer mm", "Area mm²", "Shape")
 
 
-def _write_gap_sheet(wb, plate_no, placed, radius, min_width):
+def _write_gap_sheet(wb, plate_no, placed, radius, min_width,
+                     max_width=None):
     """Add a GAP REPORT sheet: the empty pockets and the stone that fills each.
 
     A SEPARATE sheet, deliberately. Nothing on the existing per-plate sheet
@@ -407,8 +409,9 @@ def _write_gap_sheet(wb, plate_no, placed, radius, min_width):
     hand. Skipped silently when there is nothing to report, so an export never
     grows an empty sheet.
     """
+    hi = max_width if max_width else gaps.MAX_SEED_WIDTH
     try:
-        pockets = gaps.gap_report(placed, radius, min_width)
+        pockets = gaps.gap_report(placed, radius, min_width, hi)
     except Exception:
         # A report must never be the reason a plate export fails.
         _log.exception("gap report failed for plate %s", plate_no)
@@ -419,9 +422,11 @@ def _write_gap_sheet(wb, plate_no, placed, radius, min_width):
     ws = wb.create_sheet(f"Gaps_{plate_no:02d}")
     ws.cell(1, 1, f"Plate {plate_no:02d} — Gap Report").font = Font(
         bold=True, size=13, color="1F4E78")
-    ws.cell(2, 1, f"Stones that would fill the empty space, at a minimum seed "
-                  f"width of {min_width:g} mm. Nothing here is placed or "
-                  f"allocated — this is a sourcing list.").font = Font(italic=True)
+    ws.cell(2, 1, f"Stones that would fill the empty space, within the seed-width "
+                  f"range {min_width:g}–{hi:g} mm. A pocket that no stone in that "
+                  f"range can serve is left empty and not listed. Nothing here is "
+                  f"placed or allocated — this is a sourcing list."
+            ).font = Font(italic=True)
     facts = [
         ("Usable plate area", f"{summary['usableAreaMM2']:.0f} mm²"),
         ("Covered by the seeds on this plate", f"{summary['coveredMM2']:.0f} mm²"),
