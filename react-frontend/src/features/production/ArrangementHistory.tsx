@@ -244,9 +244,16 @@ export function ArrangementHistory() {
       },
       { headerName: "Shape", field: "shape", minWidth: 100 },
       {
+        // The batch NAMES, not a count. A bare "1" told you how many batches fed
+        // the run but never which — and which is the thing anyone looking at a
+        // past run actually wants. These are the batches SELECTED for the run;
+        // open the row for the per-plate breakdown, which differs once a run
+        // makes more than one plate.
         headerName: "Batches",
-        minWidth: 100,
-        valueGetter: (p) => p.data?.batches.length ?? 0,
+        minWidth: 150,
+        valueGetter: (p) =>
+          p.data?.batches?.length ? p.data.batches.join(", ") : "—",
+        tooltipValueGetter: (p) => p.data?.batches?.join(", ") ?? "",
       },
       {
         // The action column holds one fixed-size button — it stays capped so the
@@ -355,6 +362,21 @@ export function ArrangementHistory() {
                   <div key={p.plateNo} style={{ border: `1px solid ${colors.border}`, borderRadius: 8, padding: 12 }}>
                     <Space wrap style={{ marginBottom: 10 }}>
                       <Text strong>Plate {p.plateNo}</Text>
+                      {/* Which batch this PLATE's stones came from. The run-level
+                          count in the header says how many batches were selected;
+                          with several plates that is not the same question. */}
+                      {p.batches?.length ? (
+                        <Tag
+                          style={{
+                            margin: 0,
+                            color: colors.violet,
+                            borderColor: alpha(colors.violet, 0.35),
+                            background: alpha(colors.violet, 0.08),
+                          }}
+                        >
+                          {p.batches.length > 1 ? "Batches" : "Batch"} {p.batches.join(", ")}
+                        </Tag>
+                      ) : null}
                       {p.plateName ? (
                         <Tag style={{ margin: 0, color: colors.primary, borderColor: alpha(colors.primary, 0.35), background: alpha(colors.primary, 0.08) }}>
                           {p.plateName}

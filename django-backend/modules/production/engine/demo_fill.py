@@ -465,6 +465,33 @@ LEGEND_BOTTOM = PAGE_MARGIN_IN / A4_H_IN
 LEGEND_WIDTH_IN = A4_W_IN - 2 * PAGE_MARGIN_IN
 LEGEND_HEIGHT_IN = A4_H_IN - 2 * PAGE_MARGIN_IN - PLATE_TITLE_IN
 
+# OPTIONAL gap report. engine_runner sets this to a callable (placed, R) -> list
+# of pocket dicts; left at None the renderer behaves exactly as it always has, so
+# demo_fill still runs standalone and the Arrange / Machine-Cut renderers are
+# untouched. The pockets are NOT placements: nothing here is seated, allocated or
+# counted towards coverage, and they are drawn dashed and unfilled so the floor
+# cannot mistake one for a seat.
+GAP_FINDER = None
+# MAGENTA, and deliberately so. The seats are painted from viridis, which runs
+# dark purple → blue → green → yellow, so a purple outline sat right on top of
+# the colour seats 1-6 already use. Viridis never produces magenta, and neither
+# does the trimmed-seed orange (#e67e22) or the margin red (#c0392b), so this is
+# the one hue on the page that can only mean "not a real seed".
+GAP_EDGE = "#c2185b"
+GAP_FACE = "#fde7ef"        # pale pink wash, so the area reads as empty
+GAP_HATCH = "///"           # and hatched, which no placed seed ever is
+
+# OPTIONAL per-plate batch caption. engine_runner sets this to a callable
+# (placed) -> "B-1, B-2" naming the batches whose stones are on THIS plate.
+# Left at None the caption is omitted, so demo_fill still runs standalone.
+#
+# Resolved from the seeds by the CALLER, not carried through the packer: the
+# placement dicts are built fresh inside _pack_once and would have to grow a
+# field to pass a batch through, which means editing the frozen packer to print
+# a label. Looking the stock numbers up afterwards costs nothing and touches no
+# packing code.
+BATCH_LABELLER = None
+
 LEGEND_EM_PER_CHAR = 0.55   # DejaVu Sans average advance, measured from a render
 # A seed row is "<stock>   <L>x<W>   H <t>   turn <a>deg" — 39 characters for a
 # ten-character stock code. Sized at 42 for a little slack. This used to be 48,
@@ -555,16 +582,27 @@ def _draw_legend_list(axl, title, subtitle, entries):
     room = (top - LEGEND_PAD_IN / h_in) / max(per_col, 1)
     rh = min(want, room)
     colw = 1.0 / ncols
-    for i, (color, edge, num, text, tcolor) in enumerate(entries):
+    for i, ent in enumerate(entries):
+        # 5-tuples as before; an optional 6th element is a hatch for the swatch,
+        # so the gap rows can be marked without disturbing any other caller.
+        color, edge, num, text, tcolor = ent[:5]
+        hatch = ent[5] if len(ent) > 5 else None
         c, r = divmod(i, per_col)
         x0 = c * colw
         y = top - (r + 0.5) * rh
+        if color is None:
+            # DIVIDER row: no swatch, no number — a banner that separates the
+            # real seeds from the reference pockets below them.
+            axl.text(x0 + 0.005 * colw, y, text, fontsize=fp, va="center",
+                     color=tcolor, fontweight="bold")
+            continue
         axl.add_patch(Rect((x0 + 0.005 * colw, y - rh * 0.34), 0.040 * colw,
                       rh * 0.68, facecolor=color, edgecolor=edge, lw=0.8,
-                      transform=axl.transAxes, clip_on=False))
+                      hatch=hatch, transform=axl.transAxes, clip_on=False))
         # The number field has to clear a THREE digit seat number: a Ø158 plate
         # numbers past 100, and at 0.135 "150." ran into the stock code.
-        axl.text(x0 + 0.055 * colw, y, num, fontsize=fp, va="center", fontweight="bold")
+        axl.text(x0 + 0.055 * colw, y, num, fontsize=fp, va="center",
+                 fontweight="bold", color=tcolor if color == GAP_FACE else "#111")
         axl.text(x0 + 0.165 * colw, y, text, fontsize=fp, va="center", color=tcolor)
 
 
@@ -590,7 +628,22 @@ def render_enhanced_circle(placed, real, pi, R, fill, path):
     # Plate on top, seed list underneath — see the LEGEND_* block. The figure is
     # a FIXED width at every seed count, so the plate is always drawn the same
     # size; only the list's height varies.
-    _, _, _, _lh, _ph = _legend_layout(len(placed))
+    #
+    # Gap pockets, if a finder is installed, are computed BEFORE the figure is
+    # sized because they add legend rows — and the sizer and the drawer must be
+    # handed the same row count. A sizer/drawer disagreement is the bug this
+    # layout has already had three times.
+    pockets = []
+    if GAP_FINDER is not None:
+        try:
+            pockets = list(GAP_FINDER(placed, R) or [])
+        except Exception:
+            pockets = []                 # a report never breaks a plate render
+    # + 1 for the "REFERENCE ONLY" divider row the gap block carries. This count
+    # must equal len(entries) exactly — _draw_legend_list re-derives the layout
+    # from that, and any disagreement is the overlap bug all over again.
+    _n_rows = len(placed) + (len(pockets) + 1 if pockets else 0)
+    _, _, _, _lh, _ph = _legend_layout(_n_rows)
     fig = plt.figure(figsize=(A4_W_IN, A4_H_IN))
     gs = fig.add_gridspec(2, 1, height_ratios=[_ph, _lh], hspace=0.0,
                           left=LEGEND_LEFT, right=LEGEND_RIGHT,
@@ -631,6 +684,27 @@ def render_enhanced_circle(placed, real, pi, R, fill, path):
     _draw_plate_numbers(ax, [(str(i + 1), p.get("lx"), p.get("ly"),
                               p.get("area", p["w"] * p["h"]), "white") for i, p in enumerate(placed)],
                         angles=_cw)
+    # GAP pockets: DASHED outline, no fill, labelled G1.. — deliberately unlike a
+    # seat. Nothing here is placed; these mark where a stone the plate does not
+    # have would go, and the floor must be able to tell that at a glance.
+    for gi, gp in enumerate(pockets, 1):
+        poly = gp.get("poly")
+        if not poly:
+            continue
+        ax.add_patch(MplPoly(poly, closed=True, facecolor=GAP_FACE,
+                             edgecolor=GAP_EDGE, lw=1.3, ls=(0, (4, 2)),
+                             hatch=GAP_HATCH, zorder=3))
+        xs = [pt[0] for pt in poly]
+        ys = [pt[1] for pt in poly]
+        cx, cy = (min(xs) + max(xs)) / 2.0, (min(ys) + max(ys)) / 2.0
+        # "G1" over "REF", so the label says what it is even cropped or in
+        # black and white, where colour and hatch both stop helping.
+        ax.text(cx, cy + 1.1, f"G{gi}", ha="center", va="center", fontsize=7,
+                fontweight="bold", color=GAP_EDGE, zorder=4,
+                path_effects=[pe.withStroke(linewidth=1.8, foreground="white")])
+        ax.text(cx, cy - 1.3, "REF", ha="center", va="center", fontsize=4.6,
+                color=GAP_EDGE, zorder=4,
+                path_effects=[pe.withStroke(linewidth=1.5, foreground="white")])
     lim = PLATE / 2 + 3
     ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim); ax.set_aspect("equal"); ax.axis("off")
     circle_area = math.pi * R * R
@@ -638,9 +712,20 @@ def render_enhanced_circle(placed, real, pi, R, fill, path):
     # State the settings that shaped this plate. "edge cuts ≥90°" used to sit here
     # and is gone: the engine no longer cuts anything, so it described behaviour
     # that no longer exists.
+    # Which batch(es) this plate's stones came from. Named on the plate itself
+    # because the image is what reaches the floor, where "which batch is this?"
+    # is otherwise only answerable by going back to the history screen.
+    batch_line = ""
+    if BATCH_LABELLER is not None:
+        try:
+            _b = BATCH_LABELLER(placed)
+            if _b:
+                batch_line = f" · batch {_b}"
+        except Exception:
+            batch_line = ""
     ax.set_title(
-        f"Max Coverage · Plate {pi:02d} · {covered:.0f} of {circle_area:.0f} mm² covered "
-        f"({fill:.1f}%)\n"
+        f"Max Coverage · Plate {pi:02d}{batch_line} · {covered:.0f} of "
+        f"{circle_area:.0f} mm² covered ({fill:.1f}%)\n"
         f"plate Ø{PLATE:g} · margin {margin:g} mm → usable Ø{2 * R:g} · "
         f"distance between seeds {seed_gap:g} mm\n"
         # Which BANDS produced this plate. Without them two plates of the same
@@ -673,10 +758,33 @@ def render_enhanced_circle(placed, real, pi, R, fill, path):
         # is too tight to carry the label on the plate itself.
         entries.append((facecolors[i], "#e67e22" if i in trimmed else "#555", f"{i + 1}.",
                         f"{p['stock']}   {sdw}×{sdh}   H {p['H']:.2f}   ↻{_cw[i]}°{cut}", tcolor))
+    # GAP rows, after the seeds. Every row starts with "GAP" and carries its own
+    # dashed swatch, so a reader scanning the list cannot take one for a seed —
+    # these are stones the plate does NOT have.
+    if pockets:
+        entries.append((None, None, "",
+                        "▨ REFERENCE ONLY — not in inventory, not placed",
+                        GAP_EDGE))
+    for gi, gp in enumerate(pockets, 1):
+        cham = " + ".join(f"{v:g}" for v in gp.get("chamfer", ())) if gp.get("cut") else ""
+        shape = f"45° chamfer {cham}" if cham else "plain"
+        n_st = int(gp.get("stones", 1) or 1)
+        howmany = ("1 stone" if n_st == 1
+                   else f"{n_st} stones of {gp.get('stoneLength'):g}")
+        entries.append((GAP_FACE, GAP_EDGE, f"G{gi}",
+                        f"GAP {gp['length']:g}×{gp['width']:g} mm   {shape}   "
+                        f"{howmany}", GAP_EDGE, GAP_HATCH))
+    # The sizer above booked space for exactly this many rows. If these ever
+    # disagree the list is laid out in a block built for a different count,
+    # which is how this page overlapped itself twice before.
+    assert len(entries) == _n_rows, (
+        f"legend sized for {_n_rows} rows but built {len(entries)}")
     # The old subtitle counted trimmed seeds and is now permanently zero, so it
     # said nothing. Report the settings the reader actually needs instead.
     _draw_legend_list(
-        axl, f"Seeds on this plate ({nr})",
+        axl, (f"Seeds on this plate ({nr})"
+              + (f"  ·  {len(pockets)} gap(s) — stones NOT on this plate"
+                 if pockets else "")),
         ("all placed whole (nothing cut) · "
          + (f"{seed_gap:g} mm between seeds" if seed_gap > 0 else "seeds touching")
          # Say which way ↻ means, once, where the angles are listed. A number

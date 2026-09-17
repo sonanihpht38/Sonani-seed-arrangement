@@ -170,6 +170,14 @@ class ArrangementService:
                                 .filter(used_id__in=c, is_used=True)
                                 .values("used_id").annotate(n=Count("seed_id")))
         }
+        # Batch_IDs as stored → the BatchNos a human recognises, resolved once
+        # for the whole page rather than per row.
+        raw_batches = {
+            r.arrange_id: [b.strip() for b in (r.batches or "").split(",") if b.strip()]
+            for r in rows
+        }
+        batch_names = cls._resolve_batch_names(
+            [v for lst in raw_batches.values() for v in lst])
         return [
             {
                 "arrangeId": str(r.arrange_id),
@@ -185,8 +193,10 @@ class ArrangementService:
                 # there, which is also every run made before the field existed.
                 "widthMin": cls._num(r.width_min),
                 "widthMax": cls._num(r.width_max),
-                # Stored as a comma-joined string; hand the UI a real list.
-                "batches": [b for b in (r.batches or "").split(",") if b.strip()],
+                # Stored as a comma-joined string of Batch_IDs; hand the UI a
+                # real list of the BATCH NUMBERS people actually use.
+                "batches": cls._display_batch_list(raw_batches[r.arrange_id],
+                                                   batch_names),
                 "entryDate": r.entry_date.isoformat() if r.entry_date else None,
                 # Real timestamp (from the plate rows) — what the list is actually sorted by.
                 "runAt": run_at(r).isoformat(),
@@ -216,6 +226,122 @@ class ArrangementService:
         return out
 
     @classmethod
+    def _resolve_batch_names(cls, raw_values):
+        """Batch_ID → BatchNo, for the values stored on a run header.
+
+        TRN_SeedArrange.Batches holds the SELECTED batches as a comma-joined
+        string of Batch_IDs, so the raw value is a list of UUIDs. The history
+        list showed a COUNT rather than the names because a raw uuid is no use
+        to anyone; this turns them into the numbers the floor knows.
+
+        See _display_batch_list for what happens to a value that does not
+        resolve.
+        """
+        import uuid as _uuid
+
+        from .models import Batch
+
+        wanted = []
+        for v in {str(v).strip() for v in raw_values if str(v).strip()}:
+            try:
+                wanted.append(_uuid.UUID(v))
+            except (ValueError, AttributeError, TypeError):
+                continue
+        if not wanted:
+            return {}
+        names = {}
+        for i in range(0, len(wanted), cls._IN_CHUNK):
+            names.update({
+                str(bid): no
+                for bid, no in Batch.objects
+                .filter(batch_id__in=wanted[i:i + cls._IN_CHUNK])
+                .values_list("batch_id", "batch_no") if no
+            })
+        # Case-insensitive too: uuids come back from the driver in either case.
+        return {**names, **{k.lower(): v for k, v in names.items()}}
+
+    @staticmethod
+    def _display_batch_list(raw, names):
+        """Turn stored batch values into something worth putting on screen.
+
+        Three cases, and the middle one is the reason this is a function:
+
+        * a Batch_ID that resolves       → its BatchNo
+        * a Batch_ID that does NOT       → dropped. The batch has since been
+                                           deleted, and a bare 36-character uuid
+                                           in a grid cell is worse than nothing.
+        * anything that is not a uuid    → kept as-is; a handful of older rows
+                                           stored the BatchNo itself.
+        """
+        import uuid as _uuid
+
+        out = []
+        for b in raw:
+            hit = names.get(b) or names.get(b.lower())
+            if hit:
+                out.append(hit)
+                continue
+            try:
+                _uuid.UUID(b)
+            except (ValueError, AttributeError, TypeError):
+                out.append(b)          # legacy row: already a batch number
+        return out
+
+    @classmethod
+    def _header_batch_names(cls, header):
+        """The BatchNos selected for one run, from its comma-joined header field."""
+        raw = [b.strip() for b in (header.batches or "").split(",") if b.strip()]
+        return cls._display_batch_list(raw, cls._resolve_batch_names(raw))
+
+    @classmethod
+    def _batch_no_by_seed(cls, ids):
+        """seed_id → BatchNo, for REAL seeds only (dummies have no batch).
+
+        Resolved at READ time rather than stored on the plate row. TRN_SeedPlate
+        has no batch column and the seeds themselves already carry Batch_ID, so
+        a join costs nothing and — unlike a copied value — can never drift from
+        the seeds actually placed on that plate.
+
+        Chunked like _fetch_seeds for the same reason: SQL Server caps a
+        statement at 2100 parameters.
+        """
+        from .models import Batch, SeedData
+
+        ids = list(ids)
+        if not ids:
+            return {}
+        batch_of = {}
+        for i in range(0, len(ids), cls._IN_CHUNK):
+            batch_of.update({
+                r[0]: r[1]
+                for r in SeedData.objects.filter(seed_id__in=ids[i:i + cls._IN_CHUNK])
+                .values_list("seed_id", "batch_id")
+            })
+        wanted = [b for b in set(batch_of.values()) if b]
+        names = {}
+        for i in range(0, len(wanted), cls._IN_CHUNK):
+            names.update(dict(
+                Batch.objects.filter(batch_id__in=wanted[i:i + cls._IN_CHUNK])
+                .values_list("batch_id", "batch_no")))
+        return {sid: names[bid] for sid, bid in batch_of.items()
+                if bid and names.get(bid)}
+
+    @staticmethod
+    def _plate_batches(seeds_by_plate, plate_no):
+        """The distinct BatchNos on one plate, read off the seeds placed there.
+
+        Unioned across methods: a Compare run may place different seeds per
+        method, but they all land on the same physical plate, and the question
+        being answered is "which batches went onto this plate".
+        """
+        found = {
+            s["batch"]
+            for (pn, _label), seeds in seeds_by_plate.items() if pn == plate_no
+            for s in seeds if s.get("batch")
+        }
+        return sorted(found)
+
+    @classmethod
     def _seeds_by_plate(cls, arrange_id, fallback_method):
         """(plate_no, method_label) → the seeds that method placed on that plate, from
         TRN_SeedArrangeDetails joined to the seed tables. `Plate_ID` on a detail row holds
@@ -237,6 +363,7 @@ class ArrangementService:
         dummy_ids = {r[2] for r in rows if r[1] and r[2]}
         real = cls._fetch_seeds(SeedData, real_ids)
         dummy = cls._fetch_seeds(DummySeedData, dummy_ids)
+        batch_of = cls._batch_no_by_seed(real_ids)
 
         out = {}
         for plate_no, is_dummy, sid, method, cut_area, cut_pct in rows:
@@ -255,6 +382,9 @@ class ArrangementService:
                 "cutArea": (cls._num(cut_area) or None) if cut_area else None,
                 "cutPct": (cls._num(cut_pct) or None) if cut_pct else None,
                 "real": not is_dummy,
+                # Which batch this stone came from. None for dummies, and None
+                # for a real seed whose batch row has since been removed.
+                "batch": None if is_dummy else batch_of.get(sid),
             })
         for seeds in out.values():
             seeds.sort(key=lambda s: (not s["real"], s["stock"]))
@@ -293,7 +423,9 @@ class ArrangementService:
             "thicknessMax": cls._num(header.thickness_max),
             "widthMin": cls._num(header.width_min),
             "widthMax": cls._num(header.width_max),
-            "batches": [b for b in (header.batches or "").split(",") if b.strip()],
+            # Same as the list: the header stores Batch_IDs, so resolve them to
+            # the numbers people recognise before they reach the UI.
+            "batches": cls._header_batch_names(header),
             "entryDate": header.entry_date.isoformat() if header.entry_date else None,
             "isFinalized": bool(header.is_finalized),
             "seedCount": seed_count,
@@ -301,6 +433,11 @@ class ArrangementService:
                 {
                     "plateNo": p.plate_no,
                     "plateName": p.plate_name,
+                    # The batches whose stones are ON THIS PLATE. The run-level
+                    # "batches" above lists what was SELECTED for the run; with
+                    # several plates those are not the same thing, and the floor
+                    # needs the per-plate answer.
+                    "batches": cls._plate_batches(seeds_by_plate, p.plate_no),
                     "arrangeFillPct": cls._num(p.arrange_fill_pct),
                     "machineFillPct": cls._num(p.machine_fill_pct),
                     "enhancedFillPct": cls._num(p.enhanced_fill_pct),

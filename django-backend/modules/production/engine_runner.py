@@ -37,6 +37,57 @@ from openpyxl.utils import get_column_letter  # noqa: E402
 import matplotlib.pyplot as _plt  # noqa: E402
 from matplotlib.patches import Circle as _Circle, Patch as _Patch, Rectangle as _Rect  # noqa: E402
 
+from . import gaps  # noqa: E402
+
+def _gap_finder(placed, radius):
+    """Adapter handed to the Max Coverage renderer so the plate IMAGE can show
+    the same pockets the Excel sheet lists.
+
+    Installed once, below. The renderer holds only a hook and defaults to None,
+    so demo_fill still runs standalone and the Arrange / Machine-Cut renders are
+    untouched.
+    """
+    try:
+        return gaps.gap_report(placed, radius, gaps.MIN_SEED_WIDTH)
+    except Exception:
+        _log.exception("gap report failed during render")
+        return []
+
+
+D.GAP_FINDER = _gap_finder
+
+
+# stock number → BatchNo for the pool currently being packed. Filled by
+# install_batch_names() when a run loads its blocks; the renderer reads it back
+# through _batch_labeller. A module-level map rather than a field on the
+# placement dicts, because those are rebuilt inside the packer and adding one
+# would mean editing frozen packing code purely to carry a label.
+_BATCH_BY_STOCK = {}
+
+
+def install_batch_names(blocks):
+    """Remember which batch each stock number came from, for the plate caption."""
+    _BATCH_BY_STOCK.clear()
+    for b in blocks or ():
+        if b.get("batch") and b.get("stock"):
+            _BATCH_BY_STOCK[b["stock"]] = b["batch"]
+
+
+def _batch_labeller(placed):
+    """"B-1" or "B-1, B-2" — the batches whose stones are on THIS plate.
+
+    Returns "" when nothing is known, which leaves the caption off entirely
+    rather than printing a misleading blank label.
+    """
+    if not _BATCH_BY_STOCK:
+        return ""
+    names = sorted({_BATCH_BY_STOCK.get(p.get("stock"))
+                    for p in (placed or ()) if _BATCH_BY_STOCK.get(p.get("stock"))})
+    return ", ".join(names)
+
+
+D.BATCH_LABELLER = _batch_labeller
+
 SHAPE_SETS = {
     "all": {"square", "rectangle"},
     "square": {"square"},
@@ -340,9 +391,82 @@ def _fit_xl_image(im, box_w, box_h):
     return im
 
 
-def _write_single_xlsx(path, plate_no, heading, table_title, img_path, rows):
+_GAP_COLS = ("#", "Where on the plate", "Pocket length mm", "Seed width mm",
+             "Stones", "Each stone mm", "45° chamfer mm", "Area mm²", "Shape")
+
+
+def _write_gap_sheet(wb, plate_no, placed, radius, min_width):
+    """Add a GAP REPORT sheet: the empty pockets and the stone that fills each.
+
+    A SEPARATE sheet, deliberately. Nothing on the existing per-plate sheet
+    moves, so the image, the seed table and its derived row are untouched.
+
+    Reports only. The pockets are not placed, the plate's own coverage is not
+    affected, and no seed is allocated — the projected figure on this sheet is
+    what the plate WOULD reach if the listed stock were bought and seated by
+    hand. Skipped silently when there is nothing to report, so an export never
+    grows an empty sheet.
+    """
+    try:
+        pockets = gaps.gap_report(placed, radius, min_width)
+    except Exception:
+        # A report must never be the reason a plate export fails.
+        _log.exception("gap report failed for plate %s", plate_no)
+        return
+    if not pockets:
+        return
+    summary = gaps.gap_summary(placed, radius, pockets)
+    ws = wb.create_sheet(f"Gaps_{plate_no:02d}")
+    ws.cell(1, 1, f"Plate {plate_no:02d} — Gap Report").font = Font(
+        bold=True, size=13, color="1F4E78")
+    ws.cell(2, 1, f"Stones that would fill the empty space, at a minimum seed "
+                  f"width of {min_width:g} mm. Nothing here is placed or "
+                  f"allocated — this is a sourcing list.").font = Font(italic=True)
+    facts = [
+        ("Usable plate area", f"{summary['usableAreaMM2']:.0f} mm²"),
+        ("Covered by the seeds on this plate", f"{summary['coveredMM2']:.0f} mm²"),
+        ("Empty", f"{summary['emptyMM2']:.0f} mm²"),
+        ("Coverage now", f"{summary['fillPct']:.1f} %"),
+        ("Pockets found", f"{summary['pocketCount']}"),
+        ("Recoverable with the stones below", f"{summary['recoverableMM2']:.0f} mm²"),
+        ("Coverage if all were filled", f"{summary['projectedFillPct']:.1f} %"),
+    ]
+    for k, (label, value) in enumerate(facts):
+        ws.cell(4 + k, 1, label).font = Font(bold=True)
+        ws.cell(4 + k, 2, value)
+    r0 = 4 + len(facts) + 1
+    ws.cell(r0, 1, "STONES REQUIRED").font = Font(bold=True)
+    for j, col in enumerate(_GAP_COLS):
+        cell = ws.cell(r0 + 1, 1 + j, col)
+        cell.fill = _HDR_FILL
+        cell.font = _HDR_FONT
+        cell.border = _BORDER
+    for k, p in enumerate(pockets, 1):
+        cham = " + ".join(f"{v:g}" for v in p["chamfer"]) if p["cut"] else "—"
+        vals = [k, p["where"], p["length"], p["width"], p["stones"],
+                p["stoneLength"], cham, p["area"],
+                "CUT" if p["cut"] else "plain"]
+        for j, val in enumerate(vals):
+            cell = ws.cell(r0 + 1 + k, 1 + j, val)
+            cell.border = _BORDER
+    total_stones = sum(p["stones"] for p in pockets)
+    ws.cell(r0 + 2 + len(pockets), 1, f"{total_stones} stones in total").font = Font(
+        bold=True)
+    for col, width in zip("ABCDEFGHI", (5, 20, 16, 14, 8, 14, 16, 11, 9)):
+        ws.column_dimensions[col].width = width
+    return ws
+
+
+def _write_single_xlsx(path, plate_no, heading, table_title, img_path, rows,
+                       placed=None, radius=None, min_width=None):
     """Per-plate workbook for a SINGLE-stage result (Arrange / Machine-Cut / Enhanced):
-    the plate image + one seed detail table (same columns as the on-screen table)."""
+    the plate image + one seed detail table (same columns as the on-screen table).
+
+    `placed` / `radius` are the packed seats and the usable radius. When both are
+    given a second sheet is added reporting the empty pockets — see
+    _write_gap_sheet. Optional so the Arrange and Machine-Cut callers, which have
+    no use for it, are unaffected.
+    """
     wb = Workbook()
     ws = wb.active
     ws.title = f"Plate_{plate_no:02d}"
@@ -361,6 +485,9 @@ def _write_single_xlsx(path, plate_no, heading, table_title, img_path, rows):
     _write_table(ws, table_row, 1, f"{table_title} — {len(rows)} seeds", rows)
     for col in "ABCDEFGH":
         ws.column_dimensions[col].width = 14
+    if placed and radius:
+        _write_gap_sheet(wb, plate_no, placed, radius,
+                         min_width if min_width else gaps.MIN_SEED_WIDTH)
     wb.save(path)
 
 
@@ -463,7 +590,7 @@ def seed_width(L, W):
 
 
 def _blocks_from_seeds(seeds, shapes, square_tol, w_lo=None, w_hi=None, oversize=None,
-                       reject=None):
+                       reject=None, batch_names=None):
     """Apply the SAME thickness-gate + shape filter as pack_v2.load_blocks, but to
     SeedData rows (objects with .length/.width/.height/.stock_no/.cts) instead of an
     Excel file. Reads the P.T_LO/P.T_HI/P.R globals set by _apply_globals.
@@ -526,6 +653,12 @@ def _blocks_from_seeds(seeds, shapes, square_tol, w_lo=None, w_hi=None, oversize
             _bump("shape")
             continue
         blk = {"stock": s.stock_no, "cts": float(s.cts or 0.0), "L": L, "W": W, "H": H, "shape": sh}
+        # Batch this stone came from, carried so the plate IMAGE can name it.
+        # The packer never reads it — placement dicts are rebuilt inside
+        # _pack_once — so it is looked up again from the stock number at render
+        # time. This is simply the one place that still holds the SeedData row.
+        if batch_names:
+            blk["batch"] = batch_names.get(getattr(s, "batch_id", None))
         # Optional true outline for an irregular seed, as [(x, y), ...] in mm.
         # Additive and nullable: only Max Coverage reads it. The Arrange packer
         # (engine/pack_v2.py) reads L/W/H/stock/cts/shape only, so it is unaffected.
@@ -583,7 +716,14 @@ def load_blocks_from_db(shapes, square_tol, batches=None, w_lo=None, w_hi=None, 
     None. The band is applied in Python rather than SQL because the width is
     min(Length, Width) — a rotation-invariant expression the stored columns
     cannot be indexed on, and the row set is already bounded by batch."""
-    from .models import SeedData
+    from .models import Batch, SeedData
+
+    # Batch_ID → BatchNo for every batch in play, read once. Attached to each
+    # block so the plate image can name the batch it came from. A dict lookup
+    # rather than a per-row join keeps qs.iterator() streaming.
+    batch_names = dict(
+        (Batch.objects.filter(batch_id__in=list(batches)) if batches
+         else Batch.objects.all()).values_list("batch_id", "batch_no"))
 
     qs = SeedData.objects.all()
     # Seeds consumed by a FINALIZED arrangement are physically on a plate — they
@@ -596,7 +736,7 @@ def load_blocks_from_db(shapes, square_tol, batches=None, w_lo=None, w_hi=None, 
         qs = qs.filter(batch_id__in=list(batches))
     return _blocks_from_seeds(qs.iterator(), shapes, square_tol,
                               w_lo=w_lo, w_hi=w_hi, oversize=oversize,
-                              reject=reject)
+                              reject=reject, batch_names=batch_names)
 
 
 def run(action, params, out_dir, media_base, progress=lambda p: None):
@@ -627,6 +767,8 @@ def run(action, params, out_dir, media_base, progress=lambda p: None):
     blocks = load_blocks_from_db(shape_set, square_tol, batches,
                                  w_lo=w_lo, w_hi=w_hi, oversize=oversize,
                                  reject=reject)
+    # So the plate image can name the batch each plate's stones came from.
+    install_batch_names(blocks)
     empty_reason = _why_no_seeds(reject) if not blocks else None
     if oversize:
         # Loud in the log, counted in the result. These are rows the inventory
@@ -707,6 +849,8 @@ def run(action, params, out_dir, media_base, progress=lambda p: None):
             "MAX COVERAGE",
             epath,
             erows,
+            placed=eplaced,
+            radius=R,
         )
 
         total_area = round(math.pi * R * R, 2)
@@ -902,6 +1046,7 @@ def run(action, params, out_dir, media_base, progress=lambda p: None):
                 _write_single_xlsx(
                     os.path.join(excel_dir, xlsx_name), idx,
                     f"Plate {idx:02d} — Max Coverage", "MAX COVERAGE", epath, erows,
+                    placed=eplaced, radius=R,
                 )
                 enhanced_plates.append({
                     "plateNo": idx, "fillPct": round(efill, 1), "dummyCount": 0,
@@ -1280,7 +1425,8 @@ def generate_final(params, arrange_id, out_dir, media_base):
     # stored job params for exactly this reason.
     blocks = load_blocks_from_db(shape_set, square_tol, batches,
                                  w_lo=_opt_num(params, "wLo"), w_hi=_opt_num(params, "wHi"))
-    exclude_raw = ((params.get("exclude") or "") + " " + (params.get("occupiedExclude") or "")).replace(",", " ").split()
+    install_batch_names(blocks)
+    exclude_raw =((params.get("exclude") or "") + " " + (params.get("occupiedExclude") or "")).replace(",", " ").split()
     if exclude_raw:
         excluded = {s.strip() for s in exclude_raw if s.strip()}
         blocks = [b for b in blocks if str(b["stock"]).strip() not in excluded]

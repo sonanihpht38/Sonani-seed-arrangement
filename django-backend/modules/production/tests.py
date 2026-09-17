@@ -2848,3 +2848,709 @@ class UnassignReturnsSeedsTests(TransactionTestCase):
         from .models import Batch
         Batch.objects.create(batch_id=_uuid.uuid4(), batch_no="EMPTY", is_active=True)
         self.assertEqual(self._batch_counts()["EMPTY"], 0)
+
+
+class GapGeometryTests(SimpleTestCase):
+    """The pocket geometry in modules.production.gaps.
+
+    A reported pocket is a stone somebody will be asked to buy, so it has to
+    genuinely fit: inside the usable circle, clear of every seed, clear of the
+    other pockets, and with no interior angle under 90 degrees.
+    """
+
+    def _plate(self):
+        """Two 10 x 10 seeds side by side, centred, usable radius 20.
+
+        Small enough to check by hand: the seeds span x -10..10, y -5..5, and
+        the rest of the disc is free.
+        """
+        return [
+            {"x": -10.0, "y": -5.0, "w": 10.0, "h": 10.0},
+            {"x": 0.0, "y": -5.0, "w": 10.0, "h": 10.0},
+        ]
+
+    def test_every_chamfer_combination_keeps_all_four_corners(self):
+        """A rewrite of _poly once dropped the top-left point when its chamfer
+        was zero, turning stones into triangles and understating the whole
+        report by about 15 per cent. Area is the cheap way to catch it."""
+        import itertools
+
+        from shapely.geometry import Polygon
+
+        from .gaps import _poly
+
+        for cham in itertools.product((0.0, 2.0), repeat=4):
+            g = Polygon(_poly(0, 0, 10, 8, cham))
+            expected = 80.0 - sum(v * v / 2.0 for v in cham)
+            self.assertAlmostEqual(
+                g.area, expected, places=6,
+                msg="chamfer %s gave %s, expected %s" % (cham, g.area, expected))
+
+    def test_no_interior_angle_is_below_ninety_degrees(self):
+        """The shop-floor rule. A 45 degree chamfer yields 90 and 135 only."""
+        import itertools
+        import math as _m
+
+        from shapely.geometry import Polygon
+
+        from .gaps import _poly
+
+        for cham in itertools.product((0.0, 2.0, 3.0), repeat=4):
+            pts = list(Polygon(_poly(0, 0, 12, 10, cham)).exterior.coords)[:-1]
+            for i in range(len(pts)):
+                ax, ay = pts[i - 1]
+                bx, by = pts[i]
+                cx, cy = pts[(i + 1) % len(pts)]
+                v1 = (ax - bx, ay - by)
+                v2 = (cx - bx, cy - by)
+                n1 = _m.hypot(*v1)
+                n2 = _m.hypot(*v2)
+                if n1 == 0 or n2 == 0:
+                    continue
+                dot = (v1[0] * v2[0] + v1[1] * v2[1]) / (n1 * n2)
+                ang = _m.degrees(_m.acos(max(-1.0, min(1.0, dot))))
+                self.assertGreaterEqual(round(ang, 6), 90.0)
+
+    def test_reported_pockets_fit_and_never_exceed_the_empty_area(self):
+        import math as _m
+
+        from shapely.geometry import box as shbox
+
+        from .gaps import gap_report
+
+        placed = self._plate()
+        radius = 20.0
+        pockets = gap_report(placed, radius, min_width=3.0)
+        self.assertTrue(pockets, "expected pockets on a half-empty plate")
+        for p in pockets:
+            self.assertLessEqual(p["area"], p["length"] * p["width"] + 1e-6)
+            self.assertGreaterEqual(min(p["length"], p["width"]), 3.0 - 1e-6)
+        seeds = [shbox(s["x"], s["y"], s["x"] + s["w"], s["y"] + s["h"])
+                 for s in placed]
+        empty = _m.pi * radius * radius - sum(s.area for s in seeds)
+        self.assertLessEqual(sum(p["area"] for p in pockets), empty + 1e-6)
+
+    def test_a_full_plate_reports_nothing(self):
+        from .gaps import gap_report
+
+        placed = [{"x": -14.0, "y": -14.0, "w": 28.0, "h": 28.0}]
+        self.assertEqual(gap_report(placed, 20.0, min_width=8.0), [])
+
+    def test_degenerate_input_returns_empty_rather_than_raising(self):
+        from .gaps import gap_report
+
+        self.assertEqual(gap_report([], 20.0), [])
+        self.assertEqual(gap_report(self._plate(), 0.0), [])
+        self.assertEqual(gap_report(self._plate(), 20.0, min_width=0.0), [])
+
+    def test_a_narrower_minimum_never_finds_less_area(self):
+        """Lowering the minimum seed width can only open pockets. If this
+        inverts, the greedy decomposition has been broken."""
+        from .gaps import gap_report
+
+        placed = self._plate()
+        wide = sum(p["area"] for p in gap_report(placed, 20.0, min_width=6.0))
+        narrow = sum(p["area"] for p in gap_report(placed, 20.0, min_width=3.0))
+        self.assertGreaterEqual(narrow, wide - 1e-6)
+
+    def test_the_summary_adds_up(self):
+        import math as _m
+
+        from .gaps import gap_report, gap_summary
+
+        placed = self._plate()
+        pockets = gap_report(placed, 20.0, min_width=3.0)
+        s = gap_summary(placed, 20.0, pockets)
+        self.assertAlmostEqual(s["usableAreaMM2"], round(_m.pi * 400, 1), places=1)
+        self.assertAlmostEqual(s["coveredMM2"], 200.0, places=1)
+        self.assertEqual(s["pocketCount"], len(pockets))
+        self.assertGreaterEqual(s["projectedFillPct"], s["fillPct"])
+
+
+class GapSheetTests(SimpleTestCase):
+    """The GAP REPORT worksheet is additive. It must never disturb the sheet the
+    plate export already had, and must never break an export when it fails."""
+
+    ROWS = [{"type": "Real", "stock": "A1", "size": "10 x 10", "thick": "0.55",
+             "shape": "square", "center": "(0, 0)"}]
+
+    def _plate(self):
+        return [
+            {"x": -10.0, "y": -5.0, "w": 10.0, "h": 10.0},
+            {"x": 0.0, "y": -5.0, "w": 10.0, "h": 10.0},
+        ]
+
+    def test_the_gap_sheet_is_added_alongside_the_plate_sheet(self):
+        import os
+        import tempfile
+
+        from openpyxl import load_workbook
+
+        from .engine_runner import _write_single_xlsx
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "p.xlsx")
+            _write_single_xlsx(path, 1, "Plate 01", "MAX COVERAGE", None,
+                               self.ROWS, placed=self._plate(), radius=20.0,
+                               min_width=3.0)
+            wb = load_workbook(path)
+            self.assertIn("Plate_01", wb.sheetnames)
+            self.assertIn("Gaps_01", wb.sheetnames)
+            self.assertEqual(wb.sheetnames[0], "Plate_01",
+                             "the existing sheet must stay first")
+
+    def test_no_gap_sheet_without_placements(self):
+        """Arrange and Machine-Cut call the same writer and pass nothing extra,
+        so their workbooks must come out exactly as before."""
+        import os
+        import tempfile
+
+        from openpyxl import load_workbook
+
+        from .engine_runner import _write_single_xlsx
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "p.xlsx")
+            _write_single_xlsx(path, 1, "Plate 01", "ARRANGE", None, self.ROWS)
+            self.assertEqual(load_workbook(path).sheetnames, ["Plate_01"])
+
+    def test_the_plate_sheet_is_identical_with_and_without_the_gap_sheet(self):
+        import os
+        import tempfile
+
+        from openpyxl import load_workbook
+
+        from .engine_runner import _write_single_xlsx
+
+        with tempfile.TemporaryDirectory() as d:
+            plain = os.path.join(d, "plain.xlsx")
+            withgap = os.path.join(d, "gap.xlsx")
+            _write_single_xlsx(plain, 1, "Plate 01", "MAX COVERAGE", None,
+                               self.ROWS)
+            _write_single_xlsx(withgap, 1, "Plate 01", "MAX COVERAGE", None,
+                               self.ROWS, placed=self._plate(), radius=20.0,
+                               min_width=3.0)
+            a = load_workbook(plain)["Plate_01"]
+            b = load_workbook(withgap)["Plate_01"]
+            for r in range(1, 40):
+                for c in range(1, 9):
+                    self.assertEqual(
+                        a.cell(r, c).value, b.cell(r, c).value,
+                        "plate sheet changed at row %s col %s" % (r, c))
+
+    def test_a_failing_report_does_not_break_the_export(self):
+        import os
+        import tempfile
+        from unittest import mock
+
+        from openpyxl import load_workbook
+
+        from .engine_runner import _write_single_xlsx
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "p.xlsx")
+            with mock.patch("modules.production.gaps.gap_report",
+                            side_effect=RuntimeError("boom")):
+                with self.assertLogs("modules.production.engine_runner",
+                                     level="ERROR"):
+                    _write_single_xlsx(path, 1, "Plate 01", "MAX COVERAGE", None,
+                                       self.ROWS, placed=self._plate(),
+                                       radius=20.0)
+            self.assertEqual(load_workbook(path).sheetnames, ["Plate_01"])
+
+
+class GapStoneCountTests(SimpleTestCase):
+    """How many stones a pocket takes.
+
+    This has been wrong in both directions and both were caught by the user, so
+    both directions are pinned here. A fixed 13 mm cap split a 13.8 mm pocket
+    into two stones one stone covers; removing the cap reported a 58.5 mm pocket
+    as a single stone on a plate whose longest seed was 18.4 mm.
+
+    The rule: a length the plate demonstrably contains is a length that can be
+    sourced, so the divisor is the longest seed ON THAT PLATE.
+    """
+
+    def _long_plate(self, seed_len):
+        """One row of seeds of a known length, leaving rim pockets above/below."""
+        out = []
+        x = -30.0
+        while x < 30.0:
+            out.append({"x": x, "y": -5.0, "w": seed_len, "h": 10.0})
+            x += seed_len
+        return out
+
+    def test_a_pocket_shorter_than_the_longest_seed_is_one_stone(self):
+        from .gaps import gap_report
+
+        placed = self._long_plate(18.0)
+        for p in gap_report(placed, 40.0, min_width=4.0):
+            if p["length"] <= 18.0:
+                self.assertEqual(
+                    p["stones"], 1,
+                    "a %.2f mm pocket fits one 18 mm stone" % p["length"])
+
+    def test_stone_count_covers_the_pocket_length(self):
+        from .gaps import gap_report
+
+        placed = self._long_plate(12.0)
+        longest = 12.0
+        for p in gap_report(placed, 40.0, min_width=4.0):
+            self.assertGreaterEqual(p["stones"], 1)
+            # enough stones to span it...
+            self.assertGreaterEqual(p["stones"] * p["stoneLength"] + 1e-6,
+                                    p["length"])
+            # ...and none of them longer than the plate proves sourceable
+            self.assertLessEqual(p["stoneLength"], longest + 1e-6)
+            # ...and never one more than needed
+            if p["stones"] > 1:
+                self.assertGreater(p["length"], (p["stones"] - 1) * longest)
+
+    def test_a_shorter_longest_seed_means_more_stones(self):
+        """The divisor really is read off the plate, not hardcoded."""
+        from .gaps import gap_report
+
+        big = gap_report(self._long_plate(18.0), 40.0, min_width=4.0)
+        small = gap_report(self._long_plate(6.0), 40.0, min_width=4.0)
+        self.assertTrue(big and small)
+        self.assertLess(sum(p["stones"] for p in big),
+                        sum(p["stones"] for p in small))
+
+    def test_a_chamfer_below_the_threshold_is_reported_plain(self):
+        """A 0.1 mm corner is measurement tolerance, not a grinding operation.
+        Reporting it as CUT sent a buyer looking for a ground stone."""
+        from .gaps import MIN_CHAMFER, gap_report
+
+        for p in gap_report(self._long_plate(12.0), 40.0, min_width=4.0):
+            if p["cut"]:
+                self.assertGreaterEqual(max(p["chamfer"]), MIN_CHAMFER)
+            elif p["chamfer"]:
+                self.assertLess(max(p["chamfer"]), MIN_CHAMFER)
+
+    def test_every_pocket_carries_an_outline_for_drawing(self):
+        from .gaps import gap_report
+
+        for p in gap_report(self._long_plate(12.0), 40.0, min_width=4.0):
+            self.assertGreaterEqual(len(p["poly"]), 4)
+            for x, y in p["poly"]:
+                self.assertLessEqual(x * x + y * y, 40.0 * 40.0 + 1e-3)
+
+
+class GapRenderHookTests(SimpleTestCase):
+    """The plate image gains the pockets without losing its A4 page.
+
+    The A4 layout has a single decision point, _legend_layout(n), and its two
+    past failures were both a sizer/drawer disagreement about n. Gap rows are
+    ordinary legend rows, so n simply grows - these tests hold that line.
+    """
+
+    def _placed(self, n=6):
+        out = []
+        for i in range(n):
+            x = -30.0 + i * 10.0
+            out.append({
+                "stock": "S%04d" % i, "x": x, "y": -5.0, "w": 10.0, "h": 10.0,
+                "H": 0.52, "angle": 0, "area": 100.0,
+                "lx": x + 5.0, "ly": 0.0, "rawL": 10.0, "rawW": 10.0,
+                "poly": [(x, -5.0), (x + 10.0, -5.0), (x + 10.0, 5.0), (x, 5.0)],
+            })
+        return out
+
+    def test_the_renderer_source_defaults_the_hook_to_none(self):
+        """demo_fill must still run standalone, and Arrange / Machine-Cut must be
+        untouched, so the hook DEFAULTS to None. engine_runner installs a finder
+        at import time, so assert on the source rather than the live value."""
+        import os
+        import re
+
+        from . import engine_runner  # noqa: F401  (puts engine/ on sys.path)
+        import demo_fill
+
+        src = open(demo_fill.__file__, encoding="utf-8").read()
+        self.assertIsNotNone(
+            re.search(r"^GAP_FINDER = None$", src, re.M),
+            "demo_fill must default GAP_FINDER to None")
+        self.assertTrue(os.path.exists(demo_fill.__file__))
+
+    def test_the_page_stays_a4_with_and_without_gaps(self):
+        import os
+        import tempfile
+
+        from . import engine_runner  # noqa: F401  (puts engine/ on sys.path)
+        import pack_v2 as P
+        import demo_fill as D
+        from PIL import Image
+
+        P.PLATE_D, P.USABLE_D, P.R = 90.0, 80.0, 40.0
+        P.T_LO, P.T_HI, P.CLEARANCE = 0.5, 0.6, 0.0
+        placed = self._placed()
+        before = D.GAP_FINDER
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                D.GAP_FINDER = None
+                plain = os.path.join(d, "plain.png")
+                D.render_enhanced_circle(placed, placed, 1, 40.0, 50.0, plain)
+
+                from modules.production.gaps import gap_report
+                D.GAP_FINDER = lambda pl, r: gap_report(pl, r, 6.0)
+                withgaps = os.path.join(d, "gaps.png")
+                D.render_enhanced_circle(placed, placed, 1, 40.0, 50.0, withgaps)
+
+                # Close before leaving the temp dir: PIL keeps the file open and
+                # Windows will not delete a file that is still held.
+                with Image.open(plain) as im:
+                    size_plain = (im.width, im.height)
+                with Image.open(withgaps) as im:
+                    size_gaps = (im.width, im.height)
+                self.assertEqual(size_plain, size_gaps,
+                                 "the gap overlay changed the page size")
+                self.assertAlmostEqual(size_plain[0] / 200.0, 8.268, places=2)
+                self.assertAlmostEqual(size_plain[1] / 200.0, 11.693, places=2)
+        finally:
+            D.GAP_FINDER = before
+
+    def test_a_failing_finder_still_renders_the_plate(self):
+        import os
+        import tempfile
+
+        from . import engine_runner  # noqa: F401  (puts engine/ on sys.path)
+        import pack_v2 as P
+        import demo_fill as D
+
+        P.PLATE_D, P.USABLE_D, P.R = 90.0, 80.0, 40.0
+        P.T_LO, P.T_HI, P.CLEARANCE = 0.5, 0.6, 0.0
+        before = D.GAP_FINDER
+        try:
+            def boom(placed, radius):
+                raise RuntimeError("boom")
+
+            D.GAP_FINDER = boom
+            with tempfile.TemporaryDirectory() as d:
+                path = os.path.join(d, "p.png")
+                D.render_enhanced_circle(self._placed(), self._placed(), 1,
+                                         40.0, 50.0, path)
+                self.assertTrue(os.path.exists(path))
+                self.assertGreater(os.path.getsize(path), 1000)
+        finally:
+            D.GAP_FINDER = before
+
+
+class PlateBatchLabelTests(SimpleTestCase):
+    """The batch a plate's stones came from, named on the plate IMAGE.
+
+    Resolved from the stock numbers after packing rather than carried through
+    the packer: placement dicts are rebuilt inside _pack_once, so passing a
+    batch through would mean editing frozen packing code to print a label.
+    """
+
+    def setUp(self):
+        from . import engine_runner
+
+        self.er = engine_runner
+        self._saved = dict(engine_runner._BATCH_BY_STOCK)
+
+    def tearDown(self):
+        self.er._BATCH_BY_STOCK.clear()
+        self.er._BATCH_BY_STOCK.update(self._saved)
+
+    def test_the_label_names_only_the_batches_on_this_plate(self):
+        self.er.install_batch_names([
+            {"stock": "A1", "batch": "B-1"},
+            {"stock": "A2", "batch": "B-1"},
+            {"stock": "B1", "batch": "B-2"},
+            {"stock": "C1", "batch": "B-3"},
+        ])
+        # a plate holding only B-1 stones must not advertise B-2 or B-3
+        self.assertEqual(
+            self.er._batch_labeller([{"stock": "A1"}, {"stock": "A2"}]), "B-1")
+        self.assertEqual(
+            self.er._batch_labeller([{"stock": "A1"}, {"stock": "B1"}]), "B-1, B-2")
+
+    def test_the_label_is_sorted_and_deduplicated(self):
+        self.er.install_batch_names([
+            {"stock": "A", "batch": "B-2"},
+            {"stock": "B", "batch": "B-1"},
+            {"stock": "C", "batch": "B-1"},
+        ])
+        self.assertEqual(
+            self.er._batch_labeller(
+                [{"stock": "A"}, {"stock": "B"}, {"stock": "C"}]),
+            "B-1, B-2")
+
+    def test_an_unknown_pool_yields_no_caption(self):
+        """Better no batch line than a blank or wrong one."""
+        self.er._BATCH_BY_STOCK.clear()
+        self.assertEqual(self.er._batch_labeller([{"stock": "A1"}]), "")
+
+    def test_seeds_with_no_batch_are_skipped(self):
+        self.er.install_batch_names([{"stock": "A1", "batch": "B-1"},
+                                     {"stock": "A2", "batch": None}])
+        self.assertEqual(
+            self.er._batch_labeller([{"stock": "A1"}, {"stock": "A2"},
+                                     {"stock": "unknown"}]), "B-1")
+
+    def test_install_replaces_rather_than_accumulates(self):
+        """A second run must not inherit the previous run's batches."""
+        self.er.install_batch_names([{"stock": "A1", "batch": "B-1"}])
+        self.er.install_batch_names([{"stock": "A2", "batch": "B-2"}])
+        self.assertEqual(self.er._batch_labeller([{"stock": "A1"}]), "")
+        self.assertEqual(self.er._batch_labeller([{"stock": "A2"}]), "B-2")
+
+    def test_the_caption_reaches_the_plate_title(self):
+        import os
+        import tempfile
+
+        from . import engine_runner  # noqa: F401  (puts engine/ on sys.path)
+        import pack_v2 as P
+        import demo_fill as D
+
+        P.PLATE_D, P.USABLE_D, P.R = 90.0, 80.0, 40.0
+        P.T_LO, P.T_HI, P.CLEARANCE = 0.5, 0.6, 0.0
+        placed = [{
+            "stock": "A1", "x": -5.0, "y": -5.0, "w": 10.0, "h": 10.0,
+            "H": 0.52, "angle": 0, "area": 100.0, "lx": 0.0, "ly": 0.0,
+            "rawL": 10.0, "rawW": 10.0,
+            "poly": [(-5.0, -5.0), (5.0, -5.0), (5.0, 5.0), (-5.0, 5.0)],
+        }]
+        titles = []
+        before = D.BATCH_LABELLER
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                # Capture what the renderer puts in the plate title.
+                import matplotlib.axes
+
+                orig = matplotlib.axes.Axes.set_title
+
+                def spy(self, label, *a, **kw):
+                    titles.append(label)
+                    return orig(self, label, *a, **kw)
+
+                matplotlib.axes.Axes.set_title = spy
+                try:
+                    self.er.install_batch_names([{"stock": "A1", "batch": "B-7"}])
+                    D.BATCH_LABELLER = self.er._batch_labeller
+                    D.render_enhanced_circle(placed, placed, 3, 40.0, 50.0,
+                                             os.path.join(d, "with.png"))
+                    self.er._BATCH_BY_STOCK.clear()
+                    D.render_enhanced_circle(placed, placed, 3, 40.0, 50.0,
+                                             os.path.join(d, "without.png"))
+                finally:
+                    matplotlib.axes.Axes.set_title = orig
+        finally:
+            D.BATCH_LABELLER = before
+
+        plate_titles = [t for t in titles if "Max Coverage" in t]
+        self.assertEqual(len(plate_titles), 2)
+        self.assertIn("batch B-7", plate_titles[0])
+        self.assertNotIn("batch", plate_titles[1],
+                         "with no batches known the caption must be omitted")
+
+    def test_a_failing_labeller_does_not_break_the_render(self):
+        import os
+        import tempfile
+
+        from . import engine_runner  # noqa: F401  (puts engine/ on sys.path)
+        import pack_v2 as P
+        import demo_fill as D
+
+        P.PLATE_D, P.USABLE_D, P.R = 90.0, 80.0, 40.0
+        P.T_LO, P.T_HI, P.CLEARANCE = 0.5, 0.6, 0.0
+        placed = [{
+            "stock": "A1", "x": -5.0, "y": -5.0, "w": 10.0, "h": 10.0,
+            "H": 0.52, "angle": 0, "area": 100.0, "lx": 0.0, "ly": 0.0,
+            "rawL": 10.0, "rawW": 10.0,
+            "poly": [(-5.0, -5.0), (5.0, -5.0), (5.0, 5.0), (-5.0, 5.0)],
+        }]
+        before = D.BATCH_LABELLER
+        try:
+            def boom(_placed):
+                raise RuntimeError("boom")
+
+            D.BATCH_LABELLER = boom
+            with tempfile.TemporaryDirectory() as d:
+                path = os.path.join(d, "p.png")
+                D.render_enhanced_circle(placed, placed, 1, 40.0, 50.0, path)
+                self.assertTrue(os.path.exists(path))
+                self.assertGreater(os.path.getsize(path), 1000)
+        finally:
+            D.BATCH_LABELLER = before
+
+
+class PlateBatchAggregationTests(SimpleTestCase):
+    """ArrangementService._plate_batches — the per-plate batch list the history
+    screen shows. Pure aggregation over the seed rows, so it needs no database.
+
+    The run-level `batches` field says which batches were SELECTED for the run.
+    With more than one plate that is a different question from which batches
+    ended up on a given plate, which is what the floor needs.
+    """
+
+    def _svc(self):
+        from .services import ArrangementService
+
+        return ArrangementService
+
+    def test_only_the_batches_on_that_plate_are_listed(self):
+        by_plate = {
+            (1, "Max Coverage"): [{"batch": "B-1"}, {"batch": "B-1"}],
+            (2, "Max Coverage"): [{"batch": "B-2"}, {"batch": "B-3"}],
+        }
+        self.assertEqual(self._svc()._plate_batches(by_plate, 1), ["B-1"])
+        self.assertEqual(self._svc()._plate_batches(by_plate, 2), ["B-2", "B-3"])
+
+    def test_methods_are_unioned_for_the_same_plate(self):
+        """A Compare run stores a seed list per method; they are all the same
+        physical plate."""
+        by_plate = {
+            (1, "Arrange"): [{"batch": "B-1"}],
+            (1, "Max Coverage"): [{"batch": "B-2"}],
+        }
+        self.assertEqual(self._svc()._plate_batches(by_plate, 1), ["B-1", "B-2"])
+
+    def test_seeds_without_a_batch_are_ignored(self):
+        by_plate = {(1, "Max Coverage"): [
+            {"batch": None}, {"batch": ""}, {}, {"batch": "B-9"}]}
+        self.assertEqual(self._svc()._plate_batches(by_plate, 1), ["B-9"])
+
+    def test_an_unknown_plate_returns_empty(self):
+        by_plate = {(1, "Max Coverage"): [{"batch": "B-1"}]}
+        self.assertEqual(self._svc()._plate_batches(by_plate, 7), [])
+        self.assertEqual(self._svc()._plate_batches({}, 1), [])
+
+
+class BatchNameDisplayTests(SimpleTestCase):
+    """ArrangementService._display_batch_list.
+
+    TRN_SeedArrange.Batches stores the SELECTED batches as comma-joined
+    Batch_IDs. The history list showed a COUNT because a raw uuid is no use to
+    anyone; these tests pin what each stored value turns into on screen.
+    """
+
+    def _svc(self):
+        from .services import ArrangementService
+
+        return ArrangementService
+
+    def test_a_resolvable_id_becomes_its_batch_number(self):
+        names = {"b9776c7c-0d95-4093-bc04-9f93a10338b9": "DE"}
+        self.assertEqual(
+            self._svc()._display_batch_list(
+                ["b9776c7c-0d95-4093-bc04-9f93a10338b9"], names),
+            ["DE"])
+
+    def test_an_unresolvable_id_is_dropped_not_shown_raw(self):
+        """The batch was deleted. A 36-character uuid in a grid cell is worse
+        than showing nothing at all."""
+        self.assertEqual(
+            self._svc()._display_batch_list(
+                ["03ec89c8-8d3a-4913-8170-7a5d87bb6b9e"], {}),
+            [])
+
+    def test_a_legacy_plain_name_is_kept(self):
+        """A few older rows stored the BatchNo itself, not an id."""
+        self.assertEqual(self._svc()._display_batch_list(["DE", "DT"], {}),
+                         ["DE", "DT"])
+
+    def test_uuid_case_does_not_matter(self):
+        names = {"b9776c7c-0d95-4093-bc04-9f93a10338b9": "DE"}
+        self.assertEqual(
+            self._svc()._display_batch_list(
+                ["B9776C7C-0D95-4093-BC04-9F93A10338B9"], names),
+            ["DE"])
+
+    def test_a_mixed_list_keeps_what_it_can(self):
+        names = {"b9776c7c-0d95-4093-bc04-9f93a10338b9": "DE"}
+        self.assertEqual(
+            self._svc()._display_batch_list(
+                ["b9776c7c-0d95-4093-bc04-9f93a10338b9",   # resolves
+                 "03ec89c8-8d3a-4913-8170-7a5d87bb6b9e",   # deleted batch
+                 "LEGACY-1"],                              # stored as a name
+                names),
+            ["DE", "LEGACY-1"])
+
+    def test_an_empty_list_stays_empty(self):
+        self.assertEqual(self._svc()._display_batch_list([], {}), [])
+
+
+class GapMinimumWidthTests(SimpleTestCase):
+    """The shop floor's minimum dummy-seed width.
+
+    No reference stone narrower than gaps.MIN_SEED_WIDTH may ever be reported,
+    on any plate, in the image or the Excel. A narrower one is not a shopping
+    tip — it is a pocket that cannot be filled, dressed up as one that can.
+    """
+
+    def _plate(self, seed=12.0):
+        out = []
+        x = -30.0
+        while x < 30.0:
+            out.append({"x": x, "y": -5.0, "w": seed, "h": 10.0})
+            x += seed
+        return out
+
+    def test_the_floor_is_at_least_seven_millimetres(self):
+        from .gaps import MIN_SEED_WIDTH
+
+        self.assertGreaterEqual(MIN_SEED_WIDTH, 7.0)
+
+    def test_no_reported_stone_is_narrower_than_the_floor(self):
+        from .gaps import MIN_SEED_WIDTH, gap_report
+
+        for radius in (20.0, 40.0, 74.0):
+            for p in gap_report(self._plate(), radius):
+                self.assertGreaterEqual(
+                    p["width"], MIN_SEED_WIDTH - 1e-6,
+                    "reported a %.2f mm stone on a r=%s plate" % (p["width"], radius))
+                self.assertGreaterEqual(p["length"], MIN_SEED_WIDTH - 1e-6)
+
+    def test_the_default_is_the_floor_not_a_separate_number(self):
+        """engine_runner used to keep its own copy of this; two constants is one
+        too many, and they drifted the moment one was changed."""
+        import inspect
+
+        from . import engine_runner
+        from .gaps import MIN_SEED_WIDTH, gap_report
+
+        self.assertEqual(
+            inspect.signature(gap_report).parameters["min_width"].default,
+            MIN_SEED_WIDTH)
+        src = inspect.getsource(engine_runner)
+        self.assertNotIn("_GAP_MIN_WIDTH", src,
+                         "engine_runner must use gaps.MIN_SEED_WIDTH, not a copy")
+
+    def test_the_renderer_hook_respects_the_floor(self):
+        from . import engine_runner
+        from .gaps import MIN_SEED_WIDTH
+
+        for p in engine_runner._gap_finder(self._plate(), 40.0):
+            self.assertGreaterEqual(p["width"], MIN_SEED_WIDTH - 1e-6)
+
+    def test_the_excel_sheet_respects_the_floor(self):
+        import os
+        import tempfile
+
+        from openpyxl import load_workbook
+
+        from .engine_runner import _write_single_xlsx
+        from .gaps import MIN_SEED_WIDTH
+
+        rows = [{"type": "Real", "stock": "A1", "size": "12 x 10",
+                 "thick": "0.55", "shape": "rectangle", "center": "(0, 0)"}]
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "p.xlsx")
+            _write_single_xlsx(path, 1, "Plate 01", "MAX COVERAGE", None, rows,
+                               placed=self._plate(), radius=40.0)
+            wb = load_workbook(path)
+            if "Gaps_01" not in wb.sheetnames:
+                return                      # nothing met the floor: also correct
+            ws = wb["Gaps_01"]
+            header = None
+            for r in range(1, ws.max_row + 1):
+                if ws.cell(r, 1).value == "#":
+                    header = r
+                    break
+            self.assertIsNotNone(header, "gap sheet has no table header")
+            for r in range(header + 1, ws.max_row + 1):
+                width = ws.cell(r, 4).value        # "Seed width mm"
+                if isinstance(width, (int, float)):
+                    self.assertGreaterEqual(float(width), MIN_SEED_WIDTH - 1e-6)

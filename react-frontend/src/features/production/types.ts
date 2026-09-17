@@ -79,6 +79,12 @@ export interface ArrangementSeed {
 export interface ArrangementPlate {
   plateNo: number;
   plateName: string | null;
+  /**
+   * BatchNos whose stones are on THIS plate, read from the seeds placed on it.
+   * The run-level `batches` lists what was selected for the whole run; with more
+   * than one plate those are different questions.
+   */
+  batches: string[];
   arrangeFillPct: number | null;
   machineFillPct: number | null;
   enhancedFillPct: number | null;
