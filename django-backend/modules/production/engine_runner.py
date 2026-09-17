@@ -39,6 +39,22 @@ from matplotlib.patches import Circle as _Circle, Patch as _Patch, Rectangle as 
 
 from . import gaps  # noqa: E402
 
+def gap_band():
+    """The seed-width range the REFERENCE stones must fall in, for this run.
+
+    It is the band the operator entered for the plate (P.W_LO / P.W_HI, set by
+    _apply_globals), because a reference stone is only worth listing if it is
+    one this run would have accepted. Either end may be blank on the form, and
+    a blank end falls back to the module default rather than to "unbounded" —
+    an unbounded floor reports slivers nobody cuts.
+    """
+    lo = getattr(P, "W_LO", None)
+    hi = getattr(P, "W_HI", None)
+    lo = float(lo) if lo else gaps.MIN_SEED_WIDTH
+    hi = float(hi) if hi else gaps.MAX_SEED_WIDTH
+    return (lo, hi) if hi >= lo else (lo, lo)
+
+
 def _gap_finder(placed, radius):
     """Adapter handed to the Max Coverage renderer so the plate IMAGE can show
     the same pockets the Excel sheet lists.
@@ -48,8 +64,8 @@ def _gap_finder(placed, radius):
     untouched.
     """
     try:
-        return gaps.gap_report(placed, radius, gaps.MIN_SEED_WIDTH,
-                               gaps.MAX_SEED_WIDTH)
+        lo, hi = gap_band()
+        return gaps.gap_report(placed, radius, lo, hi)
     except Exception:
         _log.exception("gap report failed during render")
         return []
@@ -409,9 +425,13 @@ def _write_gap_sheet(wb, plate_no, placed, radius, min_width,
     hand. Skipped silently when there is nothing to report, so an export never
     grows an empty sheet.
     """
-    hi = max_width if max_width else gaps.MAX_SEED_WIDTH
+    # Same band the plate image used, so the sheet and the picture can never
+    # disagree about which stones were eligible.
+    band_lo, band_hi = gap_band()
+    lo = min_width if min_width else band_lo
+    hi = max_width if max_width else band_hi
     try:
-        pockets = gaps.gap_report(placed, radius, min_width, hi)
+        pockets = gaps.gap_report(placed, radius, lo, hi)
     except Exception:
         # A report must never be the reason a plate export fails.
         _log.exception("gap report failed for plate %s", plate_no)
@@ -423,7 +443,7 @@ def _write_gap_sheet(wb, plate_no, placed, radius, min_width,
     ws.cell(1, 1, f"Plate {plate_no:02d} — Gap Report").font = Font(
         bold=True, size=13, color="1F4E78")
     ws.cell(2, 1, f"Stones that would fill the empty space, within the seed-width "
-                  f"range {min_width:g}–{hi:g} mm. A pocket that no stone in that "
+                  f"range {lo:g}–{hi:g} mm this run used. A pocket that no stone in that "
                   f"range can serve is left empty and not listed. Nothing here is "
                   f"placed or allocated — this is a sourcing list."
             ).font = Font(italic=True)
@@ -463,7 +483,8 @@ def _write_gap_sheet(wb, plate_no, placed, radius, min_width,
 
 
 def _write_single_xlsx(path, plate_no, heading, table_title, img_path, rows,
-                       placed=None, radius=None, min_width=None):
+                       placed=None, radius=None, min_width=None,
+                       max_width=None):
     """Per-plate workbook for a SINGLE-stage result (Arrange / Machine-Cut / Enhanced):
     the plate image + one seed detail table (same columns as the on-screen table).
 
@@ -471,6 +492,9 @@ def _write_single_xlsx(path, plate_no, heading, table_title, img_path, rows,
     given a second sheet is added reporting the empty pockets — see
     _write_gap_sheet. Optional so the Arrange and Machine-Cut callers, which have
     no use for it, are unaffected.
+
+    `min_width` / `max_width` override the seed-width range the reference stones
+    must fall in; left out, the run's own band is used (see gap_band).
     """
     wb = Workbook()
     ws = wb.active
@@ -491,8 +515,9 @@ def _write_single_xlsx(path, plate_no, heading, table_title, img_path, rows,
     for col in "ABCDEFGH":
         ws.column_dimensions[col].width = 14
     if placed and radius:
-        _write_gap_sheet(wb, plate_no, placed, radius,
-                         min_width if min_width else gaps.MIN_SEED_WIDTH)
+        # Pass the overrides through as given; _write_gap_sheet falls back to
+        # this run's own seed-width band for whichever end is not supplied.
+        _write_gap_sheet(wb, plate_no, placed, radius, min_width, max_width)
     wb.save(path)
 
 

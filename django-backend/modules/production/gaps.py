@@ -23,16 +23,21 @@ accepts (it allows 5 to 12 corners). Measured on the reference Ø90 plate,
 chamfering is worth about two millimetres of seed width: cut stones reach the
 coverage plain rectangles would need stones 2 mm narrower to reach.
 
-ONE POCKET, ONE STONE. The seed-width range binds BOTH sides, so no reported
-stone is longer than MAX_SEED_WIDTH and none is one a single stone cannot cover.
-A long empty band is therefore split by _rect_pockets into several pockets, each
-a legal stone on its own row, rather than one row reading "N stones of X".
+THE BAND IS THE RUN'S OWN. A reference stone is only worth listing if it is one
+that run would have accepted, so the width range comes from the seed-width band
+the operator entered for the plate, not from a constant. The constants below are
+the fallback for a run that states no band.
 
-Getting here took three attempts, recorded so none of them is repeated. A fixed
-13 mm cap split a 13.8 mm pocket into two stones a single one covers. Removing
-the cap entirely then reported a 58.5 mm pocket on a Ø158 plate as ONE stone,
-when the longest seed on that plate was 18.4 mm. Deriving the cap from the plate
-fixed both, and the explicit 12-18 rule then made it moot: the cap is the rule.
+WIDTH ONLY. The band bounds the seed WIDTH — the shorter side. Length is free: a
+pocket is reported whole at its true length, with `stones` saying how many it
+takes. Bounding length as well was tried and reverted — it forced every pocket
+into a square-ish tile, which is not how the stones are cut.
+
+How many stones is derived from the longest seed ALREADY ON THAT PLATE, because
+a length the plate demonstrably contains is a length that can be sourced. Four
+attempts sit behind that one line: a fixed 13 mm cap split a 13.8 mm pocket one
+stone covers; no cap at all called a 58.5 mm pocket one stone when the plate's
+longest seed was 18.4 mm; and a hard length cap made every pocket a tile.
 
 The pocket search is greedy and the chamfer search is local, so the figures are
 a LOWER bound: a pocket is at least this big, never more than reported.
@@ -65,14 +70,21 @@ MIN_FLAT = 1.0
 # empty and unreported — that a gap exists is not a reason to suggest a stone
 # the shop will not cut.
 #
-# BOTH SIDES are bound by it — width and length alike. Every reference stone is
-# therefore between 12 x 12 and 18 x 18 mm. A long pocket is not one long stone:
-# it tiles into several, each reported on its own row, because a stone longer
-# than 18 mm is not one the shop will cut.
+# FALLBACK seed-width range, used only when a run states no band of its own.
 #
-# Expect quiet plates. The range is narrow and rim pockets are mostly narrower
-# than 12 mm, so many plates will report no reference stones at all. That is the
-# rule working, not the report failing.
+# The real range is the one the operator entered for the plate — see
+# engine_runner._gap_finder, which reads P.W_LO / P.W_HI. A reference stone is
+# only useful if it is a stone that run would have accepted, so the report
+# follows the run rather than a constant.
+#
+# Width means the SHORTER side, the same measure the form bands on
+# (engine_runner.seed_width = min(L, W)). LENGTH is NOT bounded: bounding it too
+# forced every pocket into a square-ish tile, which the shop rejected as
+# unbuildable.
+#
+# Expect quiet plates either way. Rim pockets are often narrower than any band a
+# run would use, so many plates report no reference stones at all. That is the
+# band working, not the report failing.
 MIN_SEED_WIDTH = 12.0
 MAX_SEED_WIDTH = 18.0
 
@@ -157,12 +169,12 @@ def _largest_rect(free, n, mind):
 
 
 def _rect_pockets(placed, radius, min_width, max_width, step):
-    """Empty rectangles, biggest first, every side within [min_width, max_width].
+    """Empty rectangles, biggest first, each at least min_width on both sides.
 
-    A maximal empty rectangle is CLAMPED to max_width on both sides, and only
-    the clamped part is consumed — the remainder stays free, so the next pass
-    picks it up. That is what makes a long empty band tile into several legal
-    stones instead of being reported once and the rest thrown away.
+    A rectangle whose SHORT side exceeds max_width is clamped to it — no stone
+    may be wider than the band — and only the clamped part is consumed, so the
+    strip left over stays free for the next pass instead of being thrown away.
+    The LONG side is never clamped: length is not what the band bounds.
     """
     free, n = _free_grid(placed, radius, step)
     mind = max(1, int(math.ceil(min_width / step)))
@@ -173,7 +185,11 @@ def _rect_pockets(placed, radius, min_width, max_width, step):
         if found is None:
             break
         i0, j0, wc, hc = found
-        wc, hc = min(wc, maxd), min(hc, maxd)
+        if min(wc, hc) > maxd:            # too WIDE for the band: trim the short side
+            if wc <= hc:
+                wc = maxd
+            else:
+                hc = maxd
         for jj in range(j0, j0 + hc):
             row = free[jj]
             for ii in range(i0, i0 + wc):
@@ -227,9 +243,12 @@ def _legal(x0, y0, x1, y1, cham, radius, tree, boxes, taken, min_width,
     from shapely.geometry import Polygon as ShPoly
 
     w, h = x1 - x0, y1 - y0
-    # BOTH sides in range: the short one at or above the minimum, the long one
-    # at or below the maximum. The long side clears the minimum automatically.
-    if min(w, h) < min_width - _TOL or max(w, h) > max_width + _TOL:
+    # The band constrains the seed WIDTH — the shorter side — and nothing else.
+    # LENGTH is deliberately free: bounding it too forced every pocket to be a
+    # square-ish 18 x 18 tile, which the shop rejected as unbuildable. A long
+    # pocket is reported whole, with `stones` saying how many it takes.
+    width = min(w, h)
+    if width < min_width - _TOL or width > max_width + _TOL:
         return None
     if any(v < 0 for v in cham):
         return None
@@ -297,6 +316,72 @@ def _grow(x0, y0, x1, y1, radius, tree, boxes, taken, min_width, max_width):
     return best, (x0, y0, x1, y1, tuple(round(v, 2) for v in cham))
 
 
+def _cham_of(poly, bounds):
+    """The 45-degree corner cuts a polygon actually has, read back off it.
+
+    A sliced piece keeps only some of its parent's chamfers, so they cannot be
+    carried over — they are measured here. For each corner of the bounding box,
+    the cut is how far the outline pulls back along BOTH edges meeting there;
+    equal pull-backs mean a 45-degree chamfer, which is all this module makes.
+    """
+    x0, y0, x1, y1 = bounds
+    pts = list(poly.exterior.coords)
+    out = []
+    for cx, cy in ((x0, y0), (x1, y0), (x1, y1), (x0, y1)):
+        on_h = [abs(px - cx) for px, py in pts if abs(py - cy) < 1e-6]
+        on_v = [abs(py - cy) for px, py in pts if abs(px - cx) < 1e-6]
+        if not on_h or not on_v:
+            continue
+        dx, dy = min(on_h), min(on_v)
+        if dx > 1e-6 and abs(dx - dy) < 1e-3:
+            out.append(dx)
+    return [v for v in out if v > 0]
+
+
+def _slice_pocket(g, along_x, bounds, piece, n):
+    """Cut a pocket polygon into `n` stones of `piece` mm along its long axis.
+
+    Cutting the grown POLYGON, not re-tiling the raster, is what keeps the end
+    stones chamfered and following the rim. Tiling the raster instead produced a
+    field of identical axis-aligned squares, which is not how the rim is cut.
+    """
+    from shapely.geometry import box as shbox
+
+    x0, y0, x1, y1 = bounds
+    out = []
+    for i in range(n):
+        if along_x:
+            a = x0 + i * piece
+            knife = shbox(a, y0 - 1.0, a + piece, y1 + 1.0)
+        else:
+            a = y0 + i * piece
+            knife = shbox(x0 - 1.0, a, x1 + 1.0, a + piece)
+        part = g.intersection(knife)
+        if part.geom_type == "Polygon" and part.area > 1e-6:
+            out.append(part)
+    return out
+
+
+def _stone_plan(length, min_width, max_width):
+    """(number of stones, length of each) for a pocket of `length`.
+
+    No stone may be longer than max_width or shorter than min_width. Equal
+    division is preferred; when no equal division satisfies both bounds the
+    pocket is covered by whole max_width stones and the short remainder is left
+    empty, because a remainder below the minimum is a stone nobody will cut.
+    """
+    if length < min_width - _TOL:
+        return 0, 0.0
+    n = max(1, int(math.ceil(length / max_width - 1e-9)))
+    piece = length / n
+    if piece >= min_width - _TOL:
+        return n, piece
+    n = int(math.floor(length / max_width + 1e-9))
+    if n < 1:
+        return 1, length
+    return n, max_width
+
+
 def _where(x, y, w, h, radius):
     """Plain-language position, as a fraction of the radius so it reads the same
     on a Ø90 plate and a Ø158 one."""
@@ -314,19 +399,21 @@ def gap_report(placed, radius, min_width=MIN_SEED_WIDTH,
 
     `placed` are the packed seats — dicts with x, y, w, h in mm, plate centre at
     (0, 0). `radius` is the USABLE radius, margin already removed. `min_width`
-    / `max_width` are the seed-width range the shop will cut, and both are hard:
-    a pocket that cannot be served by a stone inside the range is left out, and
-    one wider than the range gets a max_width stone with the remainder left
-    empty. They default to MIN_SEED_WIDTH / MAX_SEED_WIDTH.
+    / `max_width` bound BOTH sides of every reported stone, and both are hard.
+    A pocket no stone in the range can serve is left out; one too big for a
+    single stone is cut into several, each its own entry. They default to
+    MIN_SEED_WIDTH / MAX_SEED_WIDTH.
+
+    EVERY ENTRY IS ONE STONE — one row, one outline on the plate, one thing to
+    buy. `stones` is therefore always 1; it and `stoneLength` are kept so the
+    Excel sheet and the plate legend need no special case.
 
     Each entry:
         where       - plain-language position on the plate
-        length      - the pocket's longer side, mm
-        width       - the pocket's shorter side, mm (this is the SEED WIDTH needed)
-        stones      - how many stones it takes, given the longest seed on this
-                      plate; 1 whenever one stone can span it
-        stoneLength - length of each of those stones, mm (== length when
-                      stones is 1)
+        length      - the stone's longer side, mm (never above max_width)
+        width       - the stone's shorter side, mm (this is the SEED WIDTH needed)
+        stones      - always 1
+        stoneLength - same as length
         chamfer     - list of 45-degree corner cuts in mm; empty means a plain
                       rectangle fits
         area        - mm² the pocket covers, chamfers already deducted
@@ -356,22 +443,45 @@ def gap_report(placed, radius, min_width=MIN_SEED_WIDTH,
         x0, y0, x1, y1, cham = box
         bw, bh = x1 - x0, y1 - y0
         length = max(bw, bh)
-        out.append({
-            "where": _where(x0, y0, bw, bh, radius),
-            "length": round(length, 2),
-            "width": round(min(bw, bh), 2),
-            # Always one stone now. The length cap means a pocket can never be
-            # longer than a single legal stone — a long empty band is split by
-            # _rect_pockets into separate pockets, each its own row, rather than
-            # being one row saying "N stones of X". Both fields are kept so the
-            # sheet and the plate legend need no special case.
-            "stones": 1,
-            "stoneLength": round(length, 2),
-            "chamfer": [round(v, 2) for v in cham if v > 0],
-            "area": round(g.area, 1),
-            "cut": any(v >= MIN_CHAMFER for v in cham),
-            "poly": [(round(px, 3), round(py, 3)) for px, py in g.exterior.coords],
-        })
+        # ONE ROW PER REAL STONE. A pocket longer than the band's maximum is cut
+        # into stones that are each buildable, and each is drawn on the plate
+        # separately. Reporting one 45.6 mm outline and captioning it "3 stones"
+        # drew a seed that cannot exist.
+        n, piece = _stone_plan(length, min_width, max_width)
+        if n < 1:
+            continue
+        if n == 1 and piece >= length - _TOL:
+            # One stone, whole pocket. Uses the EXACT chamfers the grower
+            # produced rather than measuring them back off the polygon.
+            out.append({
+                "where": _where(x0, y0, bw, bh, radius),
+                "length": round(length, 2),
+                "width": round(min(bw, bh), 2),
+                "stones": 1,
+                "stoneLength": round(length, 2),
+                "chamfer": [round(v, 2) for v in cham if v > 0],
+                "area": round(g.area, 1),
+                "cut": any(v >= MIN_CHAMFER for v in cham),
+                "poly": [(round(px, 3), round(py, 3))
+                         for px, py in g.exterior.coords],
+            })
+        else:
+            for part in _slice_pocket(g, bw >= bh, (x0, y0, x1, y1), piece, n):
+                pb = part.bounds
+                pw, ph = pb[2] - pb[0], pb[3] - pb[1]
+                pcham = [round(v, 2) for v in _cham_of(part, pb)]
+                out.append({
+                    "where": _where(pb[0], pb[1], pw, ph, radius),
+                    "length": round(max(pw, ph), 2),
+                    "width": round(min(pw, ph), 2),
+                    "stones": 1,
+                    "stoneLength": round(max(pw, ph), 2),
+                    "chamfer": pcham,
+                    "area": round(part.area, 1),
+                    "cut": any(v >= MIN_CHAMFER for v in pcham),
+                    "poly": [(round(px, 3), round(py, 3))
+                             for px, py in part.exterior.coords],
+                })
     out.sort(key=lambda r: -r["area"])
     return out
 

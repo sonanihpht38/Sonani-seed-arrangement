@@ -764,11 +764,14 @@ def render_enhanced_circle(placed, real, pi, R, fill, path):
     if pockets:
         # Name the range that governed these, so the sheet and the plate agree
         # and nobody has to guess why a visible gap carries no stone.
-        # Kept SHORT: this row shares a legend column with the seed rows, and the
-        # first version of it ran off the edge as "...not placed · seed widt".
+        # The band THIS RUN used, so the plate and the Excel sheet can never
+        # disagree about which stones were eligible. Kept SHORT: this row shares
+        # a legend column with the seed rows, and the first version of it ran
+        # off the edge as "...not placed · seed widt".
         try:
-            from modules.production.gaps import MAX_SEED_WIDTH, MIN_SEED_WIDTH
-            band = f" ({MIN_SEED_WIDTH:g}–{MAX_SEED_WIDTH:g} mm)"
+            from modules.production.engine_runner import gap_band
+            _lo, _hi = gap_band()
+            band = f" ({_lo:g}–{_hi:g} mm)"
         except Exception:
             band = ""
         entries.append((None, None, "",

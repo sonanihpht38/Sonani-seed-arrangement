@@ -3060,15 +3060,17 @@ class GapSheetTests(SimpleTestCase):
 
 
 class GapStoneCountTests(SimpleTestCase):
-    """Every reported pocket is exactly ONE legal stone.
+    """Every reported entry is ONE buildable stone, inside the band on both sides.
 
-    The seed-width range binds both sides, so a pocket can never be longer than
-    a single stone: a long empty band is split into separate pockets instead.
+    Five attempts sit behind this and each is pinned below. A fixed 13 mm cap
+    split a 13.8 mm pocket one stone covers. No cap called a 58.5 mm pocket one
+    stone when the plate's longest seed was 18.4 mm. Re-tiling the raster turned
+    the rim into identical squares. Reverting the cap drew one 45.6 mm outline
+    and captioned it "3 stones" — a seed that cannot exist. Splitting to fit the
+    maximum then produced 11.6 mm pieces under a 12 mm floor.
 
-    This took three attempts and all three are pinned here. A fixed 13 mm cap
-    split a 13.8 mm pocket into two stones one covers; removing the cap reported
-    a 58.5 mm pocket as one stone on a plate whose longest seed was 18.4 mm; the
-    explicit 12-18 rule then made the cap the rule itself.
+    What survived: cut the grown POLYGON into stones that satisfy both bounds,
+    draw each one, and leave any remainder that cannot be served.
     """
 
     def _long_plate(self, seed_len):
@@ -3080,38 +3082,86 @@ class GapStoneCountTests(SimpleTestCase):
             x += seed_len
         return out
 
-    def test_every_pocket_is_exactly_one_stone(self):
+    def test_every_entry_is_exactly_one_stone(self):
         from .gaps import gap_report
 
         for seed in (6.0, 12.0, 18.0):
-            for p in gap_report(self._long_plate(seed), 40.0):
+            for p in gap_report(self._long_plate(seed), 40.0, 12.0, 18.0):
                 self.assertEqual(p["stones"], 1)
                 self.assertAlmostEqual(p["stoneLength"], p["length"], places=6)
 
-    def test_no_pocket_is_longer_than_the_maximum(self):
-        """The length cap is what makes one-stone-per-pocket true. A long empty
-        band must arrive as SEVERAL pockets, never one oversized row."""
-        from .gaps import MAX_SEED_WIDTH, gap_report
+    def test_a_pocket_one_stone_can_cover_is_not_split(self):
+        """The very first complaint: a 13.8 mm pocket must stay one stone."""
+        from .gaps import _stone_plan
 
-        for radius in (20.0, 40.0, 74.0):
-            for seed in (6.0, 12.0, 18.0):
-                for p in gap_report(self._long_plate(seed), radius):
-                    self.assertLessEqual(
-                        p["length"], MAX_SEED_WIDTH + 1e-6,
-                        "%.2f mm pocket on r=%s" % (p["length"], radius))
+        n, piece = _stone_plan(13.8, 12.0, 18.0)
+        self.assertEqual(n, 1)
+        self.assertAlmostEqual(piece, 13.8, places=6)
 
-    def test_a_long_empty_band_tiles_into_several_stones(self):
-        """The clamp must consume only what it reports, or the remainder of a
-        big empty region is silently thrown away."""
-        from .gaps import MAX_SEED_WIDTH, gap_report
+    def test_a_long_pocket_is_cut_into_buildable_stones(self):
+        """The 45.6 mm outline captioned '3 stones' drew a seed that cannot
+        exist; it must become three stones that can."""
+        from .gaps import _stone_plan
 
-        # a single narrow seed down the middle leaves two large empty regions
+        n, piece = _stone_plan(45.6, 14.0, 20.0)
+        self.assertEqual(n, 3)
+        self.assertAlmostEqual(piece, 15.2, places=6)
+        self.assertLessEqual(piece, 20.0)
+        self.assertGreaterEqual(piece, 14.0)
+
+    def test_a_pocket_no_legal_division_fits_leaves_a_remainder(self):
+        """23.2 mm under 12-18 cannot be tiled: two pieces are 11.6 (under the
+        floor), one is 23.2 (over the cap). Cover what is legal, leave the rest."""
+        from .gaps import _stone_plan
+
+        n, piece = _stone_plan(23.2, 12.0, 18.0)
+        self.assertEqual(n, 1)
+        self.assertAlmostEqual(piece, 18.0, places=6)
+
+    def test_a_pocket_below_the_minimum_yields_no_stone(self):
+        from .gaps import _stone_plan
+
+        self.assertEqual(_stone_plan(11.0, 12.0, 18.0), (0, 0.0))
+
+    def test_splitting_never_pushes_a_stone_below_the_minimum(self):
+        """Splitting a 23.2 mm pocket in two gave 11.6 mm pieces against a 12 mm
+        floor — the exact stone the band forbids. Fewer, longer stones is the
+        honest answer; a shorter one would be illegal."""
+        from .gaps import gap_report
+
         placed = [{"x": -5.0, "y": -40.0, "w": 10.0, "h": 80.0}]
-        rep = gap_report(placed, 40.0)
-        self.assertGreater(len(rep), 3,
-                           "a mostly-empty plate should tile into many stones")
+        for lo, hi in ((12.0, 18.0), (14.0, 20.0), (7.0, 18.0)):
+            for p in gap_report(placed, 40.0, lo, hi):
+                self.assertGreaterEqual(
+                    p["stoneLength"], lo - 1e-6,
+                    "%d stones of %.2f mm under a %.0f mm floor"
+                    % (p["stones"], p["stoneLength"], lo))
+
+    def test_no_reported_stone_exceeds_the_band_on_either_side(self):
+        """The band caps LENGTH as well as width — a 45.6 mm seed is not one
+        anybody can cut, whatever the caption says."""
+        from .gaps import gap_report
+
+        # a narrow seed down the middle leaves two long empty regions
+        placed = [{"x": -5.0, "y": -40.0, "w": 10.0, "h": 80.0}]
+        for lo, hi in ((12.0, 18.0), (14.0, 20.0)):
+            rep = gap_report(placed, 40.0, lo, hi)
+            self.assertTrue(rep, "expected stones on a mostly-empty plate")
+            for p in rep:
+                self.assertLessEqual(p["length"], hi + 1e-6)
+                self.assertLessEqual(p["width"], hi + 1e-6)
+                self.assertGreaterEqual(p["width"], lo - 1e-6)
+
+    def test_a_long_region_becomes_several_drawn_stones(self):
+        """Each stone gets its own outline, or the plate shows a seed that
+        cannot be made."""
+        from .gaps import gap_report
+
+        placed = [{"x": -5.0, "y": -40.0, "w": 10.0, "h": 80.0}]
+        rep = gap_report(placed, 40.0, 12.0, 18.0)
+        self.assertGreater(len(rep), 2)
         for p in rep:
-            self.assertLessEqual(p["length"], MAX_SEED_WIDTH + 1e-6)
+            self.assertGreaterEqual(len(p["poly"]), 4)
 
     def test_a_chamfer_below_the_threshold_is_reported_plain(self):
         """A 0.1 mm corner is measurement tolerance, not a grinding operation.
@@ -3486,12 +3536,41 @@ class GapMinimumWidthTests(SimpleTestCase):
             x += seed
         return out
 
-    def test_the_configured_range_is_twelve_to_eighteen(self):
-        """Stated once, so changing the shop's rule has to be deliberate."""
+    def test_the_band_comes_from_the_run_not_a_constant(self):
+        """A reference stone is only worth listing if it is one THIS run would
+        have accepted, so the range follows the operator's seed-width band."""
+        from . import engine_runner
         from .gaps import MAX_SEED_WIDTH, MIN_SEED_WIDTH
 
-        self.assertEqual(MIN_SEED_WIDTH, 12.0)
-        self.assertEqual(MAX_SEED_WIDTH, 18.0)
+        P = engine_runner.P
+        saved = (getattr(P, "W_LO", None), getattr(P, "W_HI", None))
+        try:
+            P.W_LO, P.W_HI = 14.0, 20.0
+            self.assertEqual(engine_runner.gap_band(), (14.0, 20.0))
+            P.W_LO, P.W_HI = 9.0, 11.0
+            self.assertEqual(engine_runner.gap_band(), (9.0, 11.0))
+            # a blank end falls back to the module default, never to unbounded
+            P.W_LO, P.W_HI = None, None
+            self.assertEqual(engine_runner.gap_band(),
+                             (MIN_SEED_WIDTH, MAX_SEED_WIDTH))
+            P.W_LO, P.W_HI = 15.0, None
+            self.assertEqual(engine_runner.gap_band(), (15.0, MAX_SEED_WIDTH))
+            P.W_LO, P.W_HI = None, 16.0
+            self.assertEqual(engine_runner.gap_band(), (MIN_SEED_WIDTH, 16.0))
+        finally:
+            P.W_LO, P.W_HI = saved
+
+    def test_an_inverted_run_band_does_not_produce_a_broken_range(self):
+        from . import engine_runner
+
+        P = engine_runner.P
+        saved = (getattr(P, "W_LO", None), getattr(P, "W_HI", None))
+        try:
+            P.W_LO, P.W_HI = 18.0, 12.0
+            lo, hi = engine_runner.gap_band()
+            self.assertLessEqual(lo, hi)
+        finally:
+            P.W_LO, P.W_HI = saved
 
     def test_no_reported_stone_falls_outside_the_range(self):
         from .gaps import MAX_SEED_WIDTH, MIN_SEED_WIDTH, gap_report
