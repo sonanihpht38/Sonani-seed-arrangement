@@ -503,6 +503,46 @@ LEGEND_TEXT_FRAC = 0.835    # share of a column left for text, after swatch+numb
 LEGEND_COL_PAD_IN = 0.12    # gutter, so two columns never touch
 
 
+# When the plate was generated, stamped on the image itself. Two plates run from
+# identical parameters are otherwise indistinguishable on paper, and the sheet
+# that reaches the floor is the only copy anyone has.
+GENERATED_FMT = "%d-%b-%Y %I:%M %p"
+# Bold and a size up from the 7 pt first attempt, which read as a watermark
+# rather than a fact anyone was meant to use. The margin strip is 0.18 in tall
+# and 9 pt is 0.125 in, so the line still clears both the page edge and
+# LEGEND_BOTTOM — see the arithmetic in _stamp_generated.
+GENERATED_FONT_PT = 9.0
+GENERATED_COLOR = "#3f3f3f"
+
+
+def _stamp_generated(fig, when=None):
+    """Print "Generated: ..." in the page margin, bottom-right.
+
+    Drawn with fig.text in FIGURE coordinates, outside every axes, so it cannot
+    shift the plate, the legend or the A4 page the way another title line would.
+    It sits below LEGEND_BOTTOM in the margin strip the layout already reserves,
+    which is why it needs no space of its own.
+
+    Deliberately NOT a plate parameter: the caption above the plate describes
+    what was asked for, and this describes when it was produced.
+
+    `when` exists for tests; production stamps the moment the render completes,
+    which is the moment that plate came into existence.
+    """
+    from datetime import datetime
+
+    stamp = (when or datetime.now()).strftime(GENERATED_FMT)
+    w_in, h_in = fig.get_size_inches()
+    # Vertically centred in the margin strip: half the glyph height above and
+    # below, so a larger font grows into the strip rather than off the page.
+    y_in = PAGE_MARGIN_IN / 2.0
+    fig.text(1.0 - PAGE_MARGIN_IN / float(w_in), y_in / float(h_in),
+             f"Generated: {stamp}", ha="right", va="center",
+             fontsize=GENERATED_FONT_PT, fontweight="bold",
+             color=GENERATED_COLOR)
+    return stamp
+
+
 def _legend_col_in(font_pt, chars=LEGEND_ENTRY_CHARS):
     """How wide a column must be to hold one seed row at this font size."""
     text_in = max(1, int(chars)) * font_pt * LEGEND_EM_PER_CHAR / 72.0
@@ -804,6 +844,7 @@ def render_enhanced_circle(placed, real, pi, R, fill, path):
          + "\n↻ = turn CLOCKWISE from the seed as measured"),
         entries)
 
+    _stamp_generated(fig)
     # NO bbox_inches="tight": it crops the figure to its content, and the
     # saved image then stops being A4 — the one thing this layout has to
     # guarantee. The margins are pinned instead, so there is nothing to trim.
@@ -4538,6 +4579,7 @@ def render_circle(placed, real, pi, R, fill, path):
     ax.set_title(f"Mixed + hybrid fill · Plate {pi:02d} · area covered "
                  f"{covered:.0f} mm² of {circle_area:.0f} mm² ({fill:.1f}%)\n"
                  f"Ø{PLATE:g} plate · blue = big fillers (W×H) · red = {ds:g}×{ds:g} mm dummies", fontsize=10)
+    _stamp_generated(fig)
     fig.savefig(path, dpi=85)              # fixed limits set -> no bbox_inches='tight' rescan
     plt.close(fig)
 
@@ -4615,6 +4657,7 @@ def render_cross_circle(placed, real, pi, R, fill, path):
     _draw_legend_list(axl, f"Seeds on this plate ({nr})",
                       f"D = dummy filler ({len(dummies)})", entries)
 
+    _stamp_generated(fig)
     # NO bbox_inches="tight": it crops the figure to its content, and the
     # saved image then stops being A4 — the one thing this layout has to
     # guarantee. The margins are pinned instead, so there is nothing to trim.
@@ -4698,6 +4741,7 @@ def render_real_circle(real, pi, R, fill, path):
          + "\n↻ = turn CLOCKWISE from the seed as measured"),
         entries)
 
+    _stamp_generated(fig)
     # NO bbox_inches="tight": it crops the figure to its content, and the
     # saved image then stops being A4 — the one thing this layout has to
     # guarantee. The margins are pinned instead, so there is nothing to trim.

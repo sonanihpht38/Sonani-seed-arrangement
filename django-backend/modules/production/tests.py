@@ -3657,3 +3657,113 @@ class GapMinimumWidthTests(SimpleTestCase):
                 width = ws.cell(r, 4).value        # "Seed width mm"
                 if isinstance(width, (int, float)):
                     self.assertGreaterEqual(float(width), MIN_SEED_WIDTH - 1e-6)
+
+
+class PlateTimestampTests(SimpleTestCase):
+    """Every generated plate carries WHEN it was generated.
+
+    Two runs from identical parameters are otherwise indistinguishable on paper,
+    and the printed sheet is the only copy the floor has. The stamp is drawn in
+    the page margin with fig.text, outside every axes, so it cannot move the
+    plate, the legend or the A4 page.
+    """
+
+    def _placed(self, n=6):
+        out = []
+        for i in range(n):
+            x = -30.0 + i * 10.0
+            out.append({
+                "stock": "S%04d" % i, "x": x, "y": -5.0, "w": 10.0, "h": 10.0,
+                "H": 0.52, "angle": 0, "area": 100.0, "L": 10.0, "W": 10.0,
+                "lx": x + 5.0, "ly": 0.0, "rawL": 10.0, "rawW": 10.0,
+                "poly": [(x, -5.0), (x + 10.0, -5.0), (x + 10.0, 5.0), (x, 5.0)],
+            })
+        return out
+
+    def _setup_engine(self):
+        from . import engine_runner  # noqa: F401  (puts engine/ on sys.path)
+        import pack_v2 as P
+
+        P.PLATE_D, P.USABLE_D, P.R = 90.0, 80.0, 40.0
+        P.T_LO, P.T_HI, P.CLEARANCE = 0.5, 0.6, 0.0
+        P.W_LO, P.W_HI = 12.0, 18.0
+        return P
+
+    def test_the_format_is_the_one_asked_for(self):
+        import datetime as _dt
+
+        self._setup_engine()
+        import demo_fill as D
+
+        when = _dt.datetime(2026, 9, 18, 9, 30)
+        self.assertEqual(when.strftime(D.GENERATED_FMT), "18-Sep-2026 09:30 AM")
+        self.assertEqual(
+            _dt.datetime(2026, 12, 3, 17, 5).strftime(D.GENERATED_FMT),
+            "03-Dec-2026 05:05 PM")
+
+    def test_the_stamp_lands_in_the_margin_below_the_legend(self):
+        """Below LEGEND_BOTTOM, so it occupies space the layout already
+        reserves and can never push the legend or the plate around."""
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        self._setup_engine()
+        import demo_fill as D
+
+        fig = plt.figure(figsize=(D.A4_W_IN, D.A4_H_IN))
+        try:
+            D._stamp_generated(fig)
+            txt = [t for t in fig.texts if "Generated:" in t.get_text()]
+            self.assertEqual(len(txt), 1)
+            x, y = txt[0].get_position()
+            self.assertLess(y, D.LEGEND_BOTTOM, "stamp must sit below the legend")
+            self.assertGreater(y, 0.0, "stamp must be on the page")
+            self.assertGreater(x, 0.9, "stamp belongs at the right edge")
+        finally:
+            plt.close(fig)
+
+    def test_every_renderer_stamps_its_plate(self):
+        """Arrange, Machine-Cut and Max Coverage alike — the requirement is all
+        methods and all plate sizes."""
+        import ast
+        import inspect
+
+        self._setup_engine()
+        import demo_fill as D
+
+        src = inspect.getsource(D)
+        tree = ast.parse(src)
+        want = {"render_enhanced_circle", "render_cross_circle",
+                "render_real_circle", "render_circle"}
+        seen = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name in want:
+                body = ast.get_source_segment(src, node) or ""
+                if "_stamp_generated(fig)" in body:
+                    seen.add(node.name)
+        self.assertEqual(seen, want, "unstamped renderer(s): %s" % (want - seen))
+
+    def test_the_stamp_does_not_change_the_page_size(self):
+        import os
+        import tempfile
+
+        from PIL import Image
+
+        self._setup_engine()
+        import demo_fill as D
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "p.png")
+            D.render_enhanced_circle(self._placed(), self._placed(), 1,
+                                     40.0, 50.0, path)
+            with Image.open(path) as im:
+                size = (im.width, im.height)
+        self.assertEqual(size, (1653, 2338))
+
+    def test_the_stamp_is_not_a_plate_parameter(self):
+        """It must not appear in the caption that describes the run."""
+        self._setup_engine()
+        import demo_fill as D
+
+        self.assertNotIn("Generated", D.band_caption())
