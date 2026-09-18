@@ -308,7 +308,9 @@ export function ArrangementHistory() {
         {!listQ.isLoading && !listQ.isError && rows.length === 0 && (
           <Empty description="No arrangements yet — run one from the Result screen." />
         )}
-        {rows.length > 0 && <DataGrid rowData={rows} columnDefs={columns} pageSize={25} height={520} />}
+        {/* No explicit height: the grid fills the viewport (see DataGrid), so a
+            big screen shows many more runs than the old fixed 520 px box. */}
+        {rows.length > 0 && <DataGrid rowData={rows} columnDefs={columns} pageSize={25} />}
       </Card>
 
       <Drawer

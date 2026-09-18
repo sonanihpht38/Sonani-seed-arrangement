@@ -7,10 +7,28 @@ import type { ColDef } from "ag-grid-community";
 import "ag-grid-community/styles/ag-grid.css";
 import "ag-grid-community/styles/ag-theme-quartz.css";
 
+// Default grid height: FILL the viewport rather than a fixed box.
+//
+// 360 px showed ten rows and left a screen's worth of white space underneath on
+// anything bigger than a laptop. A taller fixed number only moves the problem —
+// it overflows the short screens instead. This leaves room for the app chrome
+// and gives the rest to the rows:
+//
+//   header 64 + Content margins 48 + card head ~56 + card padding ~48
+//   + a screen's alert/toolbar ~104  ≈  320
+//
+// minHeight keeps it usable when the viewport is short; below that the page
+// scrolls, which is the right failure.
+const FILL_HEIGHT = "calc(100vh - 320px)";
+const MIN_HEIGHT = 380;
+
 interface DataGridProps<T> {
   rowData: T[];
   columnDefs: ColDef<T>[];
-  height?: number;
+  /** Number of px, or any CSS length. Defaults to filling the viewport. */
+  height?: number | string;
+  /** Floor for the fill height, so a short screen still shows useful rows. */
+  minHeight?: number;
   pageSize?: number;
   loading?: boolean;
   /** Optional: called with the row's data when a row is clicked. When set, rows
@@ -26,7 +44,8 @@ interface DataGridProps<T> {
 export function DataGrid<T>({
   rowData,
   columnDefs,
-  height = 360,
+  height = FILL_HEIGHT,
+  minHeight = MIN_HEIGHT,
   pageSize = 10,
   loading = false,
   onRowClicked,
@@ -34,7 +53,10 @@ export function DataGrid<T>({
   autoHeight = false,
 }: DataGridProps<T>) {
   return (
-    <div className="ag-theme-quartz" style={{ width: "100%", ...(autoHeight ? {} : { height }) }}>
+    <div
+      className="ag-theme-quartz"
+      style={{ width: "100%", ...(autoHeight ? {} : { height, minHeight }) }}
+    >
       <AgGridReact<T>
         rowData={rowData}
         columnDefs={columnDefs}
@@ -45,7 +67,10 @@ export function DataGrid<T>({
         domLayout={autoHeight ? "autoHeight" : "normal"}
         pagination={paginated}
         paginationPageSize={pageSize}
-        paginationPageSizeSelector={paginated ? [10, 25, 50] : undefined}
+        // 100 added: a taller grid only shows more rows if the PAGE can supply
+        // them. At a page size of 10 the extra height is just blank space below
+        // the tenth row.
+        paginationPageSizeSelector={paginated ? [10, 25, 50, 100] : undefined}
         animateRows
         loading={loading}
         onRowClicked={onRowClicked ? (e) => e.data && onRowClicked(e.data) : undefined}
