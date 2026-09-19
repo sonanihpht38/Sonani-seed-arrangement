@@ -114,7 +114,12 @@ export function Finalization() {
   // already committed cannot be built as drawn — block Assign and say why,
   // rather than letting the click fail with a conflict.
   const currentInv = finalQ.data?.plates.find((p) => p.plateNo === current?.plateNo);
-  const stale = Boolean(currentInv && !currentInv.consumed && !currentInv.canAssign);
+  const stale = Boolean(currentInv && !currentInv.consumed && currentInv.takenElsewhere > 0);
+  // The built layout never produced this plate — Max Coverage stopped when the
+  // pool ran dry, leaving an Arrange-only tail. It holds no stones of its own,
+  // so the server refuses to name it. A different problem from `stale` above,
+  // and it needs its own wording.
+  const notBuilt = Boolean(currentInv && !currentInv.consumed && currentInv.inBuiltLayout === false);
   const names = namesQ.data?.names ?? {};
   const currentName = current ? names[String(current.plateNo)] ?? undefined : undefined;
 
@@ -374,9 +379,11 @@ export function Finalization() {
                     Plate {p.plateNo}: {p.seeds} seeds
                     {p.consumed
                       ? ` · ${p.plateName}`
-                      : !p.canAssign
-                        ? ` · ${p.takenElsewhere} taken by another plate`
-                        : " · available"}
+                      : p.inBuiltLayout === false
+                        ? " · not in the built layout"
+                        : !p.canAssign
+                          ? ` · ${p.takenElsewhere} taken by another plate`
+                          : " · available"}
                   </Tag>
                 ))}
               </Space>
@@ -414,7 +421,7 @@ export function Finalization() {
               type="primary"
               icon={<FiCheck />}
               loading={assignMut.isPending}
-              disabled={!pick || !canFinalize || stale}
+              disabled={!pick || !canFinalize || stale || notBuilt}
               onClick={() => assignMut.mutate()}
             >
               Assign
@@ -463,6 +470,19 @@ export function Finalization() {
               style={{ marginBottom: 16 }}
               message="This plate is out of date"
               description={`${currentInv?.takenElsewhere} of its ${currentInv?.seeds} seeds have since been used by another finalized plate. Generate the plates again to build this one from the seeds that are still available.`}
+            />
+          )}
+
+          {/* An Arrange-only tail plate. Its stones are already drawn onto
+              earlier Max Coverage plates, so naming it would commit them a
+              second time — which is what this release fixes. */}
+          {notBuilt && (
+            <Alert
+              type="warning"
+              showIcon
+              style={{ marginBottom: 16 }}
+              message="This plate is not part of the layout that gets built"
+              description="Max Coverage ran out of stock before reaching it, so its seeds are already placed on earlier plates. Generate the plates again to build what is left."
             />
           )}
 

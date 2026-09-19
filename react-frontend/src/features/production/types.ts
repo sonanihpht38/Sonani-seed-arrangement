@@ -235,6 +235,9 @@ export interface FinalizeStatus {
     seeds: number;
     consumed: boolean;
     takenElsewhere: number;   // seeds another run has committed — >0 means stale
+    /** False = the built layout never produced this plate, so it holds no seeds
+     *  of its own and cannot be named. Optional: older backends omit it. */
+    inBuiltLayout?: boolean;
     canAssign: boolean;
   }[];
   seedsInArrangement: number;

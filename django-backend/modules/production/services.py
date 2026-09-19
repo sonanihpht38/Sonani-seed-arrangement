@@ -494,16 +494,50 @@ class InventoryService:
         falling back to whatever methods exist for runs that never produced a
         Max Coverage layout — otherwise an Arrange-only run would consume
         nothing at all.
+
+        The fallback is decided ONCE FOR THE RUN, never per plate. Max Coverage
+        stops emitting plates when the pool runs dry, so a Compare run can end
+        with plates that only Arrange produced — and deciding per plate made
+        those fall back to their Arrange list, whose stones Max Coverage had
+        already placed on EARLIER plates. Measured on the live history: 56 such
+        plates, and on one 16-plate run the per-plate lists summed to 193 seeds
+        against 164 that exist, with 29 claimed by two plates each. Naming them
+        all consumed those 29 twice (the clash guard in consume_plate excludes
+        the run's own id, so nothing complained), and releasing one handed back
+        stones physically sitting on another plate.
+
+        A plate that the built layout never produced is therefore not part of
+        it and holds nothing. None of the 56 has ever been named, so no stored
+        record changes meaning.
         """
         from .models import SeedArrangeDetail
 
-        qs = (SeedArrangeDetail.objects
-              .filter(arrange_id=arrange_id, seed_type=False)
-              .exclude(seed_id__isnull=True))
-        if plate_no is not None:
-            qs = qs.filter(plate_id=plate_no)
-        built = qs.filter(method=InventoryService.BUILT_METHOD)
-        return set((built if built.exists() else qs).values_list("seed_id", flat=True))
+        run = (SeedArrangeDetail.objects
+               .filter(arrange_id=arrange_id, seed_type=False)
+               .exclude(seed_id__isnull=True))
+        qs = run.filter(plate_id=plate_no) if plate_no is not None else run
+        if run.filter(method=InventoryService.BUILT_METHOD).exists():
+            qs = qs.filter(method=InventoryService.BUILT_METHOD)
+        return set(qs.values_list("seed_id", flat=True))
+
+    @staticmethod
+    def excluded_from_built_layout(arrange_id, plate_no):
+        """True when this plate HAS placed seeds but none of them belong to the
+        layout that gets built — the Arrange-only tail of a Compare run.
+
+        Those stones are already drawn onto earlier Max Coverage plates, so the
+        plate cannot be named without committing them twice. Deliberately NOT
+        true for a plate with no seed rows at all: such a plate consumed nothing
+        before this rule existed and still consumes nothing, so refusing it
+        would change behaviour the double-consume fix has no business changing.
+        """
+        from .models import SeedArrangeDetail
+
+        if InventoryService.seed_ids_for(arrange_id, plate_no):
+            return False
+        return (SeedArrangeDetail.objects
+                .filter(arrange_id=arrange_id, plate_id=plate_no, seed_type=False)
+                .exclude(seed_id__isnull=True).exists())
 
     @staticmethod
     @transaction.atomic
@@ -647,6 +681,7 @@ class InventoryService:
         for pn in sorted(p for p in named if p is not None):
             ids = InventoryService.seed_ids_for(arrange_id, pn)
             lost = len(ids & taken_elsewhere)
+            excluded = InventoryService.excluded_from_built_layout(arrange_id, pn)
             plates.append({
                 "plateNo": pn,
                 "plateName": named.get(pn) or None,
@@ -654,7 +689,12 @@ class InventoryService:
                 "consumed": bool(named.get(pn)),
                 # Non-zero = this plate is stale; re-generate before assigning.
                 "takenElsewhere": lost,
-                "canAssign": lost == 0,
+                # False = the built layout never produced this plate, so it
+                # holds nothing and assign() will refuse it. Reported separately
+                # from `takenElsewhere` because it is a different problem and
+                # needs a different message.
+                "inBuiltLayout": not excluded,
+                "canAssign": lost == 0 and not excluded,
             })
         return {
             "arrangeId": str(arrange_id),
@@ -683,6 +723,17 @@ class PlateService:
         row = SeedArrangePlate.objects.filter(arrange_id=arrange_id, plate_no=plate_no).first()
         if row is None:
             raise DomainError("Plate not found.")
+        # A plate the built layout never produced holds no stones (see
+        # seed_ids_for). Naming it would take a plate name out of the master and
+        # consume nothing — so refuse, rather than record a plate that cannot be
+        # built. Only reachable on a Compare run whose Max Coverage pass stopped
+        # early; every other plate has its own seeds.
+        if InventoryService.excluded_from_built_layout(arrange_id, plate_no):
+            raise DomainError(
+                "This plate is not part of the layout that gets built, so it "
+                "holds no seeds. Max Coverage ran out of stock before reaching "
+                "it — generate the plates again to build what is left."
+            )
         now = datetime.now(timezone.utc)
         old = (row.plate_name or "").strip()
         if old and old != name:  # release the plate's previous name back to the pool

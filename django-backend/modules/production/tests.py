@@ -916,6 +916,64 @@ class FinalizeConsumesSeedsTests(TransactionTestCase):
         self.assertEqual(len(self._svc().seed_ids_for(self.arrange_id, 1)), 3)
         self.assertEqual(self._assign(1, "P-1")["seedsConsumed"], 3)
 
+    def _tail_plate(self):
+        """Add plate 3 the way a Compare run ends when Max Coverage runs out of
+        stock: an Arrange-only plate whose stones the Max Coverage layout has
+        already placed on plates 1 and 2."""
+        self.SeedArrangePlate.objects.create(arrange_id=self.arrange_id, plate_no=3)
+        for s in self.seeds[:4]:          # already on plates 1-2 under `enhanced`
+            self.SeedArrangeDetail.objects.create(
+                detail_id=self.uuid.uuid4(), arrange_id=self.arrange_id, seed_type=False,
+                seed_id=s.seed_id, plate_id=3, method="arrange")
+
+    def test_a_plate_outside_the_built_layout_holds_nothing(self):
+        """The fallback to other methods is decided for the RUN, not per plate.
+        Deciding it per plate made an Arrange-only tail plate report the seeds
+        that Max Coverage had already put on earlier plates."""
+        self._tail_plate()
+        self.assertEqual(self._svc().seed_ids_for(self.arrange_id, 3), set())
+        # ...and the run's plates no longer claim the same stone twice.
+        per_plate = [self._svc().seed_ids_for(self.arrange_id, n) for n in (1, 2, 3)]
+        self.assertEqual(sum(len(s) for s in per_plate),
+                         len(set().union(*per_plate)),
+                         "a seed is claimed by more than one plate of one run")
+
+    def test_a_plate_outside_the_built_layout_cannot_be_named(self):
+        """Naming it would take a plate name out of the master and consume
+        nothing, recording a plate that cannot be built."""
+        from modules.core.exceptions import DomainError
+        self._tail_plate()
+        with self.assertRaises(DomainError):
+            self._assign(3, "P-3")
+        row = self.SeedArrangePlate.objects.get(arrange_id=self.arrange_id, plate_no=3)
+        self.assertIsNone(row.plate_name, "the refused assign still named the plate")
+        self.assertFalse(self.SeedData.objects.filter(is_used=True).exists())
+
+    def test_a_plate_with_no_seed_records_can_still_be_named(self):
+        """The refusal above is ONLY for a plate the built layout excluded. A
+        plate with no seed rows at all consumed nothing before this rule and
+        must keep working — the plate-master flow assigns exactly such rows."""
+        self.SeedArrangePlate.objects.create(arrange_id=self.arrange_id, plate_no=9)
+        self.assertEqual(self._assign(9, "P-9")["seedsConsumed"], 0)
+        row = self.SeedArrangePlate.objects.get(arrange_id=self.arrange_id, plate_no=9)
+        self.assertEqual(row.plate_name, "P-9")
+        self.assertFalse(self._svc().excluded_from_built_layout(self.arrange_id, 9))
+
+    def test_the_tail_plate_is_flagged_in_the_finalize_status(self):
+        """So the screen can disable Assign and say why, rather than letting the
+        click fail."""
+        from .services import InventoryService
+        self._tail_plate()
+        by_no = {p["plateNo"]: p
+                 for p in InventoryService.status(self.arrange_id)["plates"]}
+        self.assertTrue(by_no[1]["inBuiltLayout"])
+        self.assertTrue(by_no[1]["canAssign"])
+        self.assertFalse(by_no[3]["inBuiltLayout"])
+        self.assertFalse(by_no[3]["canAssign"])
+        self.assertEqual(by_no[3]["seeds"], 0)
+        # Not the same problem as a stale plate, and must not be reported as one.
+        self.assertEqual(by_no[3]["takenElsewhere"], 0)
+
     def test_an_arrange_only_run_still_consumes(self):
         """No Max Coverage layout exists for older runs — falling back keeps
         them working instead of silently consuming nothing."""

@@ -14,7 +14,7 @@ import { useAuth } from "../auth/useAuth";
 import { productionApi } from "./productionApi";
 import { notify } from "../../lib/notify";
 import { mediaUrl } from "../../lib/media";
-import type { ArrangementRow, ArrangementSeed } from "./types";
+import type { ArrangementPlate, ArrangementRow, ArrangementSeed } from "./types";
 import { DataGrid } from "../../components/DataGrid";
 import { FiInfo, FiEye, FiDownload, FiRefreshCw, FiCheck, FiPlus } from "../../components/icons";
 import { colors, alpha } from "../../theme";
@@ -41,6 +41,52 @@ function pct(v: number | null | undefined) {
 }
 
 const num = (v: number | null | undefined, suffix = "") => (v == null ? "—" : `${v}${suffix}`);
+
+// ---- Which layout a plate actually gets built from ------------------------
+// Mirrors InventoryService.BUILT_METHOD / seed_ids_for on the server: a Compare
+// run records a placement per method, and naming the plate commits the Max
+// Coverage one — that is the layout the floor builds.
+//
+// The fallback to other methods is decided ONCE FOR THE RUN, matching the
+// server: a Compare run whose Max Coverage pass ran out of stock ends with
+// Arrange-only plates, and those hold no stones of their own — their seeds are
+// already drawn onto earlier Max Coverage plates. Falling back per plate would
+// report seeds that naming the plate cannot legally take.
+//
+// This is REPORTING only. It reads the seed lists already in the detail
+// response and changes nothing about what Assign consumes.
+const BUILT_LABEL = "Max Coverage";
+
+/** True when ANY plate of the run has a Max Coverage layout. */
+function runHasBuiltLayout(plates: ArrangementPlate[]) {
+  return plates.some((p) => (p.seedsByMethod[BUILT_LABEL] ?? []).some((s) => s.real));
+}
+
+/** The seeds naming this plate will consume, and the layout they come from.
+ *  `excluded` mirrors InventoryService.excluded_from_built_layout: the plate
+ *  placed seeds, but none in the built layout, so the server refuses to name
+ *  it. A plate with no seed rows AT ALL is not excluded — it consumed nothing
+ *  before this rule and still does. */
+function builtSeeds(
+  p: ArrangementPlate,
+  runHasBuilt: boolean,
+): { count: number; label: string | null; excluded: boolean } {
+  const built = p.seedsByMethod[BUILT_LABEL]?.filter((s) => s.real) ?? [];
+  if (runHasBuilt) {
+    const placed = Object.values(p.seedsByMethod).some((l) => l.some((s) => s.real));
+    return { count: built.length, label: BUILT_LABEL, excluded: !built.length && placed };
+  }
+  // The run has no Max Coverage layout anywhere. The server then consumes the
+  // union of every method's rows, de-duplicated by seed — Stock No is the
+  // per-seed key we have here.
+  const stocks = new Set<string>();
+  for (const seeds of Object.values(p.seedsByMethod)) {
+    for (const s of seeds) if (s.real) stocks.add(s.stock);
+  }
+  // Pre-plate-tracking runs have no seed lists at all; the stored count is then
+  // the only number there is.
+  return { count: stocks.size || (p.realSeedCount ?? 0), label: null, excluded: false };
+}
 
 /** Seed-width band as text. Both ends null = no band was set on that run. */
 function widthBandText(lo: number | null, hi: number | null) {
@@ -169,6 +215,11 @@ export function ArrangementHistory() {
 
   const rows = listQ.data ?? [];
   const detail = detailQ.data;
+  // Decided for the whole run, not per plate — see builtSeeds above.
+  const runHasBuilt = useMemo(
+    () => runHasBuiltLayout(detail?.plates ?? []),
+    [detail],
+  );
 
   const columns = useMemo<ColDef<ArrangementRow>[]>(
     () => [
@@ -344,6 +395,11 @@ export function ArrangementHistory() {
               <Empty description="This run has no per-plate records (it predates plate tracking)." />
             ) : (
               detail.plates.map((p) => {
+                // What naming this plate will actually take out of inventory.
+                const build = builtSeeds(p, runHasBuilt);
+                // An Arrange-only tail plate of a Compare run: its stones sit on
+                // earlier plates, so the server refuses to name it. Don't offer to.
+                const notBuilt = build.excluded;
                 // Show EVERY output this plate produced. A method is worth a block if it has
                 // an image OR a seed list — older Max Coverage runs stored the seeds but no
                 // image (that column didn't exist yet), and their list must still show.
@@ -383,6 +439,11 @@ export function ArrangementHistory() {
                         <Tag style={{ margin: 0, color: colors.primary, borderColor: alpha(colors.primary, 0.35), background: alpha(colors.primary, 0.08) }}>
                           {p.plateName}
                         </Tag>
+                      ) : notBuilt ? (
+                        // Its stones are already on earlier Max Coverage plates,
+                        // so naming it would commit them twice. Say so instead of
+                        // offering a control the server will refuse.
+                        <Tag style={{ margin: 0 }}>not in the built layout</Tag>
                       ) : canAssign ? (
                         // The second chance at naming a plate. Assign only: this
                         // consumes the seeds, and handing them back stays in
@@ -424,10 +485,31 @@ export function ArrangementHistory() {
                           </Button>
                         </>
                       ) : null}
+                      {/* The count of the layout that gets BUILT, not the stored
+                          RealSeedCount. For a Compare run that column is written
+                          from the Arrange pass, so it disagreed with the seeds
+                          Assign consumes — 10 shown against 13 taken, on most
+                          Compare plates. The number below is the one the server
+                          acts on. */}
                       <Text type="secondary">
-                        {p.realSeedCount ?? 0} seed{p.realSeedCount === 1 ? "" : "s"}
+                        {build.count} seed{build.count === 1 ? "" : "s"}
                         {p.dummyCount ? ` · ${p.dummyCount} dummy` : ""}
                       </Text>
+                      {/* Say which of a Compare plate's layouts that is. With one
+                          layout there is nothing to disambiguate, so it is left
+                          off rather than repeated on every plate. */}
+                      {build.label && stages.length > 1 ? (
+                        <Tag
+                          style={{
+                            margin: 0,
+                            color: colors.primary,
+                            borderColor: alpha(colors.primary, 0.35),
+                            background: alpha(colors.primary, 0.08),
+                          }}
+                        >
+                          Builds: {build.label}
+                        </Tag>
+                      ) : null}
                       {p.excelUrl && (
                         <Button size="small" icon={<FiDownload />} href={mediaUrl(p.excelUrl)} target="_blank">
                           Excel
@@ -448,6 +530,22 @@ export function ArrangementHistory() {
                             <div key={s.label} style={{ border: `1px solid ${colors.border}`, borderRadius: 6, padding: 10 }}>
                               <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
                                 {methodTag(s.label === "Machine-Cut" ? "Machine-Cut Fill" : s.label)}
+                                {/* Point the plate header's Assign button at the
+                                    panel it belongs to. The header sits above the
+                                    FIRST panel, which made a per-plate control
+                                    read as if it were Arrange's. */}
+                                {stages.length > 1 && s.label === build.label ? (
+                                  <Tag
+                                    style={{
+                                      margin: 0,
+                                      color: colors.primary,
+                                      borderColor: alpha(colors.primary, 0.35),
+                                      background: alpha(colors.primary, 0.08),
+                                    }}
+                                  >
+                                    {p.plateName ? "built from this" : "Assign builds this"}
+                                  </Tag>
+                                ) : null}
                                 {s.fill != null && <Text type="secondary">{pct(s.fill)} filled</Text>}
                                 {seeds.length > 0 && (
                                   <Text type="secondary">
