@@ -7,7 +7,10 @@
 import { useState } from "react";
 import { Card, Form, Input, Button, Typography } from "antd";
 import { FiUser, FiLock } from "../../components/icons";
-import { Link, Navigate, useLocation, useNavigate } from "react-router-dom";
+// `Link` is used ONLY by the three disabled items at the bottom of this file,
+// so it is commented out alongside them — tsconfig sets noUnusedLocals, and an
+// import left dangling fails the build. Restore it together with them.
+import { /* Link, */ Navigate, useLocation, useNavigate } from "react-router-dom";
 import { useAuth } from "./useAuth";
 import { notify } from "../../lib/notify";
 import { Logo } from "../../components/Logo";
@@ -69,6 +72,11 @@ export function Login() {
           </Button>
         </Form>
 
+        {/* DISABLED — kept verbatim so it can be switched back on by deleting
+            these comment markers. Nothing else changed: the /forgot-password
+            and /register routes and their screens are untouched and still work
+            if opened directly; only the links from this card are hidden.
+
         <Typography.Paragraph style={{ fontSize: 13, marginTop: 12, marginBottom: 4, textAlign: "center" }}>
           <Link to="/forgot-password">Forgot password?</Link>
         </Typography.Paragraph>
@@ -78,6 +86,8 @@ export function Login() {
         <Typography.Paragraph type="secondary" style={{ fontSize: 12, marginBottom: 0 }}>
           Demo: <b>admin / admin123</b> (all screens) &middot; <b>manager / manager123</b> (HR &amp; Sales)
         </Typography.Paragraph>
+
+        */}
       </Card>
     </div>
   );
