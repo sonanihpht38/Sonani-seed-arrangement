@@ -7,7 +7,7 @@ from django.db import transaction
 
 from .models import (
     DomainError, Role, RoleColumnPermission, RoleFormPermission,
-    UserColumnPermission, UserRole,
+    UserColumnPermission,
 )
 from .repository import (
     CatalogueRepository, GridColumnRepository, RoleRepository, UserAccessRepository,
@@ -142,11 +142,3 @@ class RoleService:
         perm.set_flags(**flags)
         perm.save()
         return perm
-
-    @staticmethod
-    @transaction.atomic
-    def assign_to_user(tenant_id, user, role_id):
-        role = RoleRepository.get(tenant_id, role_id)
-        if role is None:
-            raise DomainError("Role not found.")
-        UserRole.objects.get_or_create(user=user, role=role)

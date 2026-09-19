@@ -63,17 +63,6 @@ class SystemSetting(models.Model):
             models.UniqueConstraint(fields=["tenant", "key"], name="uq_setting_tenant_key"),
         ]
 
-    def as_python(self):
-        """Cast the stored string to its declared type for API responses."""
-        if self.value_type == SettingValueType.INT:
-            return int(self.value or 0)
-        if self.value_type == SettingValueType.BOOL:
-            return str(self.value).strip().lower() in ("1", "true", "yes", "on")
-        if self.value_type == SettingValueType.JSON:
-            import json
-            return json.loads(self.value or "null")
-        return self.value
-
 
 class ParameterType(AuditModel):
     """A named lookup category, e.g. 'Departments'. Table: mst_parameter_type.
